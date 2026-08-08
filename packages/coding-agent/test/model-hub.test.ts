@@ -7,8 +7,10 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { PresetApplyResult } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { modelRoleValueFromUnknown, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ModelPresetV1 } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import {
 	type ModelHubCallbacks,
 	ModelHubComponent,
@@ -81,6 +83,9 @@ interface HubHarness {
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
 	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
+	onSavePreset: Mock<(name: string, preset: ModelPresetV1) => void>;
+	onDeletePreset: Mock<(name: string) => void>;
+	onApplyPreset: Mock<(name: string, preset: ModelPresetV1) => Promise<PresetApplyResult> | PresetApplyResult>;
 }
 
 const openHubs: ModelHubComponent[] = [];
@@ -112,6 +117,34 @@ function createHub(options: {
 		}
 		settings.override("retry.fallbackChains", chains);
 	});
+	// Mirror the controller: persist preset mutations so the hub's re-read sees them.
+	const onSavePreset = vi.fn((name: string, preset: ModelPresetV1) => {
+		const presets = { ...settings.get("modelPresets") };
+		presets[name] = preset;
+		settings.override("modelPresets", presets);
+	});
+	const onDeletePreset = vi.fn((name: string) => {
+		const presets = { ...settings.get("modelPresets") };
+		delete presets[name];
+		settings.override("modelPresets", presets);
+	});
+	// Mirror the controller's settings effect: pin the preset's routing state at
+	// the runtime override layer, tombstoning every role the preset omits.
+	const onApplyPreset = vi.fn((_name: string, preset: ModelPresetV1) => {
+		const roles: Record<string, string> = {};
+		for (const [role, value] of Object.entries(preset.roles ?? {})) {
+			const normalized = modelRoleValueFromUnknown(value);
+			if (normalized) roles[role] = normalized;
+		}
+		settings.applyRuntimeRoutingPlan({
+			roles,
+			clearRoles: settings.getAllModelRoleKeys().filter(role => !(role in roles)),
+			fallbackChains: preset.fallbackChains ?? {},
+			cycleOrder: preset.cycleOrder ?? [],
+			defaultThinkingLevel: preset.defaultThinkingLevel ?? settings.get("defaultThinkingLevel"),
+		});
+		return { applied: true } as const;
+	});
 	const hub = new ModelHubComponent(
 		ui,
 		settings,
@@ -123,12 +156,25 @@ function createHub(options: {
 			onLoginRequest: options.callbacks?.onLoginRequest ?? onLoginRequest,
 			onCycleOrderChange: options.callbacks?.onCycleOrderChange,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
+			onApplyPreset: options.callbacks?.onApplyPreset ?? onApplyPreset,
+			onSavePreset: options.callbacks?.onSavePreset ?? onSavePreset,
+			onDeletePreset: options.callbacks?.onDeletePreset ?? onDeletePreset,
 			onCancel: options.callbacks?.onCancel ?? onCancel,
 		},
 		options.hub,
 	);
 	openHubs.push(hub);
-	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange };
+	return {
+		hub,
+		onAssign,
+		onUnassign,
+		onLoginRequest,
+		onCancel,
+		onFallbackChainChange,
+		onSavePreset,
+		onDeletePreset,
+		onApplyPreset,
+	};
 }
 
 const DOWN = "\x1b[B";
@@ -1074,6 +1120,231 @@ describe("ModelHub", () => {
 
 			hub.handleInput("\n");
 			expect(onLoginRequest).toHaveBeenCalledWith("anthropic");
+		});
+	});
+
+	describe("presets view", () => {
+		test("lists a Presets scope and shows the presets header", () => {
+			const model = makeModel("test", "worker-model");
+			const { hub } = createHub({ models: [model], scoped: true });
+			installTestTheme();
+
+			expect(normalize(hub.render(220))).toContain("Presets");
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput(UP); // Roles → Presets
+			expect(normalize(hub.render(220))).toContain("Model presets");
+			expect(footerLine(hub.render(220))).toContain("→ presets");
+		});
+
+		test("saves the current models as a named preset and marks it active", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = Settings.isolated({ modelRoles: { default: "test/worker-model" } });
+			const { hub, onSavePreset } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "+ Save current as preset…"
+			hub.handleInput("\n"); // open the name strip
+			expect(footerLine(hub.render(220))).toContain("Preset name:");
+			for (const ch of "fast") hub.handleInput(ch);
+			hub.handleInput("\n"); // submit
+
+			expect(onSavePreset).toHaveBeenCalledTimes(1);
+			expect(onSavePreset.mock.calls[0]?.[0]).toBe("fast");
+			expect(onSavePreset.mock.calls[0]?.[1]?.roles?.default).toBe("test/worker-model");
+
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("fast");
+			expect(rendered).toContain("matches current"); // the saved preset equals the current settings
+		});
+
+		test("loads a saved preset, applying its roles", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				modelPresets: { deep: { roles: { default: "test/model-b" } } },
+			});
+			const { hub, onApplyPreset } = createHub({ models: [a, b], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "deep"
+			hub.handleInput("\n"); // load it
+
+			expect(onApplyPreset).toHaveBeenCalledTimes(1);
+			expect(onApplyPreset.mock.calls[0]?.[0]).toBe("deep");
+			expect(settings.get("modelRoles").default).toBe("test/model-b");
+		});
+
+		test("x deletes the selected preset", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = Settings.isolated({
+				modelPresets: {
+					alpha: { roles: { default: "test/worker-model" } },
+					bravo: { roles: { smol: "test/worker-model" } },
+				},
+			});
+			const { hub, onDeletePreset } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "alpha" (sorted first)
+			hub.handleInput("x"); // arm the delete confirm
+			expect(normalize(hub.render(220))).toContain("press x again"); // armed hint
+			expect(onDeletePreset).not.toHaveBeenCalled();
+			hub.handleInput("x"); // confirm — delete alpha
+
+			expect(onDeletePreset).toHaveBeenCalledWith("alpha");
+			expect(normalize(hub.render(220))).not.toContain("alpha");
+		});
+
+		test("keyboard nav into Presets cancels an active assignment", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = Settings.isolated({ modelRoles: { default: "test/worker-model" } });
+			const { hub } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into the roles rows
+			hub.handleInput("\n"); // Enter on the default role → begin assigning a model
+			expect(normalize(hub.render(220))).toContain("Assigning"); // the model browser is up
+
+			hub.handleInput(UP); // scope focus: hop the sidebar up into Presets
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("Model presets"); // the presets list is shown
+			expect(rendered).not.toContain("Assigning"); // the assignment was cancelled
+		});
+
+		test("keeps the selected preset visible when the list exceeds the viewport", () => {
+			const model = makeModel("test", "worker-model");
+			const modelPresets: Record<string, { roles: { default: string } }> = {};
+			for (let i = 0; i < 50; i++) {
+				modelPresets[`preset-${String(i).padStart(2, "0")}`] = { roles: { default: "test/worker-model" } };
+			}
+			const settings = Settings.isolated({ modelPresets });
+			const { hub } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "preset-00"
+			for (let i = 0; i < 45; i++) hub.handleInput(DOWN); // page toward the end
+
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("preset-45"); // the selected row scrolled into view
+			expect(rendered).not.toContain("preset-00"); // the earliest row scrolled out
+		});
+
+		test("rejects an invalid preset name and keeps the strip open", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = Settings.isolated({ modelRoles: { default: "test/worker-model" } });
+			const { hub, onSavePreset } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "+ Save current as preset…"
+			hub.handleInput("\n"); // open the name strip
+			expect(footerLine(hub.render(220))).toContain("Preset name:");
+			for (const ch of "1bad") hub.handleInput(ch); // starts with a digit — invalid
+			hub.handleInput("\n"); // submit
+
+			expect(onSavePreset).not.toHaveBeenCalled();
+			const footer = footerLine(hub.render(220));
+			expect(footer).toContain("Preset name:"); // the strip stays open
+			expect(footer).toContain("start with a letter"); // the error explains the rule
+		});
+
+		test("ignores a repeated load while one is in flight", async () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				modelPresets: { deep: { roles: { default: "test/model-b" } } },
+			});
+			let resolveApply: (() => void) | undefined;
+			const onApplyPreset = vi.fn(
+				() =>
+					new Promise<PresetApplyResult>(resolve => {
+						resolveApply = () => resolve({ applied: true });
+					}),
+			);
+			const { hub } = createHub({ models: [a, b], scoped: true, settings, callbacks: { onApplyPreset } });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "deep"
+			hub.handleInput("\n"); // load it — apply is now in flight
+			hub.handleInput("\n"); // repeat while busy — the guard ignores it
+			expect(onApplyPreset).toHaveBeenCalledTimes(1);
+
+			resolveApply?.(); // finish the in-flight apply
+			await Promise.resolve();
+			await Promise.resolve();
+
+			hub.handleInput("\n"); // now free to apply again
+			expect(onApplyPreset).toHaveBeenCalledTimes(2);
+		});
+
+		test("a synchronously-throwing onApplyPreset leaves the hub usable for a retry", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				modelPresets: { deep: { roles: { default: "test/model-b" } } },
+			});
+			const onApplyPreset = vi.fn((): PresetApplyResult => {
+				throw new Error("apply exploded");
+			});
+			const { hub } = createHub({ models: [a, b], scoped: true, settings, callbacks: { onApplyPreset } });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "deep"
+			hub.handleInput("\n"); // load it — the callback throws synchronously
+			expect(onApplyPreset).toHaveBeenCalledTimes(1);
+
+			// The applying state must clear: a second attempt reaches the callback again.
+			hub.handleInput("\n");
+			expect(onApplyPreset).toHaveBeenCalledTimes(2);
+		});
+
+		test("a rejecting onApplyPreset promise clears the applying state for a retry", async () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				modelPresets: { deep: { roles: { default: "test/model-b" } } },
+			});
+			let rejectApply: ((reason: Error) => void) | undefined;
+			const onApplyPreset = vi.fn(
+				() =>
+					new Promise<PresetApplyResult>((_resolve, reject) => {
+						rejectApply = reject;
+					}),
+			);
+			const { hub } = createHub({ models: [a, b], scoped: true, settings, callbacks: { onApplyPreset } });
+			installTestTheme();
+
+			hub.handleInput(UP); // → Roles
+			hub.handleInput(UP); // → Presets
+			hub.handleInput("\n"); // dive; cursor on "deep"
+			hub.handleInput("\n"); // load it — apply is now in flight
+			expect(onApplyPreset).toHaveBeenCalledTimes(1);
+
+			rejectApply?.(new Error("apply rejected")); // the in-flight apply fails
+			await Promise.resolve();
+			await Promise.resolve();
+
+			// The applying state must clear: a second attempt reaches the callback again.
+			hub.handleInput("\n");
+			expect(onApplyPreset).toHaveBeenCalledTimes(2);
 		});
 	});
 });

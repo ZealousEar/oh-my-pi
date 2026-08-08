@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added model presets: save, load, and delete named permutations of model roles (plus fallback chains, quick-switch cycle order, and default thinking level) from the `/models` Presets view. Preset definitions are versioned and strictly validated — a malformed or unsupported-version preset is rejected instead of being coerced and applied — and persisted per key, so saving or deleting one preset never rewrites the others. Loading a preset applies it as a transactional, session-scoped routing override (never persisted): fallback chains and cycle order are replaced exactly rather than merged with lower layers, roles omitted from the preset stay durably tombstoned to auto-selection, and a rejected or failed live model switch rolls the entire application back.
+
 ## [17.2.10] - 2026-08-06
 
 ### Breaking Changes
