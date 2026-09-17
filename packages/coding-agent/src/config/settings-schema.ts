@@ -225,6 +225,37 @@ export interface ModelTagsSettings {
 	[key: string]: ModelTagDef;
 }
 
+/**
+ * Value type of the `defaultThinkingLevel` setting — a concrete thinking
+ * effort or the `auto` sentinel. Matches the setting's enum values
+ * (`[...THINKING_EFFORTS, AUTO_THINKING]`); notably narrower than
+ * `ConfiguredThinkingLevel`, which also admits `inherit` and `off`.
+ */
+export type DefaultThinkingLevel = (typeof THINKING_EFFORTS)[number] | typeof AUTO_THINKING;
+
+/**
+ * A saved, switchable permutation of model-role settings. Applied session-scoped
+ * from the /models Presets view (a runtime routing override; never persisted to
+ * the global or project layer). Definitions are stored under the `modelPresets`
+ * setting keyed by preset name.
+ */
+export interface ModelPresetV1 {
+	/** Schema version, for forward migration of stored presets. */
+	version: 1;
+	/** Role -> model selector, mirroring `modelRoles`. */
+	roles: Record<string, string>;
+	/** `retry.fallbackChains` snapshot; an empty record means "no chains". */
+	fallbackChains: Record<string, string[]>;
+	/** Quick-switch `cycleOrder` snapshot; an empty array means "no cycle". */
+	cycleOrder: string[];
+	/**
+	 * `defaultThinkingLevel` at capture; resolves roles without an explicit
+	 * thinking suffix. Restricted to the setting's enum — a concrete thinking
+	 * effort or `auto`, never `inherit`/`off`.
+	 */
+	defaultThinkingLevel: DefaultThinkingLevel;
+}
+
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
@@ -234,6 +265,7 @@ const EMPTY_AGENT_SERVICE_TIER_OVERRIDES: Record<string, ServiceTierInheritSetti
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
+const EMPTY_MODEL_PRESETS: Record<string, ModelPresetV1> = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
@@ -519,6 +551,8 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+
+	modelPresets: { type: "record", default: EMPTY_MODEL_PRESETS },
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 

@@ -374,8 +374,37 @@ enabledModels:
 | `enabledProviders`     | array   | `[]`                        | Foreign user-level discovery sources to load; supports path-scoped entries. See [above](#provider-and-source-disabling).                                                                                                                                                                                                                                                                                          |
 | `disabledProviders`    | array   | `[]`                        | Disabled model/discovery providers; supports path-scoped entries. See [above](#provider-and-source-disabling).                                                                                                                                                                                                                                                                                                   |
 | `includeModelInPrompt` | boolean | `true`                      | Include the active model name in the system prompt.                                                                                                                                                                                                                                                                                                                                                              |
+| `modelPresets`         | record  | `{}`                        | Named preset **definitions** keyed by name; each is `{ version, roles, fallbackChains, cycleOrder, defaultThinkingLevel }`. See [Model presets](#model-presets) below.                                                                                                                                                                                                                                          |
 
 See [Models](./models.md) for the `models.yml` schema and custom-provider definitions.
+
+#### Model presets
+
+`modelPresets` is a persisted record of named preset **definitions**, keyed by preset name; the `/models` view saves and deletes them per key in the global layer, and definitions merged from project or overlay layers are honored too. Definitions carry a `version` (currently `1`) and are strictly validated on load — a malformed or unsupported-version definition is rejected rather than partially applied. Each definition is a snapshot of the routing knobs that belong together:
+
+```yaml
+modelPresets:
+  fast:
+    version: 1
+    roles:
+      default: openai/gpt-4.1-mini
+      slow: anthropic/claude-sonnet-4-5
+    fallbackChains:
+      default:
+        - openai/gpt-4.1
+    cycleOrder:
+      - smol
+      - default
+    defaultThinkingLevel: low
+```
+
+**Applying** a preset (loading it from the `/models` Presets view) does **not** write settings. It installs a runtime override — the highest-precedence, never-persisted layer described in the [Precedence](#precedence) section — over `modelRoles`, `retry.fallbackChains`, `cycleOrder`, and `defaultThinkingLevel`. As a result, an applied preset:
+
+- takes effect immediately for the current session and reverts on restart,
+- cannot be shadowed by CLI overlays (`--config`) or other runtime overrides, and
+- is never written to global or project config.
+
+Applying is an exact replacement, not a merge: roles the preset omits are tombstoned to auto-selection (durably — later single-role edits never resurrect a lower-layer value), and `retry.fallbackChains` and `cycleOrder` take exactly the preset's values, so lower-layer chains cannot leak through. The application is transactional — if the live model switch is rejected or fails, the runtime override and the live session are rolled back. See [Model presets](./models.md#model-presets) for the full save/load/delete workflow and validation semantics.
 
 ### Advisor
 
