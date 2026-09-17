@@ -78,6 +78,10 @@ Not in thinking tokens (Codex ~100/turn; Anthropic output 14 % of spend). The la
 4. **Regime switching:** automatic from the quota bars with a one-line TUI notice — aggregate 7-day remaining across pools < 40 % → `Quota-saver`, > 70 % → `Quality`; manual `/preset` overrides and pins until the next threshold crossing.
 5. **Tool-output budgets:** all tools; 8k tokens per result for read/grep/other, 16k for bash/eval; overflow spills to `artifact://` with head/tail preview.
 
+## B10 outcome
+
+Resolved without a code change — see `08-b10-cache-ttl.md`. The running binary (v18.1.10) predated upstream's OAuth 1 h default (`6019d73540`, v18.1.18). Wire capture on the 18.2.4 source shows `ttl: "1h"` and the server billing `ephemeral_1h`.
+
 ## Still open
 
 - Exact scoring weights and benchmark source for the `Benchmark` preset (B20).

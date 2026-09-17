@@ -13,6 +13,7 @@ Why one power user exhausts every subscription quota (4× Codex, 3× Anthropic, 
 | `05-external-evidence.md` | annotated citation list with the specific numbers used |
 | `06-proposed-changes.md` | the numbered change list (config + harness), each with expected effect and evidence status |
 | `07-discussion-log.md` | questions raised during review and the answers, including open decisions |
+| `08-b10-cache-ttl.md` | B10 resolved: the 5 m-vs-1 h cache TTL was a build-version issue (fixed upstream in v18.1.18); wire + server evidence |
 | `consults/` | packets sent to `openai-codex/gpt-6-astra:high` as an external reviewer, and its verbatim answers |
 | `data/` | CSV tables (generated) |
 | `scripts/analyze.py` | regenerates `data/` from `~/.omp/stats.db`, `~/.omp/agent/agent.db`, `~/.omp/agent/sessions/**` |
@@ -32,6 +33,7 @@ Why one power user exhausts every subscription quota (4× Codex, 3× Anthropic, 
 - Subagents: context cap inside the subagent (150k/32k everyday, 96k/24k crunch), turn cap only as a p99 runaway guard (~200). See item 12.
 - `reader` stays on `anthropic/claude-opus-5` while Opus quota is idle; `advisor` role moves to a cheap model and stays disabled.
 - Reasoning-effort levels are not a lever (<0.01 % of tokens); not running the turn is.
+- B10 (cache TTL): no code change — rebuild from ≥ v18.1.18; fork `main` synced to 18.2.4, presets patch partially ported on `feature/model-presets`.
 
 ## Decided 2026-09-17 (`07-discussion-log.md` → Decisions)
 
