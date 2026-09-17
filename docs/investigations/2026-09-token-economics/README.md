@@ -33,8 +33,13 @@ Why one power user exhausts every subscription quota (4× Codex, 3× Anthropic, 
 - `reader` stays on `anthropic/claude-opus-5` while Opus quota is idle; `advisor` role moves to a cheap model and stays disabled.
 - Reasoning-effort levels are not a lever (<0.01 % of tokens); not running the turn is.
 
-## Open decisions
+## Decided 2026-09-17 (`07-discussion-log.md` → Decisions)
 
-- Preset axes for the "95 % of combinations" preset set (`07-discussion-log.md` §11).
-- Exact cap levels per subagent kind (scout / builder / coordinator).
-- Whether to auto-switch presets from quota state (crunch ↔ quality).
+- Presets: `Codex-first`, `Claude-first`, `Balanced`, `Quota-saver`, `Quality`, `Overnight-GLM`, `Emergency-paid`, plus a generated `Benchmark` preset (B20).
+- Subagent context caps by kind: scout 96k/24k, builder 150k/32k, coordinator 240k/60k; crunch scales ~35 % down. Turn guard 200 (checkpoint + handoff, not a cap).
+- Regime switching automatic from quota bars (< 40 % → `Quota-saver`, > 70 % → `Quality`) with a TUI notice; `/preset` pins.
+- Tool-output budgets on all tools: 8k per result, 16k for bash/eval, spill to `artifact://`.
+
+## Still open
+
+- Scoring weights and benchmark source for the `Benchmark` preset (B20).

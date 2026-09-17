@@ -70,9 +70,14 @@ Marginally, per event only. `snapcompact` makes no LLM call, so instructions don
 
 Not in thinking tokens (Codex ~100/turn; Anthropic output 14 % of spend). The lapse is running a full-context turn that produces nothing: hub-only 0.87 B / 1.07 M out, todo-only 0.25 B. Thinking level is flat on those turns; dropping it saves < 0.004 %. Subagents helped on mechanism (half the replay cost per output token, 11k start, low duplication) but 87 runs > 90 turns are 58 % of subagent tokens and 81 runs > 2 M tokens returned < 800 chars. Full analysis `04-subagents-and-effort.md`; reviewer's ranking in `consults/02-astra-effort-answer.md`.
 
-## Open decisions
+## Decisions (2026-09-17)
 
-1. Preset axes and names (Q11).
-2. Cap levels per subagent kind: scout / builder / coordinator.
-3. Quota-adaptive preset switching (B21) — automatic or manual.
-4. Whether B13 tool-output budgets apply to `bash` (risk: truncating test output the agent needs verbatim).
+1. **Presets.** Keep the intent set — `Codex-first`, `Claude-first`, `Balanced`, `Quota-saver` (crunch), `Quality`, `Overnight-GLM`, `Emergency-paid` — and add **`Benchmark`**: a preset whose roles are filled by `omp roles suggest` (B20) from the catalog quality field, local `model_perf`, and current quota, regenerated on demand rather than hand-maintained.
+2. **Subagent context caps by kind:** scout 96k / 24k tail, builder 150k / 32k, coordinator 240k / 60k. Crunch preset scales these ~35 % down (≈ 64k / 96k / 150k).
+3. **Turn guard:** 200 turns (p99), forces checkpoint + structured handoff with lineage budget; not a cap.
+4. **Regime switching:** automatic from the quota bars with a one-line TUI notice — aggregate 7-day remaining across pools < 40 % → `Quota-saver`, > 70 % → `Quality`; manual `/preset` overrides and pins until the next threshold crossing.
+5. **Tool-output budgets:** all tools; 8k tokens per result for read/grep/other, 16k for bash/eval; overflow spills to `artifact://` with head/tail preview.
+
+## Still open
+
+- Exact scoring weights and benchmark source for the `Benchmark` preset (B20).
