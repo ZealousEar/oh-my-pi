@@ -1,0 +1,47 @@
+# 06 — Proposed changes
+
+Two layers: **A** — settings in `~/.omp/agent/config.yml` / `models.yml` the user can apply today; **B** — omp code changes. Each item: what, expected effect on the measured workload, evidence status (**measured** = from this user's telemetry; **simulated** = replay in `scripts/analyze.py`; **external** = cited study; **inference** = engineering judgement). Status column tracks the review discussion (`07-discussion-log.md`).
+
+## A. Configuration
+
+| # | change | effect | evidence | status |
+|---|---|---|---|---|
+| A1 | `compaction.thresholdTokens: 200000` (today: unset → 850k on 1M models) | main tokens −39 % (3.73 → 2.34 B / 14 d), ~2.5 compactions per long session, none for the 58 short sessions. Inside the documented band (Codex CLI 180–244k, Claude Code ~190k, WorkOS 256k, LangWatch 220–240k) and under Codex's ~253k ceiling | simulated + external | **accepted** (150k rejected: 3.2 compactions/session and below LangWatch's 146k floor; 250k rejected: above Codex ceiling) |
+| A2 | `compaction.keepRecentTokens: 48000` (default 20k) | verbatim tail covers ~30 turns; LangWatch: enlarging the preserved tail reduces post-compaction disruption more than moving the threshold; cost ≈ +28k per turn only in the post-compaction window | external | accepted |
+| A3 | remove `gpt-6-astra.contextWindow: 1000000` from `models.yml` | no cost change (Astra peaked at 237k); removes the overflow failure mode (WorkOS: oversized window "relocates the failure") | measured | accepted |
+| A4 | `retry.usageAwareFallback: true`, `usageReservePolicy: confirm`, `usageReservePct: 10` | preflight quota check rotates across 4 Codex / 3 Anthropic accounts before the wall (36 hard-limit errors in window), then walks fallback chains | measured (mechanism in `turn-recovery.ts:1120`) | accepted; `auto` in crunch regime |
+| A5 | `retry.maxDelayMs: 120000` (today 3 h) | fail over in ≤ 2 min instead of sleeping with an expiring prefix | inference | accepted |
+| A6 | fallback chains for `default` and `slow`: `[openai-codex/gpt-5.6-sol, anthropic/claude-opus-5, openrouter/openai/gpt-5.6-sol]` | makes A4 actionable; paid route last at $0.20/M cache vs Astra $1.00 | measured prices | accepted |
+| A7 | `default` → `gpt-5.6-sol` for routine turns; Astra on `plan`/`slow` only | 5× cheaper per cached token at identical context; Astra as every-turn model burned 4 Codex accounts | measured | accepted (`Sol-Opus` preset) |
+| A8 | `reader` stays `anthropic/claude-opus-5`; `advisor` role → `openrouter/deepseek/deepseek-v4.1-flash`; `advisor.enabled: false` stays | Opus pool has 25–40 % weekly headroom while Fable sub-cap is at 100 %; advisor was 30 % of tokens | measured | accepted per user ("opus is free usage") |
+| A9 | `compaction.idleEnabled: true`, `idleThresholdTokens: 150000`, `idleTimeoutSeconds: 300` | a session left at 400k resumes at ~80k, compacted before the call whose prefix already expired | measured (66 % rebuild rate after 15–60 min idle) | accepted |
+| A10 | two presets `Crunch` / `Quality` (`03-context-economics.md`) once presets can carry `compaction` + `task` limits (B11) | crunch: 13 B demand → ~4.7 B on subscriptions vs 6 B supply; quality: wider window, frontier everywhere | simulated | accepted in principle; axes open |
+
+## B. Harness
+
+| # | change | effect | evidence | status |
+|---|---|---|---|---|
+| B10 | **Anthropic 1 h cache TTL on OAuth**: `getCacheControl` intends `ttl: "1h"` on the official host, sessions show `ephemeral5m` on 606/608 turns. Find the drop (compat flag or wire), verify with a 10/40/70-min reuse probe; apply selectively (main sessions yes, short workers no — 1 h writes cost 2×, break-even ≥ 0.65 avoided expiries per creation) | 35–43 M write tokens / 14 d (≈ $1k nominal, 19 % of spend is cache-write) | measured | accepted; first PR |
+| B11 | **per-role compaction settings** `compaction.roles.<role>.{thresholdTokens,keepRecentTokens}`; presets carry `compaction` and `task` blocks | subagents/reader at 150k/32k (crunch 96k/24k), main 200k/48k, coordination profile 240k/60k | simulated (−33 % / −50 % subagent) | accepted |
+| B12 | **subagent context cap** (in-subagent compaction at the role threshold) + **p99 turn guard** (~200) with structured handoff and lineage budget inheritance; soft checkpoint at a configurable turn count asking for artifact-linked progress before continuing | long tail (87 runs = 3.40 B) is the largest single pool; context cap −33 % with no handoff penalty; turn cap at 48 flips to +6 % if P=55 | simulated + external | accepted: cap context, not turns |
+| B12b | **park-and-wake for coordinators**: `hub wait` default `timeoutMs: 0` when the agent has no other work; time-window coalescing of `async-result` deliveries (~10 s); idle compaction during the wait; longer-term a zero-model-call park primitive | 0.87 B of hub-only context (462 lone-wait turns = 183 M in the big sessions); reviewer estimate 0.40–0.71 B recoverable | measured | accepted |
+| B13 | **tool-output budgets**: ~8k tokens per result, ~20k aggregate new tool output per turn, spill to `artifact://` (`read` already pages; `grep`/`bash` don't cap the same way) | read+grep = 82 % of tool bytes, re-read every turn until compaction | measured | accepted; downside: more deliberate re-reads |
+| B14 | **compaction telemetry** in `stats.db`: reason, strategy, before/after tokens, tail size, newly-written prefix, cache TTL requested vs observed, wall time; plus tokens-since-last-verified-progress per agent | none of this is recorded today; every number here is simulated instead of measured | — | accepted; unblocks measuring B11/B12 |
+| B15 | **boundary-aware compaction**: when over threshold, defer up to N turns until a natural boundary (todo item done, test pass, plan phase change) | targets the 41.9 % post-compaction correction spike; zero token cost (timing, not content) | external | accepted |
+| B16 | **quota-per-verified-task accounting**: join `usage_history` deltas to session/task completion | subscription quota ≠ nominal dollars; needed to rank models by quota burn per finished task | inference | accepted |
+| B17 | **retry split**: transient overload ≤ 3 attempts / ~120 s; `usage_limit_reached` → no re-retry of the same account before reset, straight to rotation/fallback | 69 overloaded + 25 × 429 + 11 usage-limit retries each resend the full prefix | measured | accepted |
+| B18 | **OpenRouter endpoint pinning** as a first-class `models.yml` field; defaults GLM-5.3 → `order: [morph, deepinfra]`, DeepSeek V4.1 Flash → `order: [deepseek, deepinfra]` | default routing picks $0.20 cache when Morph is $0.18 fp8 / DeepInfra $0.12 fp4; avoids unknown-quant endpoints | measured prices | accepted |
+| B19 | **roles**: fallback chain for every role (not just `designer`); `task.agentModelOverrides` per agent kind (`scout → @reader`, `reviewer → @slow`, `sonic → @smol`, `task → @default`); thinking level per role | today all `task` agents run on Opus regardless of kind | measured (`structured-subagent.ts:281`) | accepted |
+| B20 | **`omp roles suggest`**: catalog gains a `quality` field from an aggregated benchmark source; each role declares requirements (quality ≥ q, ctx ≥ c, toolCall, vision) and a quality/cost weight; command scores routes you are authenticated for (model_perf tok/s, TTFT, current quota fraction as penalty) and prints a ranked table; `--apply` writes the preset. Suggest-then-apply, not silent | benchmarks rank models, roles need routes (auth, quota, cache price, latency) | inference | accepted in principle |
+| B21 | **quota-adaptive preset**: aggregate 7-day remaining across pools < 40 % → `Crunch`, else `Quality` | uses the bars omp already records | inference | open |
+| B22 | reasoning-effort on scheduling/bookkeeping turns → low | < 0.004 % of tokens; hygiene only | measured | footnote |
+
+## What the numbers add up to
+
+- A1–A9 alone: main tokens −39 %, advisor already gone (−31 % of the old total), idle-expiry rewrites removed on resume, Astra off routine turns → the same work at roughly a third to a half of current quota burn.
+- B11–B12b: subagent pool −33 % (crunch −50 %), hub-wait pool −50–90 %. Combined with A: crunch demand of 13 B/week fits in the 6 B/week subscription supply once the reader tier is on API.
+- B14/B16 turn the simulations into measurements; without them every later tuning is guesswork.
+
+## Sequencing
+
+B10 → B14 → B11/B12/B12b → B13 → B15/B17 → B18/B19 → B16/B20/B21. Each its own PR; A-items land as a documented `config.yml` diff alongside B11 (presets).
