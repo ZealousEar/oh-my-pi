@@ -50,6 +50,7 @@ describe("renderComputerCall", () => {
 			"press",
 			"raise",
 			"ax",
+			"observe",
 			"find",
 			"ref",
 		]);
