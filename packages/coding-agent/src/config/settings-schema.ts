@@ -225,15 +225,62 @@ export interface ModelTagsSettings {
 	[key: string]: ModelTagDef;
 }
 
+/**
+ * Value type of the `defaultThinkingLevel` setting — a concrete thinking
+ * effort or the `auto` sentinel. Matches the setting's enum values
+ * (`[...THINKING_EFFORTS, AUTO_THINKING]`); notably narrower than
+ * `ConfiguredThinkingLevel`, which also admits `inherit` and `off`.
+ */
+export type DefaultThinkingLevel = (typeof THINKING_EFFORTS)[number] | typeof AUTO_THINKING;
+
+/**
+ * A saved, switchable permutation of model-role settings. Applied session-scoped
+ * from the /models Presets view (a runtime routing override; never persisted to
+ * the global or project layer). Definitions are stored under the `modelPresets`
+ * setting keyed by preset name.
+ */
+export interface ModelPresetV1 {
+	/** Schema version, for forward migration of stored presets. */
+	version: 1;
+	/** Role -> model selector, mirroring `modelRoles`. */
+	roles: Record<string, string>;
+	/** `retry.fallbackChains` snapshot; an empty record means "no chains". */
+	fallbackChains: Record<string, string[]>;
+	/** Quick-switch `cycleOrder` snapshot; an empty array means "no cycle". */
+	cycleOrder: string[];
+	/**
+	 * `defaultThinkingLevel` at capture; resolves roles without an explicit
+	 * thinking suffix. Restricted to the setting's enum — a concrete thinking
+	 * effort or `auto`, never `inherit`/`off`.
+	 */
+	defaultThinkingLevel: DefaultThinkingLevel;
+}
+
+/** Pre-authorized automation capability loaded only from user-owned settings. */
+export interface AutomationPermissionGrantSetting {
+	targets: string[];
+	actions: string[];
+	consequential?: boolean;
+	ttlMinutes?: number;
+	task?: string;
+	valueFingerprints?: string[];
+	rawAccess?: "broad";
+	codeFingerprints?: string[];
+	browserAppAccess?: "broad";
+	desktopAccess?: "broad";
+}
+
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
+const EMPTY_AUTOMATION_PERMISSION_GRANTS: AutomationPermissionGrantSetting[] = [];
 const EMPTY_AGENT_SERVICE_TIER_OVERRIDES: Record<string, ServiceTierInheritSettingValue> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
+const EMPTY_MODEL_PRESETS: Record<string, ModelPresetV1> = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
@@ -519,6 +566,8 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+
+	modelPresets: { type: "record", default: EMPTY_MODEL_PRESETS },
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
@@ -815,6 +864,62 @@ export const SETTINGS_SCHEMA = {
 				{ value: "2000", label: "2000 lines", description: "~10K tokens" },
 				{ value: "5000", label: "5000 lines", description: "~25K tokens" },
 			],
+		},
+	},
+
+	// semantic-find settings
+	"semanticFind.maxFiles": {
+		type: "number",
+		default: 24,
+		ui: {
+			tab: "tools",
+			group: "Semantic Find",
+			label: "Max Files",
+			description: "Maximum number of files or resources `semantic_find` may read in one call",
+		},
+	},
+
+	"semanticFind.maxBytesPerFile": {
+		type: "number",
+		default: 262144,
+		ui: {
+			tab: "tools",
+			group: "Semantic Find",
+			label: "Max Bytes Per File",
+			description: "Files larger than this are skipped by `semantic_find` rather than partially read",
+		},
+	},
+
+	"semanticFind.maxPassages": {
+		type: "number",
+		default: 2000,
+		ui: {
+			tab: "tools",
+			group: "Semantic Find",
+			label: "Max Passages",
+			description: "Total passage budget across all selected files; exceeding it is an error asking to narrow",
+		},
+	},
+
+	"semanticFind.passagesPerRequest": {
+		type: "number",
+		default: 200,
+		ui: {
+			tab: "tools",
+			group: "Semantic Find",
+			label: "Passages Per Request",
+			description: "Passages scored in one judgment window; capped at the 255-option choice limit",
+		},
+	},
+
+	"semanticFind.contextLines": {
+		type: "number",
+		default: 2,
+		ui: {
+			tab: "tools",
+			group: "Semantic Find",
+			label: "Context Lines",
+			description: "Lines of surrounding context rendered around each `semantic_find` hit",
 		},
 	},
 
@@ -2673,6 +2778,115 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"compaction.semanticShake.protectTokens": {
+		type: "number",
+		default: 16_000,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Semantic Shake Protect Window",
+			description:
+				"Most recent context tokens semantic shake never touches; only tool results older than this window are offered to the judgment",
+		},
+	},
+
+	"compaction.semanticShake.maxRegionsPerCall": {
+		type: "number",
+		default: 12,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Semantic Shake Regions per Call",
+			description: "Eligible tool results judged in one request; the pass stops at reduction.maxCallsPerPass",
+		},
+	},
+
+	// Shared reduction policy (bash output pruning + semantic shake)
+	"reduction.egress": {
+		type: "enum",
+		values: ["off", "selected"] as const,
+		default: "off",
+		ui: {
+			tab: "context",
+			group: "Reduction",
+			label: "Semantic Reduction Egress",
+			description:
+				"What may leave this machine for a reduction judgment. off: deterministic stages only, nothing is sent. selected: the candidate tool-output spans, the command or tool call, and a bounded task-context excerpt — never whole transcripts, environment, or credentials; configured secrets are placeholder-obfuscated and credential-shaped text is heuristically redacted first",
+		},
+	},
+
+	"reduction.maxCallsPerPass": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "context",
+			group: "Reduction",
+			label: "Reduction Calls per Pass",
+			description:
+				"Judgment requests admitted for one reduction pass (one command's output, one shake); retries, refinements, and failures all count",
+		},
+	},
+
+	"reduction.maxLatencyMs": {
+		type: "number",
+		default: 4_000,
+		ui: {
+			tab: "context",
+			group: "Reduction",
+			label: "Reduction Latency Budget",
+			description:
+				"Wall clock admitted for one reduction pass; when it runs out the unjudged content is kept as it was",
+		},
+	},
+	"reduction.taskContextChars": {
+		type: "number",
+		default: 2_000,
+		ui: {
+			tab: "context",
+			group: "Reduction",
+			label: "Reduction Task Context",
+			description:
+				"Characters of the original request, latest request, latest reply, and standing requirements a semantic reduction may read and, with egress enabled, send",
+		},
+	},
+
+	// Bash output pruning
+	"bash.outputPruning.mode": {
+		type: "enum",
+		values: ["off", "deterministic", "semantic"] as const,
+		default: "off",
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Output Pruning",
+			description:
+				"Reduce a completed command's model-visible output after the shell minimizer: deterministic keeps recognised diagnostics, counts, exit status, and structured content and drops recognised build/install/test noise; semantic additionally asks a bounded judgment which remaining noisy spans can be omitted (requires reduction.egress = selected). The lossless original is always saved first and linked once",
+		},
+	},
+
+	"bash.outputPruning.minTokens": {
+		type: "number",
+		default: 1_500,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Output Pruning Threshold",
+			description: "Model-visible output tokens (markers and footers included) below which pruning is skipped",
+		},
+	},
+
+	"bash.outputPruning.maxSegments": {
+		type: "number",
+		default: 40,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Output Pruning Segments per Call",
+			description:
+				"Candidate spans offered to one judgment request; larger outputs are judged in bounded batches or left untouched",
+		},
+	},
+
 	// No default: an unset reserve tells the compaction layer the user never
 	// chose one, so small-window recovery may swap in the proportional reserve
 	// (see resolveBudgetReserveTokens). A materialized 16384 here would make
@@ -4126,7 +4340,7 @@ export const SETTINGS_SCHEMA = {
 	// Default tool approval mode (interaction tab, but governs the tool wrapper).
 	//   "always-ask" — auto-approves read-tier tools only; prompts for write/exec.
 	//   "write"      — auto-approves read and write-tier tools; prompts for exec.
-	//   "yolo"       — auto-approves every tier.
+	//   "yolo"       — auto-approves every tier except browser/computer mutations, which always require a scope.
 	"tools.approvalMode": {
 		type: "enum",
 		values: ["always-ask", "write", "yolo"] as const,
@@ -4136,7 +4350,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Approvals",
 			label: "Tool Approval",
 			description:
-				"Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves all tiers; user policy may still prompt or block.",
+				"Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves other exec tiers, but browser/computer mutations still require an explicit user-granted automation capability.",
 			options: [
 				{
 					value: "always-ask",
@@ -4153,7 +4367,7 @@ export const SETTINGS_SCHEMA = {
 					value: "yolo",
 					label: "Yolo",
 					description:
-						"Auto-approve read, write, and exec tools. User policy can still require confirmation or block calls.",
+						"Auto-approve read, write, and other exec tools. Browser/computer mutations still require an explicit user-granted capability.",
 				},
 			],
 		},
@@ -4392,6 +4606,111 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"computer.permissions.grants": {
+		type: "array",
+		default: EMPTY_AUTOMATION_PERMISSION_GRANTS,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Permission Grants",
+			description:
+				'Pre-authorized exact desktop app/action capabilities. Targets cannot contain wildcards; consequential actions require consequential:true. Raw computer.run requires rawAccess:"broad" or an exact codeFingerprints entry. Browser apps (Chrome, Chromium, Safari, Firefox, Edge, Brave, Arc, Opera, Vivaldi) require browserAppAccess:"broad" because desktop control is app-wide, not site-confined. Root mouse/keyboard methods target "desktop" and require desktopAccess:"broad". Optional ttlMinutes expires a grant within this session.',
+		},
+	},
+
+	// computer task settings
+	"computer.task.maxActions": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Desktop Task Max Actions",
+			description: "Maximum desktop actions one computer.task goal loop may dispatch",
+		},
+	},
+
+	"computer.task.maxCalls": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Desktop Task Max Judgment Calls",
+			description: "Maximum judgment calls one computer.task goal loop may make, failed calls included",
+		},
+	},
+
+	"computer.task.deadlineSec": {
+		type: "number",
+		default: 120,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Desktop Task Deadline",
+			description: "Wall-clock budget for one computer.task goal loop, in seconds",
+		},
+	},
+
+	"computer.task.allowConsequential": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Desktop Task Consequential Actions",
+			description:
+				"Offer send/delete/purchase-class desktop actions to the goal loop by default; withheld unless a call passes allowConsequential",
+		},
+	},
+
+	"computer.driverBin": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Cua Driver Executable",
+			description:
+				"Explicit path to the Cua Driver executable, overriding $CUA_DRIVER_BIN, the /Applications bundle, and PATH lookup. The daemon is never started by omp",
+		},
+	},
+
+	"computer.task.backend": {
+		type: "enum",
+		values: ["auto", "native", "cua"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Desktop Task Backend",
+			description:
+				"Which backend computer.task drives. 'auto' uses the Cua Driver when it is installed, at least the required version, its daemon is running, and both macOS grants are present, otherwise the native accessibility backend. 'native' never touches the driver. 'cua' requires the driver and fails closed with the exact missing prerequisites.",
+			options: [
+				{ value: "auto", label: "Auto (Cua Driver when usable)", description: "Default" },
+				{ value: "native", label: "Native accessibility" },
+				{ value: "cua", label: "Cua Driver (required)" },
+			],
+		},
+	},
+
+	"computer.cua.telemetry": {
+		type: "enum",
+		values: ["off", "driver"] as const,
+		default: "off",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Cua Driver Telemetry",
+			description:
+				"Telemetry policy for the cua-driver processes omp spawns. 'off' sets CUA_DRIVER_RS_TELEMETRY_ENABLED=false on each spawned process (the driver's documented per-process override; no global preference is changed). 'driver' leaves the driver's own persisted telemetry preference in force.",
+			options: [
+				{ value: "off", label: "Off for spawned processes", description: "Default" },
+				{ value: "driver", label: "Driver's own preference" },
+			],
+		},
+	},
+
 	"images.questionTimeoutMs": {
 		type: "number",
 		default: 300_000,
@@ -4621,6 +4940,28 @@ export const SETTINGS_SCHEMA = {
 				{ value: "1800", label: "30 minutes" },
 				{ value: "3600", label: "1 hour" },
 			],
+		},
+	},
+	"browser.permissions.grants": {
+		type: "array",
+		default: EMPTY_AUTOMATION_PERMISSION_GRANTS,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Permission Grants",
+			description:
+				'Pre-authorized browser capabilities. Ordinary mutations use exact origin/action targets with no wildcards. Raw actions are never site-confined and require rawAccess:"broad" for the whole browser identity or an exact codeFingerprints entry; actions:"*" never covers raw. Optional ttlMinutes expires a grant within this session.',
+		},
+	},
+	"browser.tabs.abandonedIdleHours": {
+		type: "number",
+		default: 6,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Abandoned Browser Tab Timeout",
+			description:
+				"Close OMP-created browser tabs idle this many hours unless protected (in-flight run, persist, login/unsaved input, download, foreground tab, other live owner). Set 0 to disable.",
 		},
 	},
 	"browser.screenshotDir": {
@@ -5297,6 +5638,73 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// B5 pane backend settings
+	"task.paneBackend": {
+		type: "enum",
+		values: ["auto", "native", "herdr"] as const,
+		default: "native",
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Task Execution Backend",
+			description:
+				"Where task subagents run. 'native' keeps every subagent in-process (no visible terminal). 'herdr' runs each subagent as a visible HerdR pane agent and fails loudly when the prerequisites are missing. 'auto' uses a pane only when omp itself is running inside a HerdR pane and preflight passes, otherwise native. Per-spawn `visible: true` requests a pane regardless. OMP_TASK_HERDR=0 disables panes outright; =1 enables the auto path.",
+			options: [
+				{ value: "native", label: "Native (in-process)", description: "Default" },
+				{ value: "auto", label: "Auto (pane when inside HerdR)" },
+				{ value: "herdr", label: "HerdR pane" },
+			],
+		},
+	},
+
+	"task.herdr.session": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "HerdR Task Session",
+			description:
+				"Dedicated named HerdR session that hosts pane subagents, e.g. 'omp-tasks'. Each spawn gets its own workspace there, which keeps task panes out of the session you drive by hand; 'default' is rejected for that reason. Leave empty to create sibling panes in the pane omp itself is running in.",
+		},
+	},
+
+	"task.herdr.readyTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "HerdR Pane Ready Timeout",
+			description:
+				"How long `herdr agent start` may take to detect the child omp in its pane and consider it ready for input. On timeout the spawn fails and the pane is retained so you can see what the child is stuck on.",
+		},
+	},
+
+	"task.herdr.promptTimeoutMs": {
+		type: "number",
+		default: 600_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "HerdR Pane Prompt Timeout",
+			description:
+				"How long a pane subagent may work on its prompt before HerdR stops waiting for a settled idle/blocked state.",
+		},
+	},
+
+	"task.herdr.keepPane": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Keep HerdR Panes",
+			description:
+				"Leave each pane subagent's pane (and workspace) open after it finishes, instead of closing the pane this spawn created. Panes are always retained when the child is blocked or never became ready.",
+		},
+	},
+
 	// Skills
 	"skills.enabled": { type: "boolean", default: true },
 
@@ -5330,6 +5738,53 @@ export const SETTINGS_SCHEMA = {
 	"skills.ignoredSkills": { type: "array", default: [] as string[] },
 
 	"skills.includeSkills": { type: "array", default: [] as string[] },
+
+	// skill-recommend settings
+	"skills.recommend.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Skill Recommendation",
+			description:
+				"Expose the `recommend_skills` tool: ranks installed skills against a task through the judgment backend, falling back to lexical overlap when none is reachable",
+		},
+	},
+
+	"skills.recommend.maxCandidatesPerRequest": {
+		type: "number",
+		default: 200,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Skill Ranking Window",
+			description:
+				"Skills scored in one judgment request (capped at the 255-option Choice limit). Larger catalogs are split into windows and every window is scored",
+		},
+	},
+
+	"skills.recommend.minRelevance": {
+		type: "number",
+		default: 0.1,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Skill Relevance Floor",
+			description: "Minimum selection probability a skill needs before it is reported as a recommendation",
+		},
+	},
+
+	"skills.recommend.cacheEntries": {
+		type: "number",
+		default: 64,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Skill Ranking Cache",
+			description: "Cached rankings kept per session, keyed by task, catalog digest, and judgment configuration",
+		},
+	},
 
 	// Commands
 	"commands.enableClaudeUser": {
@@ -5657,6 +6112,37 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"providers.typesafeModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "TypeSafe judgment model",
+			description:
+				"Pin the TypeSafe model used for typed judgments (e.g. jev-1.12) so decisions replay against a fixed backend. Unset uses TYPESAFE_DEFAULT_MODEL or jev-latest.",
+		},
+	},
+	"providers.judgmentFallback": {
+		type: "enum",
+		values: ["llm", "none"] as const,
+		default: "llm",
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "TypeSafe judgment fallback",
+			description:
+				"What happens when a TypeSafe judgment request fails after its retries. LLM re-asks the online chat chain (tiny, smol, default, session model) and flags the answer as a fallback; None fails closed: the TypeSafe error surfaces and no chat model is called.",
+			options: [
+				{ value: "llm", label: "LLM", description: "Fall back through the online model roles (default)" },
+				{
+					value: "none",
+					label: "None",
+					description: "Fail closed; surface the TypeSafe error, never spend on chat",
+				},
+			],
+		},
+	},
 	"providers.tinyModel": {
 		type: "enum",
 		values: TINY_TITLE_MODEL_VALUES,
@@ -5934,6 +6420,51 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	// browser.task settings
+	"browser.task.maxActions": {
+		type: "number",
+		default: 25,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Task Action Bound",
+			description: "Maximum page actions one browser.task run may execute before it stops with status exhausted.",
+		},
+	},
+	"browser.task.maxCalls": {
+		type: "number",
+		default: 60,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Task Call Bound",
+			description:
+				"Maximum judgment requests one browser.task run may make, including the completion check and failed calls.",
+		},
+	},
+	"browser.task.deadlineSec": {
+		type: "number",
+		default: 120,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Task Deadline",
+			description:
+				"Wall-clock budget in seconds for one browser.task run when the call supplies no explicit timeout.",
+		},
+	},
+	"browser.task.allowConsequential": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Task Consequential Actions",
+			description:
+				"Allow browser.task to click submit/buy/pay/checkout/send/delete/confirm/transfer/sign controls without a per-call allowConsequential flag.",
+		},
+	},
+
 	// Codex saved rate-limit resets (auto-redeem)
 	"codexResets.autoRedeem": {
 		type: "enum",
@@ -6294,6 +6825,13 @@ export interface CompactionSettings {
 	dropUseless: boolean;
 }
 
+export interface ReductionSettings {
+	egress: "off" | "selected";
+	maxCallsPerPass: number;
+	maxLatencyMs: number;
+	taskContextChars: number;
+}
+
 export interface RecapSettings {
 	enabled: boolean;
 	idleSeconds: number;
@@ -6477,6 +7015,7 @@ export interface GroupTypeMap {
 	shellMinimizer: ShellMinimizerSettings;
 	codexResets: CodexResetsSettings;
 	gc: GcSettings;
+	reduction: ReductionSettings;
 }
 
 export type GroupPrefix = keyof GroupTypeMap;
