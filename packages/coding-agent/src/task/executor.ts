@@ -65,8 +65,7 @@ import {
 	resolveTaskEffortLevel,
 	type TaskEffort,
 } from "@oh-my-pi/pi-tui/thinking";
-import type { ContextFileEntry, ToolSession } from "../tools";
-import { resolveEvalBackends } from "../tools/eval-backends";
+import type { ContextFileEntry } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { LIST_STATUS_ORDER } from "@oh-my-pi/pi-tui/tools/hub";
 import { DEFAULT_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/tools/hub";
@@ -83,6 +82,7 @@ import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
+import { resolveSubagentToolPolicy } from "./subagent-tool-policy";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
@@ -3336,7 +3336,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		},
 		options.parentServiceTier,
 	);
-	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(
 		0,
 		Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0),
@@ -3350,40 +3349,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	);
 	const softRequestBudget = resolveSoftRequestBudget(agent.name, configuredDefaultBudget);
 	const softRequestBudgetNotice = settings.get("task.softRequestBudgetNotice") ?? false;
-	const parentDepth = options.taskDepth ?? 0;
-	const childDepth = parentDepth + 1;
-	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
+	const {
+		toolNames,
+		spawns: spawnsEnv,
+		childDepth,
+	} = resolveSubagentToolPolicy({
+		agent,
+		settings,
+		parentDepth: options.taskDepth ?? 0,
+		restrictToolNames: options.restrictToolNames === true,
+	});
 
-	// Add tools if specified
-	let toolNames: string[] | undefined;
-	if (agent.tools) {
-		toolNames = agent.tools;
-		// Auto-include task tool if spawns defined but task not in tools
-		if (agent.spawns !== undefined && !toolNames.includes("task") && !atMaxDepth) {
-			toolNames = [...toolNames, "task"];
-		}
-	}
-
-	if (atMaxDepth && toolNames?.includes("task")) {
-		toolNames = toolNames.filter(name => name !== "task");
-	}
-	// Ordinary agents retain the host's always-on collaboration capability.
-	// Restricted sessions must not widen their explicit host tool list with hub.
-	if (
-		toolNames &&
-		!options.restrictToolNames &&
-		!toolNames.includes("hub") &&
-		(!isReadOnlyAgent(agent) || toolNames.includes("task"))
-	) {
-		toolNames = [...toolNames, "hub"];
-	}
-	if (toolNames?.includes("exec")) {
-		const backends = resolveEvalBackends({ settings } as ToolSession);
-		const expanded = toolNames.filter(name => name !== "exec");
-		if (backends.python || backends.js) expanded.push("eval");
-		expanded.push("bash");
-		toolNames = Array.from(new Set(expanded));
-	}
 	// Inbound steering works without hub, but outbound IRC roster and peer coordination instructions
 	// require the hub tool to be available to this subagent.
 	const ircEnabled =
@@ -3393,13 +3369,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
 	const sessionFile = subtaskSessionFile ?? null;
-	const spawnsEnv = atMaxDepth
-		? ""
-		: agent.spawns === undefined
-			? ""
-			: agent.spawns === "*"
-				? "*"
-				: agent.spawns.join(",");
 
 	const lspEnabled = enableLsp ?? true;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
