@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed compaction summaries losing the exact error of a long tool result: the summarizer now sees the first 1 200 and last 800 characters of each result instead of only the head, so a failing test run or shell command keeps its final error and status lines in the summary.
+
 ## [18.2.5] - 2026-09-17
 
 ### Fixed

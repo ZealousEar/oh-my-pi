@@ -15,6 +15,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { getDefault, type Settings } from "../config/settings";
 import {
+	type OutputArtifactError,
 	type OutputSummary,
 	type TruncationResult,
 	truncateMiddle,
@@ -522,13 +523,18 @@ async function spillLargeResultToArtifact(
 	// error, nor re-expose the full (possibly context-blowing) output. Mirror
 	// `enforceInlineByteCap`: always truncate past the threshold, and only
 	// attach the `artifact://` recovery link when the save actually succeeded.
+	// A failed save is surfaced as `artifactError` (the same notice the
+	// streaming sink emits) so the model sees that the elided bytes are gone
+	// instead of a bare elision it may take for a recoverable artifact.
 	let artifactId: string | undefined;
+	let artifactError: OutputArtifactError | undefined;
 	// A failed stream capture only left a preview here. Saving that preview
 	// would invent a misleading full-output recovery link, not recover the log.
 	if (!existingMeta?.artifactError) {
 		try {
 			artifactId = await sessionManager.saveArtifact(fullText, toolName);
 		} catch (error) {
+			artifactError = "write";
 			logger.warn("Failed to spill large tool result to artifact", {
 				tool: toolName,
 				error: error instanceof Error ? error.message : String(error),
@@ -608,6 +614,7 @@ async function spillLargeResultToArtifact(
 	}
 
 	const newMeta: OutputMeta = { ...existingMeta, truncation: truncationMeta };
+	if (artifactError) newMeta.artifactError = artifactError;
 	const newDetails = { ...result.details, meta: newMeta };
 
 	// Prune the raw payload only MCP results duplicate into `details.rawContent`.
