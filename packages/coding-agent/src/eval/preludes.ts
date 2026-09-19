@@ -2,6 +2,14 @@ import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback, ToolAp
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
 import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import {
+	automationScopeFromDenied,
+	DEFAULT_SCOPE_TTL_MS,
+	grantAutomationScope,
+	revokeAutomationScope,
+	settleAutomationDenialCleanup,
+	type AutomationSurface,
+} from "../tools/automation-policy";
 
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
@@ -38,6 +46,8 @@ export interface EvalPreludeDefinition {
 	codeModeDeclarations?: string;
 	/** Approval tier or argument-dependent approval decision for host calls. */
 	approval?: ToolApproval;
+	/** Automation surface whose exec calls defer prompting until the host resolves the required capability. */
+	automationSurface?: AutomationSurface;
 	/** Live availability predicate. Omission means enabled. */
 	enabled?: () => boolean;
 	/** Execute a host call outside the language VM. */
@@ -86,6 +96,9 @@ async function approvePreludeInvocation(
 	if (definition.approval !== undefined) subject.approval = definition.approval;
 	const resolved = resolveApproval(subject, parameters, mode, policies);
 	if (resolved.policy === "deny") throw denyError(resolved, definition.name);
+	// Browser/desktop exec calls are authorized only after their host resolves
+	// the required capability. A generic approval cannot grant it.
+	if (definition.automationSurface && resolved.tier === "exec") return;
 	if (resolved.policy !== "prompt") return;
 
 	const ui = context.context?.ui;
@@ -99,6 +112,68 @@ async function approvePreludeInvocation(
 		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"]),
 	);
 	if (choice !== "Approve") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
+}
+
+async function invokeWithAutomationScope(
+	definition: EvalPreludeDefinition,
+	parameters: unknown,
+	context: EvalPreludeContext,
+): Promise<AgentToolResult<unknown>> {
+	try {
+		return await definition.invoke(parameters, context);
+	} catch (error) {
+		const needsScope = automationScopeFromDenied(error);
+		if (!needsScope || definition.automationSurface !== needsScope.surface) throw error;
+		try {
+			const ui = context.context?.ui;
+			if (!ui || context.context?.hasUI === false) throw error;
+			const rawCapability = needsScope.rawAccess === "broad" || needsScope.codeFingerprints !== undefined;
+			const browserAppCapability = needsScope.browserAppAccess === "broad";
+			const desktopCapability = needsScope.desktopAccess === "broad";
+			const boundary = rawCapability
+				? ` This arbitrary-code capability reaches the whole ${needsScope.surface === "browser" ? "relay browser identity" : "desktop"}, not only ${needsScope.targets.join(", ")}.`
+				: browserAppCapability
+					? ` Desktop control of ${needsScope.targets.join(", ")} is app-wide, not confined to its active site.`
+					: desktopCapability
+						? " Root mouse/keyboard input can reach the whole desktop, not only the focused application."
+						: "";
+			const durationChoice = rawCapability
+				? needsScope.rawAccess === "broad"
+					? "Approve broad raw capability (60 min)"
+					: "Approve this exact code (60 min)"
+				: "Approve for this target+action (60 min)";
+			const onceChoice = rawCapability ? "Approve this exact capability once" : "Approve once";
+			const prompt =
+				rawCapability || browserAppCapability || desktopCapability
+					? `Allow ${needsScope.surface} ${needsScope.actions.join(", ")}?${boundary}`
+					: `Allow ${needsScope.surface} ${needsScope.actions.join(", ")} on ${needsScope.targets.join(", ")}?`;
+			const choice = await untilAborted(context.signal, () =>
+				ui.select(prompt, [durationChoice, onceChoice, "Deny"]),
+			);
+			if (choice === "Deny" || choice === undefined) throw error;
+			const once = choice === onceChoice;
+			const scope = grantAutomationScope(context.session, {
+				...needsScope,
+				ttlMs: once ? 5 * 60_000 : DEFAULT_SCOPE_TTL_MS,
+				...(once ? { once: true } : {}),
+				...(once ? { invocationId: context.toolCallId } : {}),
+			});
+			try {
+				context.signal?.throwIfAborted();
+				if (findEnabledEvalPrelude(context.session, definition.name) !== definition) {
+					throw new Error(`Eval prelude "${definition.name}" changed while authorizing the call.`);
+				}
+				return await definition.invoke(parameters, context);
+			} catch (retryError) {
+				await settleAutomationDenialCleanup(retryError);
+				throw retryError;
+			} finally {
+				if (once) revokeAutomationScope(context.session, scope.id);
+			}
+		} finally {
+			await settleAutomationDenialCleanup(error);
+		}
+	}
 }
 
 /**
@@ -128,5 +203,5 @@ export async function invokeEvalPrelude(
 			throw new Error(`Eval prelude "${name}" changed while authorizing the call.`);
 		}
 	}
-	return definition.invoke(parameters, context);
+	return await invokeWithAutomationScope(definition, parameters, context);
 }

@@ -60,8 +60,10 @@ import { MemoryReflectTool } from "./memory-reflect";
 import { MemoryRetainTool } from "./memory-retain";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
+import { RecommendSkillsTool } from "./recommend-skills";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
+import { SemanticFindTool } from "./semantic-find";
 import { supportsExternalThinking, ThinkTool } from "./think";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool } from "./todo";
@@ -121,6 +123,7 @@ export * from "./memory-reflect";
 export * from "./memory-retain";
 export * from "./read";
 export * from "./report-tool-issue";
+export * from "./recommend-skills";
 export * from "./resolve";
 export type {
 	FindingPriority,
@@ -129,6 +132,7 @@ export type {
 	SubmitReviewDetails,
 } from "@oh-my-pi/pi-tui/tools/task";
 export * from "./security-scan";
+export * from "./semantic-find";
 export * from "./think";
 export * from "./todo";
 export * from "./tts";
@@ -292,11 +296,19 @@ export interface ToolSession {
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
-	/** Owning journal; full SDK managers also supply registered identity without changing advisor-local IDs. */
+	/**
+	 * Owning journal; full SDK managers also supply registered identity without
+	 * changing advisor-local IDs, and the usage ledger so judgment-driven tools
+	 * can record their model calls (`appendModelUsage` + `getLeafId`).
+	 */
 	sessionManager?: Pick<
 		SessionManager,
 		"appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"
-	> & { getSessionId?: SessionManager["getSessionId"] };
+	> & {
+		getSessionId?: SessionManager["getSessionId"];
+		appendModelUsage?: SessionManager["appendModelUsage"];
+		getLeafId?: SessionManager["getLeafId"];
+	};
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */
@@ -530,6 +542,8 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	recommend_skills: RecommendSkillsTool.createIf,
+	semantic_find: SemanticFindTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {

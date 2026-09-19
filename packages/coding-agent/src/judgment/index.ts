@@ -7,7 +7,9 @@
  *
  * 1. **TypeSafe** (`typesafe`, or `auto` with a stored / env credential): the
  *    native System One API, keyed by `AuthStorage` so `/login typesafe` and
- *    `TYPESAFE_API_KEY` both work and 401s rotate credentials.
+ *    `TYPESAFE_API_KEY` both work and 401s rotate credentials. A failed request
+ *    falls back to the online chain (`providers.judgmentFallback: llm`) or
+ *    fails closed (`none`).
  * 2. **Local on-device model** when the feature's backend setting names one:
  *    keyword prompts through the shared tiny-model worker.
  * 3. **Online chat bridge** (`online`): keyword prompts to the `tiny`/`smol`
@@ -27,6 +29,7 @@ import {
 	type TextCompletion,
 	type TextPrompt,
 	TextJudge,
+	tokenUsage,
 	TYPESAFE_PROVIDER,
 	TypeSafeJudge,
 	type Usage,
@@ -72,8 +75,36 @@ const LOCAL_REASONING_MAX_TOKENS = 1024;
 /** Which backend a resolved judge routes to; callers tune question granularity on it. */
 export type JudgeKind = "typesafe" | "local" | "online";
 
+/** What a failed TypeSafe request does next; `providers.judgmentFallback`. */
+export type JudgmentFallback = "llm" | "none";
+
+/**
+ * One underlying transport attempt behind a judgment: the TypeSafe call (with
+ * `error` when it failed before a fallback) and every chat completion attempt
+ * the online chain made. Failed attempts carry zero usage unless the transport
+ * reported some.
+ */
+export interface JudgmentAttempt {
+	api: string;
+	provider: string;
+	model: string;
+	usage: Usage;
+	durationMs: number;
+	error?: string;
+}
+
+export interface ResolvedJudgeOptions extends JudgeOptions {
+	/** Receives one event per transport attempt, in order; the final result is unaffected. */
+	onAttempt?: (attempt: JudgmentAttempt) => void;
+}
+
 export interface ResolvedJudge extends Judge {
 	readonly kind: JudgeKind;
+	/** Model pinned via `providers.typesafeModel` when the TypeSafe backend is in front. */
+	readonly pinnedModel?: string;
+	/** Fallback policy when the TypeSafe backend is in front; absent for judges that are the LLM already. */
+	readonly fallback?: JudgmentFallback;
+	judge<Q extends Questions>(request: JudgmentRequest<Q>, options?: ResolvedJudgeOptions): Promise<JudgmentResult<Q>>;
 }
 
 /** Whether typed judgments currently go to TypeSafe rather than a chat/local model. */
@@ -85,43 +116,104 @@ export function usesTypeSafeJudge(settings: Settings, registry: ModelRegistry): 
 
 /**
  * Resolve the judge for a feature. With TypeSafe in front, a failed TypeSafe
- * call (network, 5xx after retries, rejected key) falls back to the LLM judge
- * the feature would otherwise use; only caller aborts propagate.
+ * call (network, 5xx after retries, rejected key) falls back to the online
+ * chat chain when `providers.judgmentFallback` is `llm`, or propagates when it
+ * is `none`; caller aborts always propagate.
  */
 export function resolveJudge(deps: JudgeDeps): ResolvedJudge {
 	const configuredLlm = resolveLlmJudge(deps);
 	if (!usesTypeSafeJudge(deps.settings, deps.registry)) return configuredLlm;
-	// A native judgment failure always falls back to the online role chain,
-	// never a feature's optional local-model override.
-	const fallback = new OnlineChatJudge(deps);
+	const pinnedModel = deps.settings.get("providers.typesafeModel")?.trim() || undefined;
 	const typesafe = new TypeSafeJudge({
 		apiKey: deps.registry.authStorage.resolver(TYPESAFE_PROVIDER, { sessionId: deps.sessionId }),
+		model: pinnedModel,
 	});
-	return {
-		kind: "typesafe",
-		label: typesafe.label,
-		async judge(request, options) {
-			try {
-				const result = await typesafe.judge(request, options);
-				deps.onUsage?.({
-					role: TYPESAFE_PROVIDER,
-					api: result.api,
-					provider: result.provider,
-					model: result.model,
-					usage: result.usage,
-					stopReason: "stop",
-				});
-				return result;
-			} catch (error) {
-				if (options?.signal?.aborted || AIError.is(AIError.classify(error), AIError.Flag.Abort)) throw error;
-				logger.debug("judgment: TypeSafe failed; falling back to LLM judge", {
-					error: error instanceof Error ? error.message : String(error),
-					fallback: fallback.label,
-				});
-				return fallback.judge(request, options);
-			}
+	// A native judgment failure falls back to the online role chain, never a
+	// feature's optional local-model override.
+	return new TypeSafeFrontedJudge(
+		typesafe,
+		new OnlineChatJudge(deps),
+		deps.settings.get("providers.judgmentFallback"),
+		{
+			pinnedModel,
+			onUsage: deps.onUsage,
 		},
-	};
+	);
+}
+
+/**
+ * TypeSafe in front of an LLM judge. Successful native answers are reported to
+ * `onUsage` as the `typesafe` role; failures either route to `fallback`
+ * (`llm`) or propagate (`none`). Aborts always propagate.
+ */
+export class TypeSafeFrontedJudge implements ResolvedJudge {
+	readonly kind = "typesafe";
+	readonly label: string;
+	readonly pinnedModel?: string;
+	readonly fallback: JudgmentFallback;
+	readonly #typesafe: TypeSafeJudge;
+	readonly #llm: Judge;
+	readonly #onUsage?: (usage: JudgmentUsage) => void;
+
+	constructor(
+		typesafe: TypeSafeJudge,
+		llm: Judge,
+		fallback: JudgmentFallback,
+		options: { pinnedModel?: string; onUsage?: (usage: JudgmentUsage) => void } = {},
+	) {
+		this.#typesafe = typesafe;
+		this.#llm = llm;
+		this.fallback = fallback;
+		this.label = typesafe.label;
+		this.pinnedModel = options.pinnedModel;
+		this.#onUsage = options.onUsage;
+	}
+
+	async judge<Q extends Questions>(
+		request: JudgmentRequest<Q>,
+		options?: ResolvedJudgeOptions,
+	): Promise<JudgmentResult<Q>> {
+		const startedAt = Date.now();
+		try {
+			const result = await this.#typesafe.judge(request, options);
+			this.#onUsage?.({
+				role: TYPESAFE_PROVIDER,
+				api: result.api,
+				provider: result.provider,
+				model: result.model,
+				usage: result.usage,
+				stopReason: "stop",
+			});
+			options?.onAttempt?.({
+				api: result.api,
+				provider: result.provider,
+				model: result.model,
+				usage: result.usage,
+				durationMs: Date.now() - startedAt,
+			});
+			return result;
+		} catch (error) {
+			if (options?.signal?.aborted || AIError.is(AIError.classify(error), AIError.Flag.Abort)) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			options?.onAttempt?.({
+				api: TYPESAFE_PROVIDER,
+				provider: TYPESAFE_PROVIDER,
+				model: this.#typesafe.model,
+				usage: tokenUsage(0, 0),
+				durationMs: Date.now() - startedAt,
+				error: message,
+			});
+			if (this.fallback === "none") {
+				logger.debug("judgment: TypeSafe failed; fallback disabled, failing closed", { error: message });
+				throw error;
+			}
+			logger.debug("judgment: TypeSafe failed; falling back to LLM judge", {
+				error: message,
+				fallback: this.#llm.label,
+			});
+			return this.#llm.judge(request, options);
+		}
+	}
 }
 
 function resolveLlmJudge(deps: JudgeDeps): ResolvedJudge {
@@ -189,7 +281,7 @@ class OnlineChatJudge implements ResolvedJudge {
 
 	async judge<Q extends Questions>(
 		request: JudgmentRequest<Q>,
-		options: JudgeOptions = {},
+		options: ResolvedJudgeOptions = {},
 	): Promise<JudgmentResult<Q>> {
 		const deps = this.#deps;
 		const candidates = collectOnlineTinyCandidates(
@@ -209,6 +301,10 @@ class OnlineChatJudge implements ResolvedJudge {
 			if (signal?.aborted) {
 				throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
 			}
+			// Attempts are sequential within a candidate, so each one's duration is
+			// the gap since the previous attempt ended (or since the candidate began).
+			let attemptStartedAt = Date.now();
+			let reported = 0;
 			try {
 				const apiKey = await deps.registry.getApiKey(model, deps.sessionId);
 				if (!apiKey) {
@@ -221,7 +317,9 @@ class OnlineChatJudge implements ResolvedJudge {
 					apiKey: deps.registry.resolver(model, deps.sessionId),
 					sessionId: deps.sessionId,
 					metadata,
-					onAttempt: attempt =>
+					onAttempt: attempt => {
+						const now = Date.now();
+						reported++;
 						deps.onUsage?.({
 							role,
 							api: attempt.api,
@@ -230,10 +328,36 @@ class OnlineChatJudge implements ResolvedJudge {
 							usage: attempt.usage,
 							stopReason: attempt.stopReason,
 							errorMessage: attempt.errorMessage,
-						}),
+						});
+						options.onAttempt?.({
+							api: attempt.api,
+							provider: attempt.provider,
+							model: attempt.model,
+							usage: attempt.usage,
+							durationMs: now - attemptStartedAt,
+							error:
+								attempt.stopReason === "error" || attempt.stopReason === "aborted"
+									? (attempt.errorMessage ?? attempt.stopReason)
+									: undefined,
+						});
+						attemptStartedAt = now;
+					},
 				});
 				return await new TextJudge(backend).judge(request, options);
 			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				// A candidate that failed before its transport reported anything
+				// (key resolution, backend construction) is still one tried candidate.
+				if (reported === 0) {
+					options.onAttempt?.({
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: tokenUsage(0, 0),
+						durationMs: Date.now() - attemptStartedAt,
+						error: message,
+					});
+				}
 				if (signal?.aborted) {
 					throw signal.reason instanceof Error
 						? signal.reason
@@ -242,7 +366,7 @@ class OnlineChatJudge implements ResolvedJudge {
 							: new AIError.AbortError("judgment aborted");
 				}
 				if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) throw error;
-				lastError = error instanceof Error ? error.message : String(error);
+				lastError = message;
 			}
 		}
 		throw new Error(`judgment: every tiny/smol candidate failed: ${lastError ?? "unknown error"}`);

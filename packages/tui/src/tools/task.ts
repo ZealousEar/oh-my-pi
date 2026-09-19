@@ -1720,6 +1720,8 @@ export interface TaskItem {
 	schemaMode?: "permissive" | "strict";
 	/** Eval-defined tool names exposed to this child. */
 	tools?: string[];
+	/** Run this spawn in a visible terminal pane instead of in-process (`task.paneBackend`). */
+	visible?: boolean;
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
 }
@@ -1745,6 +1747,8 @@ export interface TaskParams {
 	schemaMode?: "permissive" | "strict";
 	/** Eval-defined tool names exposed to the flat-form child. */
 	tools?: string[];
+	/** Run this spawn in a visible terminal pane instead of in-process (flat form). */
+	visible?: boolean;
 	/** Batch form (`task.batch`): one subagent per item. */
 	tasks?: TaskItem[];
 	/** Batch form: shared background prepended to every assignment; required by the batch schema. */
@@ -1935,6 +1939,19 @@ export interface SingleResult {
 	resolvedThinkingLevel?: ConfiguredThinkingLevel;
 	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
 	resolvedModelIsFallback?: boolean;
+	/**
+	 * Whether {@link resolvedModel} was confirmed by the child itself. Native
+	 * runs observe the model directly and leave this unset. A pane child
+	 * reports it in the `resolved-model:` header of its result file; `false`
+	 * means the header was missing, so no resolved model is claimed.
+	 */
+	resolvedModelVerified?: boolean;
+	/**
+	 * Where a pane-backed result came from. `artifact-file` is the child's
+	 * delivered result; `pane-read` is scraped terminal text and is never a
+	 * success; `none` means nothing usable was collected. Unset for native runs.
+	 */
+	resultSource?: "artifact-file" | "pane-read" | "none";
 	/** Retains {@link AgentProgress.advisor} after the advised session is disposed. */
 	advisor?: boolean;
 	error?: string;
