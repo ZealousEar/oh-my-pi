@@ -50,7 +50,6 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
-	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AssistantMessage,
@@ -212,9 +211,12 @@ import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import {
+	armAbandonedDeadline,
 	armIdleCloseForOwner,
+	cancelAbandonedDeadline,
 	cancelIdleCloseForOwner,
 	freezeTabsForOwner,
+	reapAbandonedTabs,
 	releaseIdleTabsForOwner,
 	releaseTabsForOwner,
 } from "../tools/browser/tab-supervisor";
@@ -381,6 +383,7 @@ import {
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
+	type ShakeOptions,
 } from "./session-maintenance";
 import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -2038,6 +2041,12 @@ export class AgentSession {
 			});
 		});
 		this.#unsubscribeIdleCloseSetting = this.settings.onEffectiveChange((path, value) => {
+			if (path === "browser.tabs.abandonedIdleHours") {
+				// A changed window re-arms the process-wide deadline; non-positive disables it.
+				if (typeof value === "number" && value > 0) armAbandonedDeadline({ idleMs: value * 3_600_000 });
+				else cancelAbandonedDeadline();
+				return;
+			}
 			if (path !== "browser.idleCloseSec") return;
 			const ownerId = this.sessionManager.getSessionId() ?? "";
 			// Any change invalidates the armed deadline: cancel first (its
@@ -4748,22 +4757,42 @@ export class AgentSession {
 			}
 		} catch (error) {
 			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+		} finally {
+			// The process-wide abandoned deadline follows the tabs map: with this
+			// session's tabs gone it re-arms for other sessions' tabs or disarms.
+			const hours = this.settings.get("browser.tabs.abandonedIdleHours");
+			if (typeof hours === "number" && hours > 0) armAbandonedDeadline({ idleMs: hours * 3_600_000 });
+			else cancelAbandonedDeadline();
 		}
 	}
 
 	/**
-	 * Turn-settle checkpoint for owned headless browser tabs (issue #8246).
-	 * Close tabs idle past `browser.idleCloseSec` as the memory backstop,
-	 * then freeze the survivors so idle animated pages stop burning CPU/GPU
-	 * while keeping their state for millisecond resume. Scoped to OMP-owned
-	 * headless tabs of this session only — relay/CDP/spawned tabs, other
-	 * sessions' tabs, and `persist` tabs are never touched. Best-effort:
-	 * never throws, so teardown cannot break the event flow.
+	 * Turn-settle checkpoint for owned browser tabs (issue #8246). Two timers:
+	 * - `browser.idleCloseSec` (short, default 1800s): the memory backstop for
+	 *   non-persistent OMP headless worker tabs only, then freeze survivors so
+	 *   idle animated pages stop burning CPU/GPU while keeping their state.
+	 * - `browser.tabs.abandonedIdleHours` (long, default 6h): every tab this
+	 *   session CREATED — headless pages and relay/connected `new_tab` targets
+	 *   — is closed once abandoned, unless protected (in-flight run, persist,
+	 *   login/credential page, unsaved input, active download, foreground tab).
+	 * Adopted user tabs, other sessions' tabs and `persist` tabs are never
+	 * touched. Best-effort: never throws, so teardown cannot break the event flow.
 	 */
 	async #settleOwnedBrowserTabs(): Promise<void> {
 		const ownerId = this.sessionManager.getSessionId();
 		if (!ownerId) return;
 		try {
+			const abandonedHours = this.settings.get("browser.tabs.abandonedIdleHours");
+			if (typeof abandonedHours === "number" && abandonedHours > 0) {
+				const reaped = await withTimeout(
+					reapAbandonedTabs({ idleMs: abandonedHours * 3_600_000, ownerId }),
+					10_000,
+					"Timed out reaping abandoned browser tabs at turn settle",
+				);
+				if (reaped.closed.length > 0) {
+					logger.debug("Closed abandoned browser tabs at turn settle", { ownerId, ...reaped });
+				}
+			}
 			const idleSec = this.settings.get("browser.idleCloseSec");
 			if (idleSec > 0) {
 				const closed = await withTimeout(
@@ -5610,7 +5639,7 @@ export class AgentSession {
 	}
 
 	/** Reduce stored context with the selected shake strategy. */
-	shake(mode: ShakeMode, opts: { config?: ShakeConfig; signal?: AbortSignal } = {}): Promise<ShakeResult> {
+	shake(mode: ShakeMode, opts: ShakeOptions = {}): Promise<ShakeResult> {
 		return this.#maintenance.shake(mode, opts);
 	}
 

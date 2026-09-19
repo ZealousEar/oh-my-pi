@@ -37,6 +37,7 @@ import {
 	resolveThresholdTokens,
 	type ShakeConfig,
 	type ShakeRegion,
+	type ToolResultShakeRegion,
 	type SummaryOptions,
 	shouldCompact,
 	shouldUseProviderNativeCompaction,
@@ -48,7 +49,7 @@ import {
 	pruneToolOutputs,
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
+import { collectToolCallsById, type ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
@@ -56,6 +57,7 @@ import type {
 	Model,
 	OpenAIResponsesHistoryPayload,
 	ProviderSessionState,
+	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
@@ -101,7 +103,15 @@ import type { SessionContext } from "./session-context";
 import { buildSessionContext, getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
-import type { ShakeMode, ShakeResult } from "./shake-types";
+import { describeShakeSelection, type ShakeMode, type ShakeResult, type ShakeSelectionSummary } from "./shake-types";
+import { type ReductionReceipt, type ReductionSkipReason, resolveReductionPolicy } from "../reduction/contract";
+import {
+	type ShakeJudgeAdmission,
+	type ShakeSelection,
+	selectShakeRegions,
+	shakeRegionReceipt,
+} from "../reduction/semantic-shake";
+import { collectTaskContext } from "../reduction/task-context";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 import experimentalContextNotesReminderPrompt from "../prompts/system/experimental-context-notes-reminder.md" with { type: "text" };
 import experimentalContextRolloverPrompt from "../prompts/system/experimental-context-rollover.md" with { type: "text" };
@@ -474,6 +484,17 @@ export interface SessionMaintenanceHost {
 	abortHandoff(): void;
 }
 
+/** Options of {@link SessionMaintenance.shake}. */
+export interface ShakeOptions {
+	config?: ShakeConfig;
+	signal?: AbortSignal;
+	requireArtifact?: boolean;
+	isCurrent?: () => boolean;
+	toolResultsOnly?: boolean;
+	/** Judge admission for `semantic` mode; defaults to `admitReductionJudge` (tests script a judge here). */
+	admitJudge?: ShakeJudgeAdmission;
+}
+
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
@@ -484,6 +505,13 @@ export class SessionMaintenance {
 	/** Interrupted-turn resume withheld from a compaction `finally` because a claim was open; consumed by `release(false)`, {@link noteTurnStarted}, or the next manual pass. */
 	#deferredResumeGeneration: number | undefined;
 	#autoCompactionAbortController: AbortController | undefined;
+	/**
+	 * Semantic shake decisions of this session, keyed by region content, goal,
+	 * judge, and protect window — an adopted view stays stable: a region judged
+	 * "keep" is re-asked only when the goal changes, and elided regions carry
+	 * `prunedAt`, so they are never re-offered.
+	 */
+	readonly #semanticShakeCache = new Map<string, boolean>();
 	/**
 	 * Live tool-loop contexts parked after mid-turn maintenance hit a no-progress
 	 * dead end. Membership suppresses the repeated rescue + warning while no cut
@@ -748,6 +776,11 @@ export class SessionMaintenance {
 	 * - `thinking` removes assistant reasoning blocks without replacement text.
 	 * - `elide` replaces whole tool-call results and large fenced/XML blocks
 	 *   with short placeholders that embed an `artifact://` recovery link.
+	 * - `semantic` elides only the tool results behind the auto-shake protect
+	 *   window that an answered judgment, given the bounded task context, says
+	 *   the task no longer needs. Blocks are never touched in this mode, and
+	 *   every protected, uncertain, or unjudged result stays verbatim (see
+	 *   `selectShakeRegions`); `elide` remains the explicit mechanical choice.
 	 *
 	 * Mutates the branch in place, persists via `rewriteEntries`, replays the
 	 * rebuilt context through the agent, and tears down provider sessions that
@@ -755,16 +788,7 @@ export class SessionMaintenance {
 	 *
 	 * No-op (zero counts) when nothing is eligible.
 	 */
-	async shake(
-		mode: ShakeMode,
-		opts: {
-			config?: ShakeConfig;
-			signal?: AbortSignal;
-			requireArtifact?: boolean;
-			isCurrent?: () => boolean;
-			toolResultsOnly?: boolean;
-		} = {},
-	): Promise<ShakeResult> {
+	async shake(mode: ShakeMode, opts: ShakeOptions = {}): Promise<ShakeResult> {
 		if (mode === "images") {
 			const { removed } = await this.#host.dropImages();
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
@@ -803,8 +827,15 @@ export class SessionMaintenance {
 		assertCurrent();
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const semantic = mode === "semantic";
 		const config = this.#withPlanProtection({
-			...(opts.config ?? AGGRESSIVE_SHAKE_CONFIG),
+			...(opts.config ??
+				(semantic
+					? {
+							...DEFAULT_SHAKE_CONFIG,
+							protectTokens: this.#host.settings.get("compaction.semanticShake.protectTokens"),
+						}
+					: AGGRESSIVE_SHAKE_CONFIG)),
 			// Skip entries summarized away by the latest compaction — shaking them
 			// only churns persisted history with no prompt/cache effect. The cut is
 			// unconditional on the wire (see `buildSessionContext`), so a compaction
@@ -813,9 +844,91 @@ export class SessionMaintenance {
 		});
 		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
 		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
-		if (regions.length === 0) {
-			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
+		let selection: ShakeSelectionSummary | undefined;
+		let selected: ShakeSelection | undefined;
+		const selectionStarted = Date.now();
+		if (semantic) {
+			const candidates = regions.filter(region => region.kind === "toolResult");
+			selected = await selectShakeRegions({
+				regions: candidates,
+				context: collectTaskContext(branchEntries, {
+					maxChars: resolveReductionPolicy(this.#host.settings).taskContextChars,
+					...(latestCompaction ? { boundaryId: latestCompaction.firstKeptEntryId } : {}),
+				}),
+				toolCalls: collectToolCallsById(branchEntries),
+				protectTokens: config.protectTokens,
+				settings: this.#host.settings,
+				registry: this.#host.modelRegistry,
+				sessionId: this.#host.sessionId(),
+				...(this.#model ? { sessionModel: this.#model } : {}),
+				...(opts.signal ? { signal: opts.signal } : {}),
+				obfuscateText: text => this.#host.obfuscateTextForProvider(text) ?? text,
+				cache: this.#semanticShakeCache,
+				...(opts.admitJudge ? { admitJudge: opts.admitJudge } : {}),
+			});
+			assertCurrent();
+			selection = selected.summary;
+			// Only results an answered judgment cleared are elided; blocks and every kept result stay.
+			const { elide } = selected;
+			regions = candidates.filter(region => elide.has(region));
 		}
+		/** One receipt per candidate, keyed by region; `elidedIndex` maps elided regions to their placeholder tokens. */
+		const buildReceipts = (
+			artifact: string | undefined,
+			elidedIndex: ReadonlyMap<ShakeRegion, number>,
+			replacementTokenCounts: readonly number[],
+		): Map<ToolResultShakeRegion, ReductionReceipt> => {
+			const receipts = new Map<ToolResultShakeRegion, ReductionReceipt>();
+			if (!selected) return receipts;
+			const durationMs = Date.now() - selectionStarted;
+			for (const [region, decision] of selected.regions) {
+				const index = elidedIndex.get(region);
+				receipts.set(
+					region,
+					shakeRegionReceipt({
+						region,
+						decision,
+						artifactId: artifact,
+						replacementTokens: index === undefined ? region.tokens : (replacementTokenCounts[index] ?? 0),
+						...(selected.judge ? { judge: selected.judge } : {}),
+						durationMs,
+					}),
+				);
+			}
+			return receipts;
+		};
+		const untouched = (skipped?: ReductionSkipReason): ShakeResult => {
+			// Nothing was removed: a region the judge cleared but that stays (no archive) is kept unjudged.
+			if (selected && skipped) {
+				for (const [region, decision] of selected.regions) {
+					if (decision.keep) continue;
+					selected.regions.set(region, {
+						keep: true,
+						basis: "unjudged",
+						skipped: { reason: skipped, detail: "kept: nothing was removed" },
+						attempts: decision.attempts,
+					});
+				}
+				selected.elide.clear();
+				if (selection) {
+					selection = {
+						...selection,
+						keptUnjudged: selection.keptUnjudged + selection.elided,
+						elided: 0,
+						skipped,
+					};
+				}
+			}
+			return {
+				mode,
+				toolResultsDropped: 0,
+				blocksDropped: 0,
+				tokensFreed: 0,
+				...(selection ? { selection } : {}),
+				...(selected ? { receipts: [...buildReceipts(undefined, new Map(), []).values()] } : {}),
+			};
+		};
+		if (regions.length === 0) return untouched();
 
 		let reservedArtifact: { id?: string; path?: string } = {};
 		try {
@@ -837,9 +950,7 @@ export class SessionMaintenance {
 			return { replacements, replacementTokenCounts, savings };
 		};
 		let { replacements, replacementTokenCounts, savings } = calculateReplacementState(artifactId);
-		if (opts.toolResultsOnly && savings < config.minSavings) {
-			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
-		}
+		if (opts.toolResultsOnly && savings < config.minSavings) return untouched();
 		if (reservedArtifact.path && reservedArtifact.id) {
 			try {
 				await writeArtifact(reservedArtifact.path, this.#shakeArtifactText(regions));
@@ -855,10 +966,10 @@ export class SessionMaintenance {
 				throw new Error("shake could not save a recovery artifact");
 			}
 			({ replacements, replacementTokenCounts, savings } = calculateReplacementState(artifactId));
-			if (opts.toolResultsOnly && savings < config.minSavings) {
-				return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
-			}
+			if (opts.toolResultsOnly && savings < config.minSavings) return untouched();
 		}
+		// Semantic mode promises recoverability: without an archive the baseline stays untouched.
+		if (semantic && !artifactId) return untouched("archive-failed");
 
 		assertCurrent();
 		const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
@@ -903,6 +1014,21 @@ export class SessionMaintenance {
 		if (anchorEntry && !entrySnapshots.has(anchorEntry))
 			entrySnapshots.set(anchorEntry, structuredClone(anchorEntry));
 		applyShakeRegions(items);
+		let receipts: ReductionReceipt[] | undefined;
+		if (selected) {
+			const elidedIndex = new Map(items.map((item, index) => [item.region, index]));
+			const byRegion = buildReceipts(artifactId, elidedIndex, replacementTokenCounts);
+			receipts = [...byRegion.values()];
+			// Kept regions stay untouched; an elided result carries its receipt beside the placeholder.
+			for (const [region, receipt] of byRegion) {
+				if (!elidedIndex.has(region)) continue;
+				const message = region.entry.message as ToolResultMessage;
+				const details = message.details;
+				if (details === undefined || (typeof details === "object" && details !== null && !Array.isArray(details))) {
+					message.details = { ...(details as Record<string, unknown> | undefined), shake: receipt };
+				}
+			}
+		}
 		try {
 			this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
 			await this.#host.sessionManager.rewriteEntries();
@@ -923,6 +1049,8 @@ export class SessionMaintenance {
 			blocksDropped,
 			tokensFreed: Math.max(0, originalTokens - replacementTokens),
 			artifactId,
+			...(selection ? { selection } : {}),
+			...(receipts ? { receipts } : {}),
 		};
 	}
 
@@ -4080,16 +4208,30 @@ export class SessionMaintenance {
 
 		const effectiveSettings = resolveMethodSettings(compactionSettings, method);
 		const fallbackFromShake = options.fallbackFromShake === true;
-		// Shake runs inline (cheap, no remote LLM). If it cannot recover enough
-		// context, resume from the next configured method instead of hardcoding a
-		// context-full summary.
-		if (method === "shake" && !armedSpec) {
+		// Shake runs inline (cheap; semantic shake adds only the bounded judgment).
+		// If it cannot recover enough context, resume from the next configured
+		// method instead of hardcoding a context-full summary.
+		if ((method === "shake" || method === "semantic-shake") && !armedSpec) {
+			// Named in the fallback message so the operator sees what runs next.
+			const nextMethod = methods
+				.slice(methodIndex + 1)
+				.find(candidate =>
+					isCompactionMethodUsable(
+						candidate,
+						reason,
+						this.#model,
+						compactionSettings,
+						options.excludeMediaMethods === true,
+					),
+				);
 			const outcome = await this.#runAutoShake(
+				method,
 				reason,
 				willRetry,
 				generation,
 				shouldAutoContinue,
 				terminalTextAnswer,
+				nextMethod,
 				options.triggerContextTokens,
 				suppressContinuation,
 				options.detachPostCommit === true,
@@ -4098,7 +4240,8 @@ export class SessionMaintenance {
 			return await this.runAutoCompaction(reason, willRetry, deferred, allowDefer, {
 				...options,
 				methodIndex: methodIndex + 1,
-				fallbackFromShake: true,
+				// A semantic pass that removed nothing has not exhausted mechanical elision.
+				fallbackFromShake: method === "shake",
 			});
 		}
 		// "overflow" and "incomplete" force inline execution because they are recovery
@@ -5066,31 +5209,41 @@ export class SessionMaintenance {
 
 	/**
 	 * Run a shake-method auto-maintenance pass. Emits the
-	 * `auto_compaction_start`/`auto_compaction_end` pair with a shake `action`,
-	 * runs {@link shake} inline against the protect-window config, and schedules
-	 * continuation exactly like the context-full tail.
+	 * `auto_compaction_start`/`auto_compaction_end` pair with the method as its
+	 * `action`, runs {@link shake} inline against the protect-window config
+	 * (`elide` for `shake`, `semantic` for `semantic-shake`), and schedules
+	 * continuation exactly like the context-full tail. The semantic path
+	 * reports its measured selection (`kept X of Y (…), elided N, C calls, T ms, …`)
+	 * on the fallback message — which also names `nextMethod`, the method the
+	 * caller will advance to — and as a notice on success.
 	 *
 	 * Returns `"fallback"` when the caller should advance to the next configured
 	 * method; returns a check result when shake handled the maintenance itself.
 	 */
 	async #runAutoShake(
+		method: "shake" | "semantic-shake",
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
 		willRetry: boolean,
 		generation: number,
 		autoContinue: boolean,
 		terminalTextAnswer: boolean,
+		nextMethod: CompactionMethod | undefined,
 		triggerContextTokens?: number,
 		suppressContinuation = false,
 		detachPostCommit = false,
 	): Promise<CompactionCheckResult | "fallback"> {
-		const action = "shake";
+		const action = method;
+		const label = method === "semantic-shake" ? "Auto-semantic-shake" : "Auto-shake";
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;
 		const signal = controller.signal;
 		try {
 			await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action }, false);
-			const result = await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
+			const result =
+				method === "semantic-shake"
+					? await this.#host.shake("semantic", { signal })
+					: await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
 			if (signal.aborted) {
 				await this.#emitLifecycleEvent(
 					{
@@ -5141,9 +5294,14 @@ export class SessionMaintenance {
 			}
 			const shouldFallBack = reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
 			if (shouldFallBack) {
-				const errorMessage = reclaimed
-					? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`
-					: "Auto-shake found nothing eligible to drop; trying the next preferred compaction method.";
+				// The semantic message names what was kept and why, what was elided,
+				// why no judgment ran (when none did), and the method that runs next.
+				const next = nextMethod ? `falling back to ${nextMethod}` : "no further compaction method is configured";
+				const errorMessage = result.selection
+					? `${label}: ${describeShakeSelection(result.selection)}${reclaimed ? `, ~${result.tokensFreed} tokens freed` : ""}; ${stillOverThreshold ? "still over threshold" : "nothing freed"} — ${next}.`
+					: reclaimed
+						? `${label} reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`
+						: `${label} found nothing eligible to drop; trying the next preferred compaction method.`;
 				await this.#emitLifecycleEvent(
 					{
 						type: "auto_compaction_end",
@@ -5169,6 +5327,13 @@ export class SessionMaintenance {
 				},
 				detachPostCommit,
 			);
+			if (result.selection) {
+				this.#host.emitNotice(
+					"info",
+					`${label}: ${describeShakeSelection(result.selection)}${reclaimed ? `, ~${result.tokensFreed} tokens freed` : ", nothing eligible"}.`,
+					"compaction",
+				);
+			}
 
 			let continuationScheduled = false;
 			if (willRetry) {

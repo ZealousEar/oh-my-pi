@@ -53,6 +53,26 @@ The tool returns a single `text` content block plus optional `details`.
 
 Stdout and stderr are merged before the model sees them. Definite non-zero exit codes are appended to the returned error result text as `Command exited with code <n>`.
 
+## Output pruning
+
+Completed, non-timeout commands can reduce repetitive model-facing output after the native minimizer and inline byte cap have run. Set `bash.outputPruning.mode` to `off`, `deterministic`, or `semantic`. The default is `off`. `bash.outputPruning.minTokens` sets the admission threshold, and `bash.outputPruning.maxSegments` limits the complete candidate spans sent in each semantic request.
+
+Before removing any line, Bash reads a bounded task context from the current session branch. It collects the first and latest user requests, the latest assistant reply after that request, and user sentences that state retention, counting, or standing requirements. `reduction.taskContextChars` bounds each request/reply field and the requirements collection (default `2000` characters). Other turns and message content are not task context.
+
+The deterministic stage chooses one of three policies:
+
+- **Full:** when task coverage is available and no retention requirement was stated, collapse exact repeated lines and long blank runs, and remove long runs of recognized build, install, download, and progress noise.
+- **Conservative (`context-unavailable`):** when no session branch or no user turn is available, only content-free exact-repeat and blank-run collapses run. Distinct recognized-noise lines stay because their values may matter. If nothing changes, `details.reduction.skipped.reason` is `context-unavailable`; semantic mode also records that reason and makes no judgment request.
+- **Abstain (`standing-requirement`):** any stated retention, counting, enumeration, or exhaustive-output requirement keeps the whole command output unchanged. No deterministic removal or semantic request occurs, and the receipt includes a bounded copy of the matched sentence. For example, “report each slow batch” keeps every routine-looking batch line.
+
+Every deterministic policy retains diagnostics, path and line references, result counts, status notices, artifact links, URLs, absolute paths, secret placeholders, and the first three and last eight lines. The last-eight-line boundary applies to the complete model-visible text, including appended wall-time, exit, and truncation notices. Structured JSON, patches, fenced code, tables, binary or ANSI/control-coloured output, and commands that explicitly request listings or file views stay unchanged before task policy is considered.
+
+Semantic mode runs the applicable deterministic rules first. It can then ask the configured reduction judge whether remaining spans are unnecessary for both the task and the command's evident purpose. `reduction.egress`, `reduction.maxCallsPerPass`, and `reduction.maxLatencyMs` control that request. An enabled profile sends only the command, optional working directory, exit code, output head and tail, complete candidate spans, and the bounded task fields (`original_request`, `latest_request`, `latest_reply`, and `standing_requirements`), all after credential redaction. It never sends the session transcript or unrelated turns. A disabled egress policy, missing task coverage, unavailable judge, exhausted budget, or judge failure leaves every unjudged span in place.
+
+Each removed span becomes one line in the form `[… pruned N lines (<rule>|judge) …]`. A successful reduction ends with `[pruned output: M→K tokens; original: artifact://<id>]`. The `original:` artifact contains the exact pre-pruning text visible to the model, after native output bounding and Bash notices. When a large command also shows `[raw output: artifact://<id>]`, that separate artifact contains the full raw command stream. `details.reduction` records source identity, baseline and visible token counts, stage results, character offsets, judgment provenance, and the same model-visible recovery locator.
+
+Pruning reverts to the baseline when savings fail either required floor—15 percent or 200 tokens—or when the recovery artifact cannot be written. Reading an `artifact://` recovery locator through Bash is never pruned again. Timeouts keep their existing result path and never enter pruning. Non-zero exits retain error status and exit text; they may use deterministic rules, but skip semantic judgment.
+
 ## Command policy and dedicated-tool routing
 
 Two independent settings can prevent a Bash subprocess from starting. They serve different purposes and run at different points in the tool-call lifecycle.

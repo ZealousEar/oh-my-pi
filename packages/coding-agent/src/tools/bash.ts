@@ -1,23 +1,28 @@
 import {
-	type BashToolDetails,
+	type BashToolDetails as TuiBashToolDetails,
 	formatBackgroundNotice,
 	formatWallTimeNotice,
 	formatExitCodeNotice,
 } from "@oh-my-pi/pi-tui/tools/bash";
 import * as fs from "node:fs";
 import { type } from "@oh-my-pi/omptype";
-import type {
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
-	ToolApprovalDecision,
+import {
+	Tokenizer,
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	type ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS, raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
+import { pruneBashOutput, type PruneBashOutputResult } from "../reduction/output-pruning";
+import { resolveReductionPolicy, type ReductionReceipt } from "../reduction/contract";
+import { collectTaskContext } from "../reduction/task-context";
+import { getLatestCompactionEntry } from "../session/session-context";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
 import { InternalUrlRouter } from "../internal-urls";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
@@ -52,6 +57,10 @@ import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
+
+export interface BashToolDetails extends TuiBashToolDetails {
+	reduction?: ReductionReceipt;
+}
 
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
@@ -612,6 +621,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			requestedTimeoutSec?: number;
 			notices?: readonly string[];
 			wallTimeMs?: number;
+			command?: string;
+			cwd?: string;
+			identity?: string;
+			signal?: AbortSignal;
+			recoveryRead?: boolean;
 		} = {},
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const exitCode = result.exitCode;
@@ -687,6 +701,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		// Non-timeout cancellations and missing exit status still propagate as thrown errors.
 		this.#throwIfUnfinished(result, timeoutSec, outputText);
+		const completedExitCode = result.exitCode;
+		if (completedExitCode === undefined) {
+			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
+		}
 
 		// No-op for already-bounded output; see `inlineCap` above.
 		const cappedOutputText = await enforceInlineByteCap(outputText, inlineCap);
@@ -695,7 +713,71 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			.content([{ type: "text", text: cappedOutputText }, ...(result.images ?? [])])
 			.truncationFromSummary(result, { direction: "tail" });
 		if (failedExit) resultBuilder.error();
-		return resultBuilder.done();
+		const completed = resultBuilder.done();
+		if (!options.command) return completed;
+
+		// Everything from here is optional reduction: any failure returns the completed command result.
+		let baseline: string;
+		let pruned: PruneBashOutputResult;
+		try {
+			baseline = this.#extractTextResult(completed);
+			const activeModel = this.session.getActiveModel?.();
+			const sessionId = this.session.getSessionId?.() ?? undefined;
+			const branch = this.session.sessionManager?.getBranch?.();
+			const boundaryId = branch === undefined ? undefined : getLatestCompactionEntry(branch)?.firstKeptEntryId;
+			const task =
+				branch === undefined
+					? undefined
+					: collectTaskContext(branch, {
+							maxChars: resolveReductionPolicy(this.session.settings).taskContextChars,
+							...(boundaryId === undefined ? {} : { boundaryId }),
+						});
+			pruned = await pruneBashOutput({
+				baseline,
+				output: normalizeResultOutput(result),
+				...(options.recoveryRead === undefined ? {} : { recoveryRead: options.recoveryRead }),
+				command: options.command,
+				...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+				exitCode: completedExitCode,
+				tokenizer: new Tokenizer(activeModel),
+				settings: this.session.settings,
+				...(task === undefined ? {} : { task }),
+				...(this.session.modelRegistry === undefined ? {} : { registry: this.session.modelRegistry }),
+				...(sessionId === undefined ? {} : { sessionId }),
+				...(activeModel === undefined ? {} : { sessionModel: activeModel }),
+				archive: text => saveBashOriginalArtifact(this.session, text),
+				...(result.artifactId === undefined ? {} : { existingArtifactId: result.artifactId }),
+				...(options.signal === undefined ? {} : { signal: options.signal }),
+				...(options.identity === undefined ? {} : { identity: options.identity }),
+			});
+		} catch (error) {
+			logger.warn("Bash output pruning failed; returning original output", {
+				error,
+				command: options.command,
+			});
+			return completed;
+		}
+		if (!pruned.receipt) return completed;
+
+		const reducedDetails: BashToolDetails = { ...completed.details, reduction: pruned.receipt };
+		if (pruned.visible === baseline) return { ...completed, details: reducedDetails };
+
+		// The outer tool wrapper appends details.meta after execute returns. The
+		// pruning baseline includes that notice, so remove its retained copy from
+		// the content block and let the wrapper append it exactly once.
+		const metaNotice = formatOutputNotice(completed.details?.meta);
+		const noticeOffset = metaNotice ? pruned.visible.lastIndexOf(metaNotice) : -1;
+		const visibleText =
+			noticeOffset < 0
+				? pruned.visible
+				: pruned.visible.slice(0, noticeOffset) + pruned.visible.slice(noticeOffset + metaNotice.length);
+		let replaced = false;
+		const content = completed.content.map(block => {
+			if (replaced || block.type !== "text") return block;
+			replaced = true;
+			return { ...block, text: visibleText };
+		});
+		return { ...completed, content, details: reducedDetails };
 	}
 
 	#buildBackgroundStartResult(
@@ -742,6 +824,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
 		notices?: readonly string[];
+		identity: string;
+		recoveryRead: boolean;
 
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
@@ -787,6 +871,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices ?? [],
 						wallTimeMs,
+						command: options.command,
+						cwd: options.commandCwd,
+						identity: options.identity,
+						recoveryRead: options.recoveryRead,
+						signal: runSignal,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -845,7 +934,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -860,6 +949,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		let command = rawCommand;
+		const recoveryRead = rawCommand.includes("artifact://");
 		const env = normalizeBashEnv(rawEnv);
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
@@ -977,6 +1067,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				identity: toolCallId,
+				recoveryRead,
 
 				resolvedEnv,
 				onUpdate,
@@ -1015,6 +1107,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				identity: toolCallId,
+				recoveryRead,
 
 				resolvedEnv,
 				onUpdate,
@@ -1327,6 +1421,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					wallTimeMs: performance.now() - bridgeWallTimeStart,
+					command,
+					cwd: commandCwd,
+					identity: toolCallId,
+					recoveryRead,
+					signal,
 				});
 			} finally {
 				clearTimeout(timeoutTimer);
@@ -1412,6 +1511,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			requestedTimeoutSec,
 			notices: pendingNotices,
 			wallTimeMs,
+			command,
+			cwd: commandCwd,
+			identity: toolCallId,
+			recoveryRead,
+			signal,
 		});
 	}
 }

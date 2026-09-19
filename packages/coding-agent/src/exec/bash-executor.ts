@@ -71,6 +71,13 @@ export interface BashResult {
 	workingDir?: string;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
 	images?: ImageContent[];
+	/**
+	 * Set when the native shell minimizer rewrote the output and the lossless
+	 * original was persisted: `artifactId` is the same id the
+	 * `[raw output: artifact://…]` footer names, so a later reduction stage can
+	 * reuse it instead of archiving a second copy.
+	 */
+	minimized?: { filter: string; inputBytes: number; outputBytes: number; artifactId: string };
 }
 
 /** POSIX-safe variable name — gates which direnv unsets we inject into the
@@ -737,6 +744,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		// (or an unavailable allocator) must keep the raw stream rather than
 		// silently dropping the diagnostics the summary elided.
 		const minimized = winner.result.minimized;
+		let minimizedProvenance: BashResult["minimized"];
 		if (minimized && minimized.text !== minimized.originalText) {
 			const artifactId = options?.onMinimizedSave
 				? await options.onMinimizedSave(minimized.originalText, {
@@ -754,6 +762,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				sink.replace(minimizedText);
 				const sep = minimizedText.endsWith("\n") ? "" : "\n";
 				sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
+				minimizedProvenance = {
+					filter: minimized.filter,
+					inputBytes: minimized.inputBytes,
+					outputBytes: minimized.outputBytes,
+					artifactId,
+				};
 			}
 		}
 
@@ -762,6 +776,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			exitCode: winner.result.exitCode,
 			cancelled: false,
 			workingDir: winner.result.workingDir,
+			...(minimizedProvenance ? { minimized: minimizedProvenance } : {}),
 			...(await dump()),
 		};
 	} catch (err) {

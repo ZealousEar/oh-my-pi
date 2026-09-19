@@ -44,7 +44,7 @@ describe("/shake dispatch (ACP)", () => {
 	});
 
 	it("parses each explicit mode", async () => {
-		for (const mode of ["elide", "images", "thinking"] as const) {
+		for (const mode of ["elide", "images", "thinking", "semantic"] as const) {
 			const h = acpRuntime();
 			await executeAcpBuiltinSlashCommand(`/shake ${mode}`, h.runtime);
 			expect(h.shake).toHaveBeenCalledWith(mode);
@@ -62,7 +62,7 @@ describe("/shake dispatch (ACP)", () => {
 	it("is advertised to ACP clients with the mode hint", () => {
 		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "shake");
 		expect(advertised).toBeDefined();
-		expect(advertised?.input?.hint).toBe("[elide|images|thinking]");
+		expect(advertised?.input?.hint).toBe("[elide|images|thinking|semantic]");
 	});
 
 	it("advertises /shake images as the image-stripping path and no longer advertises /drop-images", () => {
