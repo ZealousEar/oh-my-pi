@@ -47,6 +47,27 @@ describe("browser prelude", () => {
 		);
 	});
 
+	it("rejects app.new_tab before touching any browser when it cannot apply", async () => {
+		const session = makeSession(
+			Settings.isolated({ "browser.enabled": true, "browser.relay": false, "browser.cmux": false }),
+		);
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-new-tab-preflight" };
+
+		// Nothing listens on port 1: reaching the connect step would surface a
+		// connection error instead of the mutual-exclusion message.
+		await expect(
+			prelude.invoke(
+				{ action: "open", name: "x", app: { cdp_url: "http://127.0.0.1:1", new_tab: true, target: "docs" } },
+				context,
+			),
+		).rejects.toThrow(/app\.new_tab and app\.target are mutually exclusive/);
+		// Headless resolution: reaching the launch step would download/start Chromium.
+		await expect(prelude.invoke({ action: "open", name: "x", app: { new_tab: true } }, context)).rejects.toThrow(
+			/app\.new_tab is only for user-driven browsers/,
+		);
+	});
+
 	it("closes through the real host for an absent named tab", async () => {
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);

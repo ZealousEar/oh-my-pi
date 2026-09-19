@@ -66,6 +66,8 @@ interface TargetInfo {
 	url: string;
 	attached: boolean;
 	canAccessOpener: boolean;
+	/** Relay extension: per-tab UUID of an OMP-created tab. Puppeteer ignores it; the supervisor's reaper reads it. */
+	ompMarker?: string;
 }
 
 class CdpConnection {
@@ -117,8 +119,14 @@ class TabState {
 	/** Group RPC in flight — suppresses duplicate requests from load-time tabUpdated bursts. */
 	grouping = false;
 	ompGroupId: number | undefined;
-	/** User pulled the tab out of the omp group — never re-group it. */
+	/**
+	 * User pulled the tab out of the omp group — never re-group it. For a
+	 * marked (OMP-created) tab the extension persists this and reports it in
+	 * every snapshot; for an adopted tab it lives here for the server lifetime.
+	 */
 	groupOptOut = false;
+	/** Extension-minted UUID: this tab was created by the relay (OMP-owned). Absent on user tabs. */
+	marker: string | undefined;
 	/** Real Chrome session ids (OOPIF/worker children) living under this tab's root session. */
 	readonly realSessions = new Set<string>();
 	/** Live execution contexts from the shared root debugger session. */
@@ -139,6 +147,8 @@ class TabState {
 		this.windowId = snap.windowId;
 		this.pinned = snap.pinned;
 		this.groupId = snap.groupId;
+		this.marker = snap.ompMarker;
+		this.groupOptOut = snap.optOut === true;
 	}
 
 	update(snap: TabSnapshot): void {
@@ -148,6 +158,9 @@ class TabState {
 		this.windowId = snap.windowId;
 		this.pinned = snap.pinned;
 		this.groupId = snap.groupId;
+		if (snap.ompMarker) this.marker = snap.ompMarker;
+		// The extension's persisted opt-out is authoritative for marked tabs.
+		if (snap.optOut === true) this.groupOptOut = true;
 	}
 }
 
@@ -185,7 +198,8 @@ export class RelayBridge {
 	#sessionSeq = 0;
 	#rpcSeq = 0;
 	#ext: RelaySocket | null = null;
-	#extInfo: { userAgent: string; browserVersion: string } | null = null;
+	#extInfo: { userAgent: string; browserVersion: string; generation?: string; extensionVersion?: string } | null =
+		null;
 	#extensionSeen = false;
 	#pendingRpc = new Map<
 		number,
@@ -222,7 +236,7 @@ export class RelayBridge {
 		return this.#extensionSeen;
 	}
 
-	/** Payload for `GET /json/version`. */
+	/** Payload for `GET /json/version`. `OMP-Browser-Generation` is present once a 0.2.0 extension has said hello. */
 	versionInfo(wsUrl: string): Record<string, string> {
 		const ua = this.#extInfo?.userAgent ?? "";
 		return {
@@ -232,7 +246,22 @@ export class RelayBridge {
 			"V8-Version": "",
 			"WebKit-Version": "",
 			webSocketDebuggerUrl: wsUrl,
+			...(this.#extInfo?.generation ? { "OMP-Browser-Generation": this.#extInfo.generation } : {}),
+			...(this.#extInfo?.extensionVersion ? { "OMP-Extension-Version": this.#extInfo.extensionVersion } : {}),
 		};
+	}
+
+	/** Marker of an OMP-created tab by page/tab target id; undefined for user tabs. */
+	markerOf(targetId: string): string | undefined {
+		const parsed = parseTargetId(targetId);
+		return parsed ? this.#tabs.get(parsed.tabId)?.marker : undefined;
+	}
+
+	/** Test probe: current omp group id per tab (undefined when ungrouped). */
+	groupStateForTest(): Record<number, number | undefined> {
+		const out: Record<number, number | undefined> = {};
+		for (const tab of this.#tabs.values()) out[tab.tabId] = tab.grouped ? tab.ompGroupId : undefined;
+		return out;
 	}
 
 	/** Payload for `GET /json/list` (debugging aid; per-target endpoints are not served). */
@@ -275,10 +304,10 @@ export class RelayBridge {
 			tab.attached = false;
 			tab.attaching = null;
 			this.#resetRuntime(tab);
-			// The extension dissolves omp groups on disconnect (or died along
-			// with them); grouping state is unknowable until the next hello.
-			// Without this reset, the next hello's groupId=-1 snapshots would
-			// read as the user dragging every tab out (permanent opt-out).
+			// Grouping state is unknowable until the next hello (a 0.1.0
+			// extension dissolved groups on disconnect; 0.2.0 leaves them and
+			// reuses them). Without this reset, the next hello's snapshots
+			// could read as the user dragging every tab out (permanent opt-out).
 			tab.grouped = false;
 			tab.grouping = false;
 			tab.ompGroupId = undefined;
@@ -330,7 +359,12 @@ export class RelayBridge {
 	}
 
 	#onHello(msg: Extract<ExtToRelayMessage, { t: "hello" }>): void {
-		this.#extInfo = { userAgent: msg.userAgent, browserVersion: msg.browserVersion };
+		this.#extInfo = {
+			userAgent: msg.userAgent,
+			browserVersion: msg.browserVersion,
+			generation: typeof msg.generation === "string" && msg.generation.length > 0 ? msg.generation : undefined,
+			extensionVersion: typeof msg.extensionVersion === "string" ? msg.extensionVersion : undefined,
+		};
 		this.#extensionSeen = true;
 		const seen = new Set<number>();
 		const attachedNow = new Set(msg.attachedTabIds);
@@ -655,6 +689,17 @@ export class RelayBridge {
 				this.#reply(conn, msg, {});
 				return;
 			}
+			case "Target.getTargets": {
+				// Same set `setDiscoverTargets` announces, as a snapshot. The
+				// supervisor's crash-transfer sweep reads `ompMarker` from here.
+				const targetInfos: TargetInfo[] = [];
+				for (const tab of this.#tabs.values()) {
+					if (!this.#eligible(tab)) continue;
+					targetInfos.push(this.#tabInfo(tab, tab.attached), this.#pageInfo(tab, tab.attached));
+				}
+				this.#reply(conn, msg, { targetInfos });
+				return;
+			}
 			case "Target.setAutoAttach": {
 				conn.autoAttach = true;
 				const tabs = [...this.#tabs.values()].filter(tab => this.#eligible(tab));
@@ -697,7 +742,8 @@ export class RelayBridge {
 			case "Target.createTarget": {
 				const url =
 					typeof msg.params?.url === "string" && msg.params.url.length > 0 ? msg.params.url : "about:blank";
-				const result = (await this.#rpc({ op: "createTab", url })) as { tab: TabSnapshot };
+				const background = msg.params?.background === true;
+				const result = (await this.#rpc({ op: "createTab", url, active: !background })) as { tab: TabSnapshot };
 				this.#onTabUpsert(result.tab);
 				// Creating a tab is an explicit act of driving it.
 				this.#claimTab(conn, result.tab.tabId);
@@ -872,11 +918,14 @@ export class RelayBridge {
 			this.#tabs.set(snap.tabId, tab);
 		} else {
 			if (tab.url !== snap.url) tab.banned = false;
-			// The user dragging a tab out of the omp group is an opt-out; the
-			// relay never fights the user over grouping.
+			// The user dragging an adopted tab out of the omp group is an
+			// opt-out; the relay never fights the user over grouping. Marked
+			// tabs are judged by the extension (it can tell a user drag from
+			// its own duplicate-group merge) and report `optOut` in snapshots.
 			if (tab.grouped && tab.ompGroupId !== undefined && snap.groupId !== tab.ompGroupId) {
 				tab.grouped = false;
-				tab.groupOptOut = true;
+				if (tab.marker === undefined) tab.groupOptOut = true;
+				else tab.ompGroupId = undefined;
 			}
 			tab.update(snap);
 		}
@@ -913,13 +962,20 @@ export class RelayBridge {
 
 	// ---- tab grouping -----------------------------------------------------------
 
-	/** A tab belongs in the omp group when claimed by a client, controllable, unpinned, not user-opted-out, and not already in a user group. */
+	/**
+	 * A tab belongs in the OMP group when it is OMP-created (marked) or claimed
+	 * by a client, controllable, unpinned, not user-opted-out, and not already
+	 * in some other (user) group. Marked tabs keep their membership across
+	 * claims, connections and relay restarts; adopted tabs are grouped only
+	 * while a client drives them.
+	 */
 	#groupWorthy(tab: TabState): boolean {
-		if (!this.#claimed(tab.tabId) || !this.#eligible(tab) || tab.pinned || tab.groupOptOut) return false;
-		return tab.grouped || tab.groupId === -1;
+		const wanted = tab.marker !== undefined || this.#claimed(tab.tabId);
+		if (!wanted || !this.#eligible(tab) || tab.pinned || tab.groupOptOut) return false;
+		return tab.grouped || tab.groupId === -1 || (tab.marker !== undefined && tab.ompGroupId === undefined);
 	}
 
-	/** Re-group every claimed tab (extension hello / reconnect). */
+	/** Re-group every marked/claimed tab (extension hello / reconnect) — the extension reuses the existing group. */
 	#syncGrouping(): void {
 		if (!this.#group) return;
 		const worthy = [...this.#tabs.values()].filter(tab => this.#groupWorthy(tab) && !tab.grouped && !tab.grouping);
@@ -933,7 +989,10 @@ export class RelayBridge {
 			if (!tab.grouped && !tab.grouping) this.#requestGroup([tab]);
 			return;
 		}
-		if (tab.grouped) {
+		// Only adopted tabs leave the group when nobody drives them anymore; a
+		// marked tab is OMP's and stays grouped until it is closed or the user
+		// drags it out.
+		if (tab.grouped && tab.marker === undefined) {
 			tab.grouped = false;
 			tab.ompGroupId = undefined;
 			void this.#rpc({ op: "ungroup", tabIds: [tab.tabId] }).catch(() => {});
@@ -1134,6 +1193,7 @@ export class RelayBridge {
 			url: tab.url || "about:blank",
 			attached,
 			canAccessOpener: false,
+			...(tab.marker ? { ompMarker: tab.marker } : {}),
 		};
 	}
 
@@ -1145,6 +1205,7 @@ export class RelayBridge {
 			url: tab.url || "about:blank",
 			attached,
 			canAccessOpener: false,
+			...(tab.marker ? { ompMarker: tab.marker } : {}),
 		};
 	}
 

@@ -18,6 +18,7 @@ import * as launch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -67,6 +68,8 @@ describe("browser open during first-use Chromium download", () => {
 				getEvalSessionId: () => "browser-download-regression",
 				getEvalPreludes: () => [prelude],
 			};
+			// The scripted `tab.click` is a mutation: fixture grant on this session only.
+			grantBrowserFixtureScope(session);
 			const prelude = createBrowserPrelude(session);
 			const tool = new EvalTool(session);
 			await tool.execute("browser-warm-eval", { language: "js", code: "var marker = 'kernel survived';" });

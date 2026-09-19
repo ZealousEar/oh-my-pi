@@ -119,11 +119,23 @@ export async function renderPdfPageScreenshot(
 		await releaseBrowser(acquiredBrowser, { kill: false });
 		browserLease = false;
 
+		// Internal, constant, observation-only render of a local file: declared as a
+		// read-tier screenshot so the automation policy (read-only by default) allows it;
+		// a missing descriptor is treated as a raw mutation and denied.
 		const result = await runInTab(tabName, {
 			code: PDF_SCREENSHOT_CODE,
 			timeoutMs: PDF_RENDER_TIMEOUT_MS,
 			signal: renderSignal,
 			session,
+			automation: {
+				surface: "browser",
+				tier: "read",
+				action: "browser.tab.screenshot",
+				target: url.protocol === "file:" ? "file:" : url.origin,
+				consequential: false,
+				raw: false,
+				summary: `render PDF page ${page} screenshot`,
+			},
 		});
 		const screenshot = result.screenshots.at(-1);
 		if (!screenshot) throw new ToolError(`Chromium did not capture PDF page ${page}.`);

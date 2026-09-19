@@ -221,6 +221,36 @@ describe("RelayBridge tab grouping", () => {
 		expect(groups[0]!.tabIds).toEqual([9]);
 	});
 
+	it("maps Target.createTarget background onto the extension's createTab active flag", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.createTarget",
+				params: { url: "about:blank", background: true },
+			}),
+		);
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 11, url: "about:blank" }) });
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params: { url: "https://example.com/" } }),
+		);
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 12 }) });
+		await flush();
+		// The extension reads `active` to decide whether the new tab steals the
+		// user's foreground: background creations must send false, plain
+		// creations keep Chrome's activate-by-default.
+		expect(ext.rpcs("createTab").map(rpc => [rpc.url, rpc.active])).toEqual([
+			["about:blank", false],
+			["https://example.com/", true],
+		]);
+	});
+
 	it("never re-groups a tab the user pulled out of the omp group", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();

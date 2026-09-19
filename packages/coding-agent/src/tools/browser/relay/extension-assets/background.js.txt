@@ -1,8 +1,18 @@
-// extension/background.ts
+// extension/background.ts (OMP Browser Relay 0.2.0)
+//
+// Tab identity: every tab the relay CREATES gets a per-tab UUID ("marker")
+// kept in chrome.storage.session, so it lives exactly as long as Chrome's tab
+// ids do. Markers — never the group title — identify OMP-owned tabs and the
+// ONE OMP group per window. A user dragging a marked tab out of that group is
+// a persistent opt-out (chrome.storage.local, keyed by marker) that survives
+// relay restarts and service-worker restarts. Groups are never dissolved on
+// relay disconnect; the next connection reuses them. User groups that merely
+// share the title are never touched: only marked tabs are ever moved.
 var DEFAULT_PORT = 9224;
 var PING_INTERVAL_MS = 20000;
 var RECONNECT_MIN_MS = 1000;
 var RECONNECT_MAX_MS = 1e4;
+var EXTENSION_VERSION = chrome.runtime.getManifest().version;
 var ws = null;
 var reconnectDelay = RECONNECT_MIN_MS;
 var pingTimer = null;
@@ -15,10 +25,57 @@ async function loadSettings() {
     token: typeof stored.token === "string" ? stored.token : ""
   };
 }
+// ---- durable identity ------------------------------------------------------
+// session: { generation, ompTabs: {tabId: marker}, ompGroups: {windowId: groupId} }
+// local:   { ompOptOut: {marker: true} }
+var identity = null;
+async function loadIdentity() {
+  if (identity)
+    return identity;
+  const stored = await chrome.storage.session.get({ generation: "", ompTabs: {}, ompGroups: {} }).catch(() => ({ generation: "", ompTabs: {}, ompGroups: {} }));
+  const local = await chrome.storage.local.get({ ompOptOut: {} }).catch(() => ({ ompOptOut: {} }));
+  let generation = typeof stored.generation === "string" ? stored.generation : "";
+  if (!generation) {
+    generation = crypto.randomUUID();
+    await chrome.storage.session.set({ generation }).catch(() => {});
+  }
+  identity = {
+    generation,
+    tabs: stored.ompTabs && typeof stored.ompTabs === "object" ? stored.ompTabs : {},
+    groups: stored.ompGroups && typeof stored.ompGroups === "object" ? stored.ompGroups : {},
+    optOut: local.ompOptOut && typeof local.ompOptOut === "object" ? local.ompOptOut : {}
+  };
+  return identity;
+}
+function saveIdentity() {
+  if (!identity)
+    return;
+  chrome.storage.session.set({ ompTabs: identity.tabs, ompGroups: identity.groups }).catch(() => {});
+}
+function saveOptOut() {
+  if (!identity)
+    return;
+  chrome.storage.local.set({ ompOptOut: identity.optOut }).catch(() => {});
+}
+function markerOf(tabId) {
+  const marker = identity?.tabs[String(tabId)];
+  return typeof marker === "string" ? marker : undefined;
+}
+async function markTab(tabId) {
+  const id = await loadIdentity();
+  const existing = id.tabs[String(tabId)];
+  if (typeof existing === "string")
+    return existing;
+  const marker = crypto.randomUUID();
+  id.tabs[String(tabId)] = marker;
+  saveIdentity();
+  return marker;
+}
 function snapshot(tab) {
   if (tab.id === undefined)
     return null;
-  return {
+  const marker = markerOf(tab.id);
+  const snap = {
     tabId: tab.id,
     url: tab.url ?? tab.pendingUrl ?? "",
     title: tab.title ?? "",
@@ -27,63 +84,175 @@ function snapshot(tab) {
     pinned: tab.pinned,
     groupId: tab.groupId
   };
+  if (marker) {
+    snap.ompMarker = marker;
+    if (identity?.optOut[marker])
+      snap.optOut = true;
+  }
+  return snap;
 }
-var ompGroupTitle = null;
+// ---- grouping ----------------------------------------------------------------
 var groupOps = Promise.resolve();
+var groupOpInFlight = 0;
 function enqueueGroupOp(fn) {
   const result = groupOps.then(fn, fn);
   groupOps = result.catch(() => {});
   return result;
 }
+// Mirror of planGroupReconcile in relay/protocol.ts — keep the two in lockstep.
+function planGroupReconcile(input) {
+  const requested = new Set(input.requested ?? []);
+  const groupById = new Map;
+  for (const group of input.groups)
+    groupById.set(group.id, group);
+  const markedByGroup = new Map;
+  const windows = new Set;
+  for (const tab of input.tabs) {
+    windows.add(tab.windowId);
+    if (tab.ompMarker && tab.groupId !== -1 && groupById.has(tab.groupId))
+      markedByGroup.set(tab.groupId, (markedByGroup.get(tab.groupId) ?? 0) + 1);
+  }
+  const plan = { canonical: {}, moves: [], creates: [] };
+  for (const windowId of windows) {
+    const key = String(windowId);
+    const stored = input.storedGroups[key];
+    const storedGroup = stored !== undefined ? groupById.get(stored) : undefined;
+    let canonical = storedGroup && storedGroup.windowId === windowId && storedGroup.title === input.title ? storedGroup.id : undefined;
+    if (canonical === undefined) {
+      let best = 0;
+      for (const group of input.groups) {
+        if (group.windowId !== windowId || group.title !== input.title)
+          continue;
+        const marked = markedByGroup.get(group.id) ?? 0;
+        if (marked > best) {
+          best = marked;
+          canonical = group.id;
+        }
+      }
+    }
+    const movers = [];
+    const newcomers = [];
+    for (const tab of input.tabs) {
+      if (tab.windowId !== windowId || tab.pinned)
+        continue;
+      const marked = tab.ompMarker !== undefined;
+      if (marked && tab.optOut)
+        continue;
+      if (!marked && !requested.has(tab.tabId))
+        continue;
+      if (!marked && tab.groupId !== -1 && tab.groupId !== canonical)
+        continue;
+      if (canonical !== undefined) {
+        if (tab.groupId !== canonical)
+          movers.push(tab.tabId);
+      } else {
+        newcomers.push(tab.tabId);
+      }
+    }
+    if (canonical !== undefined) {
+      plan.canonical[key] = canonical;
+      if (movers.length > 0)
+        plan.moves.push({ groupId: canonical, tabIds: movers });
+    } else if (newcomers.length > 0) {
+      plan.creates.push({ windowId, tabIds: newcomers });
+    }
+  }
+  return plan;
+}
+async function reconcileInput(title, requested) {
+  const id = await loadIdentity();
+  const [tabs, groups] = await Promise.all([chrome.tabs.query({}), chrome.tabGroups.query({})]);
+  return {
+    title,
+    groups: groups.map((g) => ({ id: g.id, windowId: g.windowId, title: g.title ?? "" })),
+    tabs: tabs.filter((t) => t.id !== undefined).map((t) => {
+      const marker = markerOf(t.id);
+      return {
+        tabId: t.id,
+        windowId: t.windowId,
+        groupId: t.groupId,
+        pinned: t.pinned,
+        ompMarker: marker,
+        optOut: marker ? !!id.optOut[marker] : false
+      };
+    }),
+    storedGroups: id.groups,
+    requested
+  };
+}
+// Group the requested tabs into their window's single OMP group, merging
+// duplicate OMP groups and reusing the stored one. Returns {grouped}.
 async function groupTabs(tabIds, title, color) {
-  ompGroupTitle = title;
-  chrome.storage.session.set({ ompGroupTitle: title });
-  const byWindow = new Map;
+  const id = await loadIdentity();
+  const requested = [];
   for (const tabId of tabIds) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab.pinned || tab.id === undefined)
-        continue;
-      const bucket = byWindow.get(tab.windowId) ?? [];
-      bucket.push(tab.id);
-      byWindow.set(tab.windowId, bucket);
+      if (!tab.pinned && tab.id !== undefined)
+        requested.push(tab.id);
     } catch {}
   }
+  const plan = planGroupReconcile(await reconcileInput(title, requested));
   const grouped = {};
-  for (const [windowId, ids] of byWindow) {
-    const existing = await chrome.tabGroups.query({ title, windowId });
-    let groupId;
-    if (existing[0]) {
-      groupId = existing[0].id;
-      for (const dupe of existing.slice(1)) {
-        const dupeTabs = await chrome.tabs.query({ groupId: dupe.id });
-        const dupeIds = dupeTabs.map((tab) => tab.id).filter((id) => id !== undefined);
-        if (dupeIds.length > 0)
-          await chrome.tabs.group({ tabIds: dupeIds, groupId });
-      }
-      await chrome.tabs.group({ tabIds: ids, groupId });
-    } else {
-      groupId = await chrome.tabs.group({ tabIds: ids });
+  groupOpInFlight++;
+  try {
+    for (const move of plan.moves) {
+      await chrome.tabs.group({ tabIds: move.tabIds, groupId: move.groupId });
+      for (const tabId of move.tabIds)
+        grouped[String(tabId)] = move.groupId;
     }
-    await chrome.tabGroups.update(groupId, { title, color });
-    for (const id of ids)
-      grouped[String(id)] = groupId;
+    for (const create of plan.creates) {
+      const groupId = await chrome.tabs.group({ tabIds: create.tabIds });
+      plan.canonical[String(create.windowId)] = groupId;
+      for (const tabId of create.tabIds)
+        grouped[String(tabId)] = groupId;
+    }
+    id.groups = plan.canonical;
+    saveIdentity();
+    for (const groupId of Object.values(plan.canonical))
+      await chrome.tabGroups.update(groupId, { title, color }).catch(() => {});
+  } finally {
+    groupOpInFlight--;
+  }
+  // Requested tabs already sitting in their canonical group count as grouped.
+  for (const tabId of requested) {
+    if (grouped[String(tabId)] !== undefined)
+      continue;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const canonical = plan.canonical[String(tab.windowId)];
+      if (canonical !== undefined && tab.groupId === canonical)
+        grouped[String(tabId)] = canonical;
+    } catch {}
   }
   return { grouped };
 }
-async function restoreGroups() {
-  if (!ompGroupTitle) {
-    const stored = await chrome.storage.session.get({ ompGroupTitle: "" }).catch(() => ({ ompGroupTitle: "" }));
-    ompGroupTitle = typeof stored.ompGroupTitle === "string" && stored.ompGroupTitle ? stored.ompGroupTitle : null;
-  }
-  if (!ompGroupTitle)
+// Ungroup adopted tabs only: a marked (OMP-created) tab keeps its group.
+async function ungroupTabs(tabIds) {
+  const adopted = tabIds.filter((tabId) => markerOf(tabId) === undefined);
+  if (adopted.length === 0)
     return;
-  const groups = await chrome.tabGroups.query({ title: ompGroupTitle }).catch(() => []);
-  for (const group of groups) {
-    const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
-    const ids = tabs.map((tab) => tab.id).filter((id) => id !== undefined);
-    if (ids.length > 0)
-      await chrome.tabs.ungroup(ids).catch(() => {});
+  groupOpInFlight++;
+  try {
+    await chrome.tabs.ungroup(adopted).catch(() => {});
+  } finally {
+    groupOpInFlight--;
+  }
+}
+// A marked tab leaving its OMP group while no group op is running is the user
+// dragging it out: remember that forever (per marker).
+async function noteUserRegroup(tab) {
+  if (tab.id === undefined || groupOpInFlight > 0)
+    return;
+  const marker = markerOf(tab.id);
+  if (!marker || !identity)
+    return;
+  const canonical = identity.groups[String(tab.windowId)];
+  if (canonical === undefined)
+    return;
+  if (tab.groupId !== canonical && !identity.optOut[marker]) {
+    identity.optOut[marker] = true;
+    saveOptOut();
   }
 }
 function post(msg) {
@@ -97,7 +266,14 @@ async function setBadge(connected) {
   } catch {}
 }
 async function buildHello() {
+  const id = await loadIdentity();
   const [tabs, targets] = await Promise.all([chrome.tabs.query({}), chrome.debugger.getTargets()]);
+  // Forget markers of tabs that no longer exist (missed onRemoved while the worker slept).
+  const live = new Set(tabs.map((tab) => String(tab.id)));
+  for (const key of Object.keys(id.tabs))
+    if (!live.has(key))
+      delete id.tabs[key];
+  saveIdentity();
   const snapshots = [];
   for (const tab of tabs) {
     const snap = snapshot(tab);
@@ -115,7 +291,9 @@ async function buildHello() {
     userAgent: navigator.userAgent,
     browserVersion: versionMatch?.[0] ?? "Chrome/unknown",
     tabs: snapshots,
-    attachedTabIds
+    attachedTabIds,
+    generation: id.generation,
+    extensionVersion: EXTENSION_VERSION
   };
 }
 async function runRpc(msg) {
@@ -135,7 +313,10 @@ async function runRpc(msg) {
     case "send":
       return await chrome.debugger.sendCommand(msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId }, msg.method, msg.params);
     case "createTab": {
-      const tab = await chrome.tabs.create({ url: msg.url });
+      const tab = await chrome.tabs.create({ url: msg.url, active: msg.active ?? true });
+      if (tab.id === undefined)
+        throw new Error("created tab has no id");
+      await markTab(tab.id);
       const snap = snapshot(tab);
       if (!snap)
         throw new Error("created tab has no id");
@@ -153,7 +334,7 @@ async function runRpc(msg) {
     case "group":
       return await enqueueGroupOp(() => groupTabs(msg.tabIds, msg.title, msg.color));
     case "ungroup":
-      await enqueueGroupOp(() => chrome.tabs.ungroup(msg.tabIds).catch(() => {}));
+      await enqueueGroupOp(() => ungroupTabs(msg.tabIds));
       return {};
   }
 }
@@ -178,6 +359,7 @@ function scheduleReconnect() {
 async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))
     return;
+  await loadIdentity();
   const settings = await loadSettings();
   const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
   const socket = new WebSocket(url);
@@ -202,7 +384,7 @@ async function connect() {
       pingTimer = null;
     }
     setBadge(false);
-    restoreGroups();
+    // Groups are left in place: the next relay connection reuses them.
     scheduleReconnect();
   };
   socket.onerror = () => {
@@ -225,12 +407,18 @@ chrome.tabs.onCreated.addListener((tab) => {
   if (snap)
     post({ t: "tabCreated", tab: snap });
 });
-chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined)
+    void noteUserRegroup(tab);
   const snap = snapshot(tab);
   if (snap)
     post({ t: "tabUpdated", tab: snap });
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (identity && identity.tabs[String(tabId)] !== undefined) {
+    delete identity.tabs[String(tabId)];
+    saveIdentity();
+  }
   post({ t: "tabRemoved", tabId });
 });
 chrome.alarms.create("omp-relay-keepalive", { periodInMinutes: 0.5 });
@@ -238,8 +426,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "omp-relay-keepalive")
     connect();
 });
-chrome.storage.onChanged.addListener((_changes, areaName) => {
+chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local")
+    return;
+  if (!changes.port && !changes.token)
     return;
   ws?.close();
   connect();

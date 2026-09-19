@@ -43,6 +43,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import * as logger from "@oh-my-pi/pi-utils/logger";
+import { grantBrowserFixtureScope } from "./browser-scope";
 
 function makeKind(socketSuffix: string): CmuxKind {
 	return {
@@ -54,13 +55,15 @@ function makeKind(socketSuffix: string): CmuxKind {
 
 function makeSession(cwd: string, screenshotDir?: string): ToolSession {
 	// Minimal shape: `runInTab` reads `cwd`, `settings.get("browser.screenshotDir")`,
-	// and `getActiveModel?.()`. Everything else is untouched by this flow.
-	return {
+	// and `getActiveModel?.()`. Everything else is untouched by this flow. The
+	// fixture scope lets raw `tab.run` reach the worker; this suite's contract is
+	// the rejection plumbing, not the permission gate.
+	return grantBrowserFixtureScope({
 		cwd,
 		hasUI: false,
 		settings: { get: (key: string) => (key === "browser.screenshotDir" ? screenshotDir : undefined) },
 		getSessionFile: () => null,
-	} as unknown as ToolSession;
+	} as unknown as ToolSession);
 }
 
 async function drainAllTabs(): Promise<void> {
@@ -77,6 +80,39 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 		} finally {
 			vi.restoreAllMocks();
 		}
+	});
+
+	it("without a fixture grant a raw run on a cmux tab is denied before any cmux request is issued", async () => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		const methods: string[] = [];
+		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+			async (method: string): Promise<Record<string, unknown>> => {
+				methods.push(method);
+				if (method === "browser.open_split") return { surface_id: "surface-ungranted", url: "about:blank" };
+				if (method === "browser.url.get") return { url: "about:blank" };
+				if (method === "browser.snapshot") return { page: { html: "" } };
+				if (method === "browser.eval") return { value: "" };
+				return {};
+			},
+		);
+		const browser = await acquireBrowser(makeKind("ungranted"), { cwd: "/tmp" });
+		await acquireTab("ungranted", browser, { timeoutMs: 5_000, ownerSessionId: "session-ungranted" });
+		const ungranted = {
+			cwd: "/tmp",
+			hasUI: false,
+			settings: { get: () => undefined },
+			getSessionFile: () => null,
+		} as unknown as ToolSession;
+		const before = methods.length;
+		await expect(
+			runInTab("ungranted", {
+				code: 'await tab.goto("https://example.test");',
+				timeoutMs: 5_000,
+				session: ungranted,
+			}),
+		).rejects.toThrow(/^AUTOMATION_DENIED: .*browser\.tab\.run/);
+		expect(methods.slice(before)).toEqual([]);
 	});
 
 	it("releaseTab() during an in-flight cmux run rejects the run and never emits unhandledRejection", async () => {

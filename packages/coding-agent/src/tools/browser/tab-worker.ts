@@ -55,17 +55,20 @@ import {
 import { extractReadableFromHtml, type ReadableFormat } from "./readable";
 
 import { cloneSafe, RunOutput } from "./run-output";
-import type {
-	Observation,
-	ObservationEntry,
-	ReadyInfo,
-	RunErrorPayload,
-	ScreenshotResult,
-	SessionSnapshot,
-	ToolReply,
-	Transport,
-	WorkerInbound,
-	WorkerInitPayload,
+import {
+	type Observation,
+	type ObservationEntry,
+	originOf,
+	type ReadyInfo,
+	type RunBinding,
+	type RunErrorPayload,
+	type ScreenshotResult,
+	type SessionSnapshot,
+	targetChangedDenial,
+	type ToolReply,
+	type Transport,
+	type WorkerInbound,
+	type WorkerInitPayload,
 } from "./tab-protocol";
 
 declare module "puppeteer-core" {
@@ -1022,7 +1025,8 @@ export class WorkerCore {
 	#unsub: () => void;
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
-	#mode?: WorkerInitPayload["mode"];
+	/** The page is omp's to close: a headless page or a supervisor-created (`app.new_tab`) target. */
+	#ownsPage = false;
 	#activateForScreenshot = true;
 	#dialogPolicy?: DialogPolicy;
 	#dialogHandler?: (dialog: Dialog) => void;
@@ -1127,7 +1131,7 @@ export class WorkerCore {
 
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
-			this.#mode = payload.mode;
+			this.#ownsPage = payload.mode === "headless" || payload.ownsTarget === true;
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			this.#browser = await puppeteer.connect({
@@ -1256,8 +1260,35 @@ export class WorkerCore {
 			this.#openDialog = { type: dialog.type(), message: dialog.message() };
 		});
 		page.on("framenavigated", frame => {
-			if (frame === page.mainFrame()) this.#openDialog = undefined;
+			if (frame !== page.mainFrame()) return;
+			this.#openDialog = undefined;
+			// Keep the supervisor's cached URL honest between runs so the next
+			// dispatch is classified against the page the tab actually shows.
+			// The authoritative check is still `#bindLiveTarget` at run time.
+			if (!this.#active) void this.#postReadyInfo();
 		});
+	}
+
+	/**
+	 * Re-prove a non-raw mutation's authorization against the LIVE document
+	 * right before the code executes: read `location.href` from the main frame
+	 * (not the cached URL the supervisor classified against) and refuse when
+	 * its origin is not the one the policy decided. An unreadable document
+	 * (execution context torn down by an in-flight navigation) fails closed.
+	 */
+	async #bindLiveTarget(binding: RunBinding): Promise<void> {
+		const page = this.#requirePage();
+		let liveUrl: string | undefined;
+		try {
+			const href: unknown = await page.mainFrame().evaluate("location.href");
+			liveUrl = typeof href === "string" ? href : undefined;
+		} catch {
+			liveUrl = undefined;
+		}
+		if (liveUrl === undefined || originOf(liveUrl) !== binding.target) {
+			await this.#postReadyInfo();
+			throw new ToolError(targetChangedDenial(binding, liveUrl));
+		}
 	}
 
 	async #currentReadyInfo(): Promise<ReadyInfo> {
@@ -1341,6 +1372,7 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
+			if (msg.binding) await this.#bindLiveTarget(msg.binding);
 			runPage = createRunPageScope(this.#requirePage());
 			const browser = this.#requireBrowser();
 			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
@@ -2257,7 +2289,7 @@ export class WorkerCore {
 		this.#clearElementCache();
 		const page = this.#page;
 		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);
-		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
+		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });
 		this.#transport.close();
