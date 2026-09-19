@@ -599,87 +599,106 @@ describe("selector setting side effects", () => {
 		}
 	});
 
-	it("switches the live session when a global edit replaces a runtime override in project mode", async () => {
-		const testTheme = await getThemeByName("dark");
-		if (!testTheme) throw new Error("Failed to load dark theme for model selector test");
-		setThemeInstance(testTheme);
+	it.each(["ordinary runtime override", "cleared exact preset"] as const)(
+		"switches the live session when a global edit replaces a %s in project mode",
+		async overrideKind => {
+			const testTheme = await getThemeByName("dark");
+			if (!testTheme) throw new Error("Failed to load dark theme for model selector test");
+			setThemeInstance(testTheme);
 
-		const projectModel = getBundledModel("openai", "gpt-5.5");
-		const globalModel = getBundledModel("openai", "gpt-5.6");
-		if (!projectModel || !globalModel) throw new Error("Expected bundled OpenAI models for selector test");
+			const projectModel = getBundledModel("openai", "gpt-5.5");
+			const globalModel = getBundledModel("openai", "gpt-5.6");
+			if (!projectModel || !globalModel) throw new Error("Expected bundled OpenAI models for selector test");
 
-		const projectSelector = `${projectModel.provider}/${projectModel.id}`;
-		const globalSelector = `${globalModel.provider}/${globalModel.id}`;
-		const settings = Settings.isolated({ modelRoleStorage: "project" });
-		settings.setProjectModelRole("default", projectSelector);
-		// Simulate a CLI --model override: runtime override distinct from the project value.
-		settings.overrideModelRoles({ default: `anthropic/claude-sonnet-4-5` });
-		const setModel = vi.fn(async () => ({ switched: true }));
-		const assignmentApplied = Promise.withResolvers<void>();
-		const showStatus = vi.fn((message: string) => {
-			if (message.startsWith("Global default model:")) assignmentApplied.resolve();
-		});
-		let captured: unknown;
-		const controller = new SelectorController({
-			ui: {
-				requestRender: vi.fn(),
-				setFocus: vi.fn(),
-				showOverlay: vi.fn((component: unknown) => {
-					captured = component;
-					return { hide: vi.fn() };
-				}),
-				terminal: { rows: 40 },
-			},
-			editorContainer: { clear: vi.fn(), addChild: vi.fn(), children: [] },
-			editor: {},
-			settings,
-			session: {
-				model: projectModel,
-				modelRegistry: {
-					getAll: () => [projectModel, globalModel],
-					getAvailable: () => [projectModel, globalModel],
-					getError: () => undefined,
-					refresh: async () => {},
-					refreshProvider: async () => {},
-					getDiscoverableProviders: () => [],
-					getProviderDiscoveryState: () => undefined,
-					authStorage: { hasAuth: () => false },
+			const projectSelector = `${projectModel.provider}/${projectModel.id}`;
+			const globalSelector = `${globalModel.provider}/${globalModel.id}`;
+			const settings = Settings.isolated({ modelRoleStorage: "project" });
+			settings.setProjectModelRole("default", projectSelector);
+			if (overrideKind === "ordinary runtime override") {
+				settings.overrideModelRoles({ default: "anthropic/claude-sonnet-4-5" });
+			} else {
+				settings.applyRuntimeRoutingPlan({
+					roles: { default: projectSelector },
+					clearRoles: [],
+					fallbackChains: {},
+					cycleOrder: [],
+					defaultThinkingLevel: ThinkingLevel.Medium,
+				});
+				settings.setModelRole("default", undefined);
+			}
+			let liveModel = projectModel;
+			const setModel = vi.fn(async () => {
+				liveModel = globalModel;
+				settings.setModelRole("default", globalSelector);
+				return { switched: true };
+			});
+			const assignmentApplied = Promise.withResolvers<void>();
+			const showStatus = vi.fn((message: string) => {
+				if (message.startsWith("Global default model:")) assignmentApplied.resolve();
+			});
+			let captured: unknown;
+			const controller = new SelectorController({
+				ui: {
+					requestRender: vi.fn(),
+					setFocus: vi.fn(),
+					showOverlay: vi.fn((component: unknown) => {
+						captured = component;
+						return { hide: vi.fn() };
+					}),
+					terminal: { rows: 40 },
 				},
-				scopedModels: [{ model: projectModel }, { model: globalModel }],
-				getContextUsage: () => undefined,
-				setModel,
-				setThinkingLevel: vi.fn(),
-			},
-			statusLine: { invalidate: vi.fn() },
-			updateEditorBorderColor: vi.fn(),
-			keybindings: { getKeys: () => [], getDisplayString: () => "" },
-			showStatus,
-			showError: vi.fn(),
-		} as unknown as InteractiveModeContext);
+				editorContainer: { clear: vi.fn(), addChild: vi.fn(), children: [] },
+				editor: {},
+				settings,
+				session: {
+					model: projectModel,
+					modelRegistry: {
+						getAll: () => [projectModel, globalModel],
+						getAvailable: () => [projectModel, globalModel],
+						getError: () => undefined,
+						refresh: async () => {},
+						refreshProvider: async () => {},
+						getDiscoverableProviders: () => [],
+						getProviderDiscoveryState: () => undefined,
+						authStorage: { hasAuth: () => false },
+					},
+					scopedModels: [{ model: projectModel }, { model: globalModel }],
+					getContextUsage: () => undefined,
+					setModel,
+					setThinkingLevel: vi.fn(),
+				},
+				statusLine: { invalidate: vi.fn() },
+				updateEditorBorderColor: vi.fn(),
+				keybindings: { getKeys: () => [], getDisplayString: () => "" },
+				showStatus,
+				showError: vi.fn(),
+			} as unknown as InteractiveModeContext);
 
-		controller.showModelSelector();
-		const hub = captured as { handleInput(data: string): void; dispose(): void } | undefined;
-		if (!hub) throw new Error("Expected model hub overlay to be shown");
-		try {
-			hub.handleInput("\x1b[A"); // All models → Roles.
-			hub.handleInput("\n"); // Enter the role rows.
-			hub.handleInput("\n"); // Assign DEFAULT.
-			hub.handleInput("\t"); // Sidebar → model list.
-			hub.handleInput("\x1b[B"); // Effective project model → new global fallback.
-			hub.handleInput("\n"); // Pick the global fallback model.
-			hub.handleInput("\x1b[B"); // Project scope → global scope.
-			hub.handleInput("\n");
-			await assignmentApplied.promise;
+			controller.showModelSelector();
+			const hub = captured as { handleInput(data: string): void; dispose(): void } | undefined;
+			if (!hub) throw new Error("Expected model hub overlay to be shown");
+			try {
+				hub.handleInput("\x1b[A"); // All models → Roles.
+				hub.handleInput("\n"); // Enter the role rows.
+				hub.handleInput("\n"); // Assign DEFAULT.
+				hub.handleInput("\t"); // Sidebar → model list.
+				hub.handleInput("\x1b[B"); // Effective project model → new global fallback.
+				hub.handleInput("\n"); // Pick the global fallback model.
+				hub.handleInput("\x1b[B"); // Project scope → global scope.
+				hub.handleInput("\n");
+				await assignmentApplied.promise;
 
-			// The runtime override makes the global edit effective, so the live
-			// session must switch to the newly assigned global model.
-			expect(setModel).toHaveBeenCalledWith(globalModel, "default", expect.objectContaining({ persist: true }));
-			expect(settings.getProjectModelRole("default")).toBe(projectSelector);
-			expect(showStatus).toHaveBeenCalledWith(`Global default model: ${globalSelector}`);
-		} finally {
-			hub.dispose();
-		}
-	});
+				// The runtime override makes the global edit effective, so the live
+				// session must switch to the newly assigned global model.
+				expect(setModel).toHaveBeenCalledWith(globalModel, "default", expect.objectContaining({ persist: true }));
+				expect(settings.getProjectModelRole("default")).toBe(projectSelector);
+				expect(liveModel).toBe(globalModel);
+				expect(settings.getModelRole("default")).toBe(globalSelector);
+			} finally {
+				hub.dispose();
+			}
+		},
+	);
 
 	it("switches a global edit when a byte-identical startup runtime override shadows the project default", async () => {
 		const testTheme = await getThemeByName("dark");
@@ -1866,6 +1885,160 @@ describe("selector setting side effects", () => {
 			// Global model is not in scopedModels, so resolveModelRoleValue cannot
 			// match it → setModel must NOT be called.
 			expect(setModel).not.toHaveBeenCalled();
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("applies valid presets through the controller and keeps later routing edits effective", async () => {
+		const testTheme = await getThemeByName("dark");
+		if (!testTheme) throw new Error("Failed to load dark theme for preset controller test");
+		setThemeInstance(testTheme);
+
+		const modelA = buildModel({
+			id: "model-a",
+			name: "model-a",
+			api: "ollama-chat",
+			baseUrl: "https://example.com",
+			reasoning: false,
+			provider: "test",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 1024,
+		});
+		const modelB = { ...modelA, id: "model-b", name: "model-b" };
+		const settings = Settings.isolated({
+			modelRoles: { default: "test/model-a", reviewer: "test/model-a" },
+			"retry.modelFallback": true,
+			"retry.fallbackChains": { slow: ["test/model-a"] },
+			cycleOrder: ["default", "slow"],
+			defaultThinkingLevel: "medium",
+			modelPresets: {
+				broken: {
+					version: 2,
+					roles: { default: "test/model-b" },
+					fallbackChains: {},
+					cycleOrder: [],
+					defaultThinkingLevel: "low",
+				},
+				exact: {
+					version: 1,
+					roles: { default: "test/model-b" },
+					fallbackChains: { default: ["test/model-a"] },
+					cycleOrder: ["default"],
+					defaultThinkingLevel: AUTO_THINKING,
+				},
+			},
+		});
+		const setModel = vi.fn(async () => ({ switched: true }));
+		const setThinkingLevel = vi.fn();
+		const applied = Promise.withResolvers<void>();
+		const applySettled = Promise.withResolvers<void>();
+		const failed = Promise.withResolvers<void>();
+		let applicationReported = false;
+		let rejectionReported = false;
+		let captured: unknown;
+		const controller = new SelectorController({
+			ui: {
+				requestRender: () => {
+					if (rejectionReported) failed.resolve();
+					if (applicationReported) applySettled.resolve();
+				},
+				setFocus: vi.fn(),
+				showOverlay: vi.fn((component: unknown) => {
+					captured = component;
+					return { hide: vi.fn() };
+				}),
+				terminal: { rows: 40 },
+			},
+			editorContainer: { clear: vi.fn(), addChild: vi.fn(), children: [] },
+			editor: {},
+			settings,
+			session: {
+				model: modelA,
+				modelRegistry: {
+					getAll: () => [modelA, modelB],
+					getAvailable: () => [modelA, modelB],
+					getError: () => undefined,
+					refresh: async () => {},
+					refreshProvider: async () => {},
+					getDiscoverableProviders: () => [],
+					getProviderDiscoveryState: () => undefined,
+					find: (provider: string, id: string) =>
+						[modelA, modelB].find(model => model.provider === provider && model.id === id),
+					hasConfiguredAuth: () => true,
+					authStorage: { hasAuth: () => true },
+				},
+				scopedModels: [{ model: modelA }, { model: modelB }],
+				getContextUsage: () => undefined,
+				setModel,
+				setThinkingLevel,
+				configuredThinkingLevel: () => ThinkingLevel.Medium,
+			},
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			keybindings: { getKeys: () => [], getDisplayString: () => "" },
+			showStatus: () => {
+				applicationReported = true;
+				applied.resolve();
+			},
+			showError: () => {
+				rejectionReported = true;
+			},
+		} as unknown as InteractiveModeContext);
+
+		controller.showModelSelector();
+		const hub = captured as { handleInput(data: string): void; dispose(): void } | undefined;
+		if (!hub) throw new Error("Expected model hub overlay to be shown");
+		try {
+			hub.handleInput("\x1b[A"); // All models → Roles.
+			hub.handleInput("\x1b[A"); // Roles → Presets.
+			hub.handleInput("\n"); // Enter preset rows.
+			hub.handleInput("\n"); // Attempt malformed "broken".
+			await failed.promise;
+			expect(setModel).not.toHaveBeenCalled();
+			expect(setThinkingLevel).not.toHaveBeenCalled();
+			expect(settings.getModelRole("default")).toBe("test/model-a");
+			expect(settings.getModelRole("reviewer")).toBe("test/model-a");
+			expect(settings.get("retry.fallbackChains")).toEqual({ slow: ["test/model-a"] });
+			expect(settings.get("cycleOrder")).toEqual(["default", "slow"]);
+			expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);
+
+			hub.handleInput("\x1b[B"); // "broken" → "exact".
+			hub.handleInput("\n");
+			await applied.promise;
+			await applySettled.promise;
+
+			expect(setModel).toHaveBeenCalledWith(
+				modelB,
+				"default",
+				expect.objectContaining({ persist: false, thinkingLevel: ThinkingLevel.Inherit }),
+			);
+			expect(setThinkingLevel).toHaveBeenCalledWith(AUTO_THINKING);
+			expect(setThinkingLevel.mock.calls[0]).toHaveLength(1);
+			expect(settings.getModelRole("default")).toBe("test/model-b");
+			expect(settings.getModelRole("reviewer")).toBeUndefined();
+			expect(settings.get("retry.modelFallback")).toBe(true);
+			expect(settings.get("retry.fallbackChains")).toEqual({ default: ["test/model-a"] });
+			expect(settings.get("cycleOrder")).toEqual(["default"]);
+			expect(settings.get("defaultThinkingLevel")).toBe(AUTO_THINKING);
+
+			hub.handleInput("\x1b[D"); // Preset rows → sidebar.
+			hub.handleInput("\x1b[B"); // Presets → Roles.
+			hub.handleInput("\n"); // Enter role rows on DEFAULT.
+			hub.handleInput("c"); // Remove DEFAULT from the preset's cycle.
+			expect(settings.get("cycleOrder")).toEqual([]);
+			hub.handleInput("\x1b[B"); // DEFAULT → its fallback.
+			hub.handleInput("x"); // Remove the preset's fallback.
+			expect(settings.get("retry.fallbackChains")).toEqual({});
+
+			// The callbacks still persist globally; clearing the active preset
+			// overrides exposes the same edits rather than the loaded values.
+			settings.clearOverride("cycleOrder");
+			settings.clearOverride("retry.fallbackChains");
+			expect(settings.get("cycleOrder")).toEqual([]);
+			expect(settings.get("retry.fallbackChains")).toEqual({});
 		} finally {
 			hub.dispose();
 		}
