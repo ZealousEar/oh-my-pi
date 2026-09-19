@@ -33,7 +33,12 @@ import {
 	removeManagedMcpOAuthCredential,
 	removeManagedMcpOAuthCredentials,
 } from "../../mcp/oauth-credentials";
-import { MCPOAuthFlow, type MCPStoredOAuthCredential, mcpOAuthCredentialId } from "../../mcp/oauth-flow";
+import {
+	MCPOAuthFlow,
+	type MCPStoredOAuthCredential,
+	mcpOAuthCredentialId,
+	sharedMcpCredentialProfiles,
+} from "../../mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
 	createSmitheryCliAuthSession,
@@ -2048,7 +2053,16 @@ export class MCPCommandController {
 			// Definition-only entries resolve through the url-keyed binding alone;
 			// skip the write-back so a committed project mcp.json stays clean.
 			const urlKeyedId = serverUrl ? mcpOAuthCredentialId(serverUrl) : undefined;
-			const shouldPersist = currentAuth || oauthResult.credentialId !== urlKeyedId;
+			// Shared credential mode (OMP_SHARED_MCP_PROFILES): the minted row is url-keyed
+			// and meant for every channel. A project-level definition is the one file all
+			// channels load, so its (secret-free) pointer is written even for
+			// definition-only entries — that is how a build whose lookup only honours a
+			// config `auth.credentialId` resolves it. User-level entries stay clean: the
+			// other channels have their own user files, and the url-keyed lookup does not
+			// need a pointer.
+			const sharedProjectPointer =
+				sharedMcpCredentialProfiles() !== undefined && found.scope === "project" && !found.discovered;
+			const shouldPersist = currentAuth || oauthResult.credentialId !== urlKeyedId || sharedProjectPointer;
 			const updatedConfig = shouldPersist
 				? this.#persistOAuthResult(baseConfig, oauthResult, {
 						tokenUrl: oauth.tokenUrl,

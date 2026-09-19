@@ -10,6 +10,8 @@ import {
 	mcpOAuthCredentialProfile,
 	mcpOAuthServerUrlFromCredentialId,
 	refreshMCPOAuthToken,
+	sharedMcpCredentialProfiles,
+	sharedMcpOAuthCredentialId,
 } from "./oauth-flow";
 import type { MCPAuthConfig, MCPServerConfig } from "./types";
 
@@ -23,11 +25,40 @@ export type MCPOAuthRefreshMaterial = MCPStoredOAuthCredential | MCPAuthConfig |
 export function mcpOAuthCredentialIdsForServerUrl(serverUrl: string | undefined): string[] {
 	if (!serverUrl) return [];
 	const ids: string[] = [];
+	const shared = sharedMcpCredentialProfiles();
+	const own = getActiveProfile() ?? "default";
 	for (const url of [expandEnvVarsDeep(serverUrl), serverUrl]) {
-		const id = mcpOAuthCredentialId(url);
-		if (!ids.includes(id)) ids.push(id);
+		// Shared mode: the url-keyed row first, then this profile's row, then the
+		// sibling channels' rows (a login made by a build that mints profile-scoped
+		// ids). Order = resolution precedence.
+		const candidates = shared
+			? [
+					sharedMcpOAuthCredentialId(url),
+					mcpOAuthCredentialId(url, own),
+					...shared.filter(profile => profile !== own).map(profile => mcpOAuthCredentialId(url, profile)),
+				]
+			: [mcpOAuthCredentialId(url)];
+		for (const id of candidates) if (!ids.includes(id)) ids.push(id);
 	}
 	return ids;
+}
+
+/**
+ * A sibling profile's row is adopted only when it was minted for the same OAuth
+ * client identity this config would use: an explicitly configured client id
+ * must match the one embedded in the credential (DCR / discovered clients carry
+ * none in the config and are accepted). Own-profile and url-keyed rows are
+ * never filtered.
+ */
+function credentialMatchesConfiguredClient(
+	credentialId: string,
+	credential: MCPStoredOAuthCredential,
+	expectedClientId: string | undefined,
+): boolean {
+	if (!expectedClientId) return true;
+	const scopedProfile = mcpOAuthCredentialProfile(credentialId);
+	if (scopedProfile === undefined || scopedProfile === (getActiveProfile() ?? "default")) return true;
+	return !credential.clientId || credential.clientId === expectedClientId;
 }
 
 export function hasMcpAuthorizationHeader(config: MCPServerConfig): boolean {
@@ -39,7 +70,7 @@ export function lookupMcpOAuthCredentialForServer(
 	authStorage: AuthStorage | null | undefined,
 	auth: MCPAuthConfig | undefined,
 	serverUrl: string | undefined,
-	options: { allowUrlKeyedFallback?: boolean } = {},
+	options: { allowUrlKeyedFallback?: boolean; expectedClientId?: string } = {},
 ): MCPOAuthCredentialLookup | undefined {
 	if (!authStorage) return undefined;
 	if (auth && auth.type !== "oauth") return undefined;
@@ -49,14 +80,20 @@ export function lookupMcpOAuthCredentialForServer(
 		(!auth.credentialId.startsWith("mcp_oauth:profile:") || urlKeyedCredentialIds.includes(auth.credentialId))
 	) {
 		const credential = authStorage.get(auth.credentialId);
-		if (credential?.type === "oauth") {
+		if (
+			credential?.type === "oauth" &&
+			credentialMatchesConfiguredClient(auth.credentialId, credential, options.expectedClientId)
+		) {
 			return { credentialId: auth.credentialId, credential };
 		}
 	}
 	if (options.allowUrlKeyedFallback === false) return undefined;
 	for (const credentialId of urlKeyedCredentialIds) {
 		const credential = authStorage.get(credentialId);
-		if (credential?.type === "oauth") {
+		if (
+			credential?.type === "oauth" &&
+			credentialMatchesConfiguredClient(credentialId, credential, options.expectedClientId)
+		) {
 			return { credentialId, credential };
 		}
 	}
@@ -71,10 +108,14 @@ export function lookupMcpOAuthCredential(
 	if (config.type !== "http" && config.type !== "sse") {
 		return lookupMcpOAuthCredentialForServer(authStorage, auth, undefined);
 	}
+	const expectedClientId = config.oauth?.clientId?.trim() || auth?.clientId?.trim() || undefined;
 	if (hasMcpAuthorizationHeader(config)) {
-		return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, { allowUrlKeyedFallback: false });
+		return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, {
+			allowUrlKeyedFallback: false,
+			expectedClientId,
+		});
 	}
-	return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url);
+	return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, { expectedClientId });
 }
 
 export function selectMcpOAuthRefreshMaterial(
@@ -225,7 +266,9 @@ export async function removeManagedMcpOAuthCredential(
 ): Promise<boolean> {
 	if (!isManagedMCPOAuthCredentialId(credentialId)) return false;
 	const scopedProfile = mcpOAuthCredentialProfile(credentialId);
-	if (scopedProfile !== undefined && scopedProfile !== (getActiveProfile() ?? "default")) return false;
+	// Shared mode: a logout is a logout everywhere, so sibling channels' rows are removable too.
+	const removableProfiles = new Set([getActiveProfile() ?? "default", ...(sharedMcpCredentialProfiles() ?? [])]);
+	if (scopedProfile !== undefined && !removableProfiles.has(scopedProfile)) return false;
 	if (authStorage.get(credentialId)?.type !== "oauth") return false;
 	await authStorage.remove(credentialId);
 	return true;
