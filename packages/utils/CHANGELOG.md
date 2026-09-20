@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed `getBrowserRelayDir()` to the profile-independent `~/.omp/browser-relay` (like the global daemon runtime root) so every omp profile installs the relay extension to the one path Chrome has loaded.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added

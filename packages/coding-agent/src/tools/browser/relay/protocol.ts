@@ -11,7 +11,87 @@
  * group title — identify OMP-owned tabs and the one OMP group per window. A
  * user dragging a marked tab out of its group is a persistent opt-out
  * (`chrome.storage.local`, keyed by marker) that survives relay restarts.
+ *
+ * Protocol identity: the relay and the extension each speak one integer
+ * protocol version. {@link RELAY_PROTOCOL_VERSION} is this relay's; the
+ * extension's is derived from the manifest version it reports in `hello`
+ * ({@link extensionProtocolOf}): 0.2.0 and later speak 2, a 0.1.0 extension
+ * (or one that reports no `extensionVersion` at all) speaks 1. A relay whose
+ * `/json/version` answers carry no protocol field (stock 18.2.6 and legacy
+ * 18.1.10 builds) is likewise protocol 1. The relay refuses to become ready
+ * for an extension older than {@link RELAY_EXTENSION_MIN_VERSION}; relay
+ * consumers may refuse relays older than the protocol they require.
+ *
+ * Profile identity: one relay URL is not one Chrome cookie jar — the same
+ * unpacked extension loaded in another Chrome profile dials the same relay.
+ * Every extension install therefore mints a durable `installId`
+ * (`chrome.storage.local`, per install per Chrome profile) and reports it in
+ * `hello`; the relay only becomes ready for the install recorded in its
+ * binding file (`~/.omp/browser-relay/binding.json`, read on every hello) and
+ * closes any other install with {@link RELAY_CLOSE_PROFILE_MISMATCH}.
+ * Same-OS-user tampering (rewriting the binding file or the extension's
+ * storage) is outside this protection; it is a profile selector, not a
+ * sandbox.
  */
+
+/** Protocol version this relay speaks (advertised as `OMP-Relay-Protocol` / `relayProtocol`). */
+export const RELAY_PROTOCOL_VERSION = 2;
+/** Oldest extension manifest version this relay accepts. */
+export const RELAY_EXTENSION_MIN_VERSION = "0.2.0";
+
+const PROTOCOL_2_MIN_VERSION = [0, 2, 0] as const;
+
+/**
+ * Protocol version an extension speaks, from the manifest version it reports:
+ * `>= 0.2.0` → 2; anything older, unparseable, or absent (the 0.1.0 extension
+ * sent no `extensionVersion`) → 1.
+ */
+export function extensionProtocolOf(version: string | undefined): number {
+	if (version === undefined) return 1;
+	const match = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(version.trim());
+	if (!match) return 1;
+	const parts = [Number(match[1]), Number(match[2]), Number(match[3] ?? "0")];
+	for (let i = 0; i < PROTOCOL_2_MIN_VERSION.length; i++) {
+		if (parts[i]! !== PROTOCOL_2_MIN_VERSION[i]) return parts[i]! > PROTOCOL_2_MIN_VERSION[i] ? 2 : 1;
+	}
+	return 2;
+}
+
+/** Websocket close code the relay sends an extension whose install is not the bound one (reason `profile-mismatch`). */
+export const RELAY_CLOSE_PROFILE_MISMATCH = 4403;
+/** Reserved close code for an unbound relay refusing a dial (reason `profile-unbound`); the relay currently keeps unbound sockets open instead. */
+export const RELAY_CLOSE_PROFILE_UNBOUND = 4401;
+
+/** Short public identifier of an install id: sha256 hex prefix, never the id itself. */
+export function installFingerprint(installId: string): string {
+	return new Bun.CryptoHasher("sha256").update(installId).digest("hex").slice(0, 12);
+}
+
+/**
+ * `Browser.getVersion.revision` a protocol-2 relay answers over a CDP
+ * connection: `omp-relay/2;binding=<state>;fp=<fingerprint>`. Chrome's own
+ * value is a source revision string, so no other CDP client is affected.
+ */
+export function relayRevision(bindingState: string, installId: string | undefined): string {
+	return `omp-relay/${RELAY_PROTOCOL_VERSION};binding=${bindingState};fp=${installId ? installFingerprint(installId) : ""}`;
+}
+
+/** Parsed `Browser.getVersion.revision` of a relay. */
+export interface RelayRevision {
+	protocol: number;
+	/** Binding state the relay reported (`bound` when it is ready for the install it serves). */
+	binding: string;
+	/** Fingerprint of the install the connection is served by; empty when none. */
+	fingerprint: string;
+}
+
+/** Parse a relay revision; null when it is not one (stock/legacy relay or Chrome itself). */
+export function parseRelayRevision(revision: unknown): RelayRevision | null {
+	if (typeof revision !== "string") return null;
+	const match = /^omp-relay\/(\d+)(?:;binding=([^;]*))?(?:;fp=([^;]*))?$/.exec(revision);
+	if (!match) return null;
+	return { protocol: Number(match[1]), binding: match[2] ?? "", fingerprint: match[3] ?? "" };
+}
 
 /** Minimal view of a Chrome tab shared between extension and relay. */
 export interface TabSnapshot {
@@ -70,6 +150,8 @@ export type ExtToRelayMessage =
 			generation?: string;
 			/** Extension manifest version, so the relay can tell a legacy install apart. */
 			extensionVersion?: string;
+			/** Durable per-install UUID (`chrome.storage.local`); the relay binds to exactly one. Absent before 0.2.0. */
+			installId?: string;
 	  }
 	| { t: "cdpEvent"; tabId: number; sessionId?: string; method: string; params?: Record<string, unknown> }
 	| { t: "detached"; tabId: number; reason: string; relayInitiated?: boolean }
@@ -78,106 +160,3 @@ export type ExtToRelayMessage =
 	| { t: "tabRemoved"; tabId: number }
 	| { t: "rpcResult"; id: number; ok: boolean; result?: unknown; error?: string }
 	| { t: "ping" };
-
-/** One Chrome tab group as the reconciler sees it. */
-export interface GroupReconcileGroup {
-	id: number;
-	windowId: number;
-	title: string;
-}
-
-/** One tab as the reconciler sees it (a subset of {@link TabSnapshot}). */
-export interface GroupReconcileTab {
-	tabId: number;
-	windowId: number;
-	groupId: number;
-	pinned: boolean;
-	ompMarker?: string;
-	optOut?: boolean;
-}
-
-export interface GroupReconcileInput {
-	/** Stable agent namespace: the title the OMP group carries. */
-	title: string;
-	groups: readonly GroupReconcileGroup[];
-	tabs: readonly GroupReconcileTab[];
-	/** Previously chosen OMP group per window (`String(windowId)` → groupId), validated against `groups`. */
-	storedGroups: Readonly<Record<string, number>>;
-	/** Tabs the caller wants grouped now (claimed or created); marked tabs are always candidates. */
-	requested?: readonly number[];
-}
-
-export interface GroupReconcilePlan {
-	/** Canonical OMP group per window after the plan runs (`String(windowId)` → groupId); absent when a window needs a new group. */
-	canonical: Record<string, number>;
-	/** Marked tabs (and requested adopted tabs) to move into an existing canonical group. */
-	moves: Array<{ groupId: number; tabIds: number[] }>;
-	/** Windows with no usable OMP group: create one from these tabs. */
-	creates: Array<{ windowId: number; tabIds: number[] }>;
-}
-
-/**
- * Pure reconciliation shared (by mirroring) between the bridge tests and the
- * extension: ONE OMP group per window, identified by marked membership or the
- * stored id — never by title alone, so a user's own group named `omp` with no
- * marked tab is invisible here. Duplicate OMP groups (two groups in a window
- * both holding marked tabs) merge into the canonical one; only marked or
- * explicitly requested tabs ever move; pinned tabs and opted-out marked tabs
- * never move. Unmarked tabs of a duplicate group stay where they are.
- */
-export function planGroupReconcile(input: GroupReconcileInput): GroupReconcilePlan {
-	const requested = new Set(input.requested ?? []);
-	const groupById = new Map<number, GroupReconcileGroup>();
-	for (const group of input.groups) groupById.set(group.id, group);
-	const markedByGroup = new Map<number, number>();
-	const windows = new Set<number>();
-	for (const tab of input.tabs) {
-		windows.add(tab.windowId);
-		if (tab.ompMarker && tab.groupId !== -1 && groupById.has(tab.groupId)) {
-			markedByGroup.set(tab.groupId, (markedByGroup.get(tab.groupId) ?? 0) + 1);
-		}
-	}
-	const plan: GroupReconcilePlan = { canonical: {}, moves: [], creates: [] };
-	for (const windowId of windows) {
-		const key = String(windowId);
-		const stored = input.storedGroups[key];
-		const storedGroup = stored !== undefined ? groupById.get(stored) : undefined;
-		let canonical: number | undefined =
-			storedGroup && storedGroup.windowId === windowId && storedGroup.title === input.title
-				? storedGroup.id
-				: undefined;
-		if (canonical === undefined) {
-			let best = 0;
-			for (const group of input.groups) {
-				if (group.windowId !== windowId || group.title !== input.title) continue;
-				const marked = markedByGroup.get(group.id) ?? 0;
-				if (marked > best) {
-					best = marked;
-					canonical = group.id;
-				}
-			}
-		}
-		const movers: number[] = [];
-		const newcomers: number[] = [];
-		for (const tab of input.tabs) {
-			if (tab.windowId !== windowId || tab.pinned) continue;
-			const marked = tab.ompMarker !== undefined;
-			if (marked && tab.optOut) continue;
-			if (!marked && !requested.has(tab.tabId)) continue;
-			// An adopted (unmarked) tab sitting in some other group is the user's arrangement.
-			if (!marked && tab.groupId !== -1 && tab.groupId !== canonical) continue;
-			if (canonical !== undefined) {
-				if (tab.groupId !== canonical) movers.push(tab.tabId);
-			} else {
-				newcomers.push(tab.tabId);
-			}
-		}
-		if (canonical !== undefined) {
-			plan.canonical[key] = canonical;
-			if (movers.length > 0) plan.moves.push({ groupId: canonical, tabIds: movers });
-		} else if (newcomers.length > 0) {
-			plan.creates.push({ windowId, tabIds: newcomers });
-		}
-	}
-	return plan;
-}

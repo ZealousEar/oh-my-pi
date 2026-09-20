@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { isCompiledBinary, isRecord, logger, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
-import type { Browser, CDPSession } from "puppeteer-core";
+import type { Browser, CDPSession, Connection } from "puppeteer-core";
 import { ToolAbortError } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
@@ -22,9 +22,10 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
+import { ensureRelayDaemon, isLoopbackRelayUrl, relayProtocolTooOldMessage } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
-import { waitForRelayExtension } from "./relay/probe";
+import { LEGACY_RELAY_PROTOCOL, relayProtocolOf, waitForRelayExtension } from "./relay/probe";
+import { parseRelayRevision } from "./relay/protocol";
 import { ensureSharedBrowser } from "./shared-daemon";
 
 export type PuppeteerBrowserKind =
@@ -227,36 +228,72 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	}
 	if (kind.kind === "relay") {
 		const cdpUrl = normalizeConnectedCdpUrl(kind.cdpUrl);
-		// Loopback relays are owned by a machine-global broker and auto-started
-		// on demand (the extension dials in on its own). Hosts without a CLI
-		// worker entry (bun test, SDK embedding) never spawn brokers. Remote
-		// relay URLs must already be serving.
+		// Loopback relays are owned by a machine-global broker (or, when pinned,
+		// a launchd job) and auto-started on demand (the extension dials in on
+		// its own). Hosts without a CLI worker entry (bun test, SDK embedding)
+		// never spawn brokers. Remote relay URLs must already be serving.
 		if (isLoopbackRelayUrl(cdpUrl) && (isCompiledBinary() || workerHostEntry() !== null)) {
-			await ensureRelayDaemon({ cdpUrl, signal: opts.signal });
+			await ensureRelayDaemon({
+				cdpUrl,
+				signal: opts.signal,
+				requireProtocol: kind.requireProtocol,
+				supervisor: kind.supervisor,
+			});
 		}
 		// The relay answers /json/version with 503 until its extension dials in;
-		// the wait fails fast when nothing serves the port or the server has
-		// already outlived the window an installed extension needs to connect.
+		// the wait fails fast when nothing serves the port, the server has
+		// already outlived the window an installed extension needs to connect,
+		// or the relay refused the extension that dialed.
 		const outcome = await waitForRelayExtension(cdpUrl, opts.signal);
-		if (outcome === "unreachable") {
-			throw new ToolError(
-				`omp browser relay is not reachable at ${cdpUrl}. Start it with \`omp browser-relay\` (or check the endpoint), and make sure the OMP Browser Relay extension is loaded in Chrome.`,
-			);
-		}
-		if (outcome === "no-extension") {
-			throw new ToolError(
-				`omp browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`omp browser-relay install\` and check the toolbar badge shows "on".`,
-			);
+		switch (outcome.kind) {
+			case "unreachable":
+				throw new ToolError(
+					`omp browser relay is not reachable at ${cdpUrl}. Start it with \`omp browser-relay\` (or check the endpoint), and make sure the OMP Browser Relay extension is loaded in Chrome.`,
+				);
+			case "no-extension":
+				throw new ToolError(
+					`omp browser relay is serving at ${cdpUrl} but its extension never connected. Install it with \`omp browser-relay install\` and check the toolbar badge shows "on".`,
+				);
+			case "incompatible-extension":
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl}: relay extension ${outcome.version} is older than this relay requires (${outcome.required}); reinstall it (omp browser-relay install) and reload it in chrome://extensions.`,
+				);
+			case "profile-unbound":
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl}: relay extension from an unbound Chrome profile is connected${outcome.connectedFingerprint ? ` (install ${outcome.connectedFingerprint})` : ""}; bind it with the launcher runbook (omp-relay-share bind --from-connected) or reload the approved profile's extension.`,
+				);
+			case "profile-mismatch":
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl}: relay extension install ${outcome.rejectedFingerprint ?? "(unknown)"} was rejected: the relay is bound to Chrome profile install ${outcome.boundFingerprint}; rebind explicitly (omp-relay-share bind) if the approved profile changed.`,
+				);
+			case "profile-invalid":
+				throw new ToolError(`omp browser relay at ${cdpUrl}: ${outcome.error}`);
+			case "ready":
+				break;
 		}
 		// The staged relay reports the extension's per-Chrome-run generation
 		// (`OMP-Browser-Generation`); it scopes durable relay tab records so a
 		// tab id recycled by a Chrome restart can never match an old record.
+		// The protocol is re-derived from this same answer (the last one before
+		// puppeteer connects) so a relay swapped in after the wait cannot slip
+		// under the requirement — hosts that skipped ensureRelayDaemon included.
+		// The binding proof follows below, over the adopted connection itself.
 		const version = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: 2_000, signal: opts.signal });
+		if (kind.requireProtocol !== undefined) {
+			const found = Math.min(outcome.relayProtocol, relayProtocolOf(version) ?? LEGACY_RELAY_PROTOCOL);
+			if (found < kind.requireProtocol) {
+				throw new ToolError(relayProtocolTooOldMessage(cdpUrl, found, kind.requireProtocol, kind.supervisor));
+			}
+		}
 		let generation: string | undefined;
+		let expectedFingerprint: string | undefined;
 		try {
 			const parsed: unknown = version ? JSON.parse(version.body) : undefined;
-			if (isRecord(parsed) && typeof parsed["OMP-Browser-Generation"] === "string") {
-				generation = parsed["OMP-Browser-Generation"];
+			if (isRecord(parsed)) {
+				if (typeof parsed["OMP-Browser-Generation"] === "string") generation = parsed["OMP-Browser-Generation"];
+				if (typeof parsed["OMP-Profile-Fingerprint"] === "string") {
+					expectedFingerprint = parsed["OMP-Profile-Fingerprint"];
+				}
 			}
 		} catch {
 			// Legacy relay (18.1.10): no generation; relay tab records stay unprovable and are never reaped.
@@ -267,6 +304,45 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		if (kind.requireProtocol !== undefined) {
+			// The proof that counts is bound to THIS connection: puppeteer's own
+			// discovery lookup and websocket may have reached a different process
+			// than the probes above. Only a protocol-2 relay stamps `revision`, and
+			// it must be the same bound install the pre-connect answer named.
+			let revision: unknown;
+			try {
+				revision = (await rootCdpConnection(browser).send("Browser.getVersion")).revision;
+			} catch (err) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl} did not answer Browser.getVersion over the adopted connection: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			const proven = parseRelayRevision(revision);
+			if (proven === null || proven.protocol < kind.requireProtocol) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					relayProtocolTooOldMessage(
+						cdpUrl,
+						proven?.protocol ?? LEGACY_RELAY_PROTOCOL,
+						kind.requireProtocol,
+						kind.supervisor,
+					),
+				);
+			}
+			const mismatch =
+				proven.binding !== "bound"
+					? `it is ${proven.binding || "unbound"}, not bound`
+					: proven.fingerprint !== expectedFingerprint
+						? `it serves Chrome profile install ${proven.fingerprint || "(none)"}, not ${expectedFingerprint ?? "(none)"}`
+						: null;
+			if (mismatch) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl}: the relay puppeteer connected to is not the one that answered /json/version — ${mismatch}. Another relay took the port between the check and the connection; retry, and stop the stray relay (omp ps --global browser-relay list).`,
+				);
+			}
+		}
 		return {
 			key: browserKey(kind),
 			kind,
@@ -481,4 +557,18 @@ async function openSharedHeadlessHandle(
 /** Test-only accessor for the module-global browsers map. */
 export function getBrowsersMapForTest(): ReadonlyMap<string, BrowserHandle> {
 	return browsers;
+}
+
+/**
+ * Puppeteer's root CDP connection — the browser session itself. `browser.target()`
+ * cannot stand in for it on the relay: the bridge announces no `browser` target
+ * and its `Target.attachToTarget` only knows tab/page ids. Puppeteer's own
+ * `newPage()` sends `Target.createTarget` on this connection.
+ */
+export function rootCdpConnection(browser: Browser): Connection {
+	// `_connection` is `@internal` on CdpBrowser and absent from the public
+	// `Browser` typings; nothing public exposes the browser session.
+	const internal = browser as unknown as { _connection?: Connection };
+	if (!internal._connection) throw new ToolError("Browser root CDP connection is unavailable");
+	return internal._connection;
 }

@@ -25,6 +25,7 @@ import {
 	relayLiveMarkersForTest,
 	type WorkerTabSession,
 } from "./tab-supervisor";
+import { TEST_HELLO_IDENTITY, writeRelayBindingFixture } from "../../../test/tools/relay-binding-fixture";
 
 const GENERATION = "gen-relay-test";
 const MARKER = "11111111-2222-4333-8444-555555555555";
@@ -55,7 +56,7 @@ class FakeExtension {
 						tabs: [],
 						attachedTabIds: [],
 						generation: GENERATION,
-						extensionVersion: "0.2.0",
+						...TEST_HELLO_IDENTITY,
 					}),
 				);
 				resolve();
@@ -118,7 +119,9 @@ describe("relay durable records — marker recorded, dead owner swept by marker"
 	it("stores the extension marker on the new_tab record and a later process closes the dead owner's marked tab", async () => {
 		const port = await findFreeCdpPort();
 		const cdpUrl = `http://127.0.0.1:${port}`;
-		const relay: RelayServer = startRelayServer({ port });
+		const bindingPath = await writeRelayBindingFixture();
+		roots.push(path.dirname(bindingPath));
+		const relay: RelayServer = startRelayServer({ port, bindingPath });
 		const extension = new FakeExtension(port);
 		let handle: BrowserHandle | undefined;
 		try {

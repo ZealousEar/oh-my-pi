@@ -21,12 +21,60 @@
  * - real child session ids (OOPIFs, workers) — created by Chrome under the
  *   shared root session and passed through verbatim
  */
-import type { ExtToRelayMessage, RelayRpcRequest, RelayToExtMessage, TabSnapshot } from "./protocol";
+import { logger } from "@oh-my-pi/pi-utils";
+import { defaultRelayBindingPath, type RelayBindingState, readRelayBinding } from "./binding";
+import {
+	type ExtToRelayMessage,
+	extensionProtocolOf,
+	installFingerprint,
+	RELAY_CLOSE_PROFILE_MISMATCH,
+	RELAY_EXTENSION_MIN_VERSION,
+	RELAY_PROTOCOL_VERSION,
+	relayRevision,
+	type RelayRpcRequest,
+	type RelayToExtMessage,
+	type TabSnapshot,
+} from "./protocol";
 
 /** Transport-agnostic websocket surface the bridge writes to. */
 export interface RelaySocket {
 	send(text: string): void;
-	close(): void;
+	close(code?: number, reason?: string): void;
+}
+
+/** Why the last extension hello could not make the relay ready. */
+export interface IncompatibleExtension {
+	version: string;
+	required: string;
+	/** `version`: older than {@link RELAY_EXTENSION_MIN_VERSION}; `install-id`: new enough but reported no install id. */
+	reason: "version" | "install-id";
+}
+
+/** A rejected extension install (bound relay, different install). */
+export interface RejectedInstall {
+	fingerprint: string;
+	/** ISO 8601. */
+	at: string;
+}
+
+/** Binding view for `/json/version` 503 bodies and `/omp/binding`. */
+export type ProfileBindingInfo =
+	| { state: "unbound"; connectedFingerprint?: string }
+	| { state: "bound"; boundFingerprint: string; lastRejected?: RejectedInstall }
+	| { state: "invalid"; error: string };
+
+/** Why `/json/version` answers 503 (absent: no extension has connected). */
+export type RelayUnavailableReason =
+	| "extension-incompatible"
+	| "profile-unbound"
+	| "profile-mismatch"
+	| "profile-invalid";
+
+/** Mismatch warnings are rate-limited per install id. */
+const MISMATCH_LOG_INTERVAL_MS = 60_000;
+
+function invalidBindingError(detail: string): string {
+	return `relay binding file is invalid: ${detail}; fix or remove it (omp-relay-share unbind)`;
 }
 
 interface CdpCommand {
@@ -197,10 +245,31 @@ export class RelayBridge {
 	#connSeq = 0;
 	#sessionSeq = 0;
 	#rpcSeq = 0;
+	/** Extension socket whose hello was accepted (compatible, install not rejected by the binding). */
 	#ext: RelaySocket | null = null;
-	#extInfo: { userAgent: string; browserVersion: string; generation?: string; extensionVersion?: string } | null =
-		null;
+	#extInfo: {
+		userAgent: string;
+		browserVersion: string;
+		generation?: string;
+		extensionVersion?: string;
+		installId: string;
+	} | null = null;
+	/** Extension sockets that connected but have not (successfully) said hello; never replace {@link #ext}. */
+	#candidates = new Set<RelaySocket>();
+	/** Hellos of candidates ignored while unbound (a second install); replayed once {@link #ext} is free. */
+	#candidateHellos = new Map<RelaySocket, Extract<ExtToRelayMessage, { t: "hello" }>>();
 	#extensionSeen = false;
+	/** Sticky until an accepted hello: the last hello this relay could not accept for protocol reasons. */
+	#incompatibleExtension: IncompatibleExtension | null = null;
+	#bindingPath: string;
+	/** Binding file as of the last {@link refreshBinding}/hello. */
+	#binding: RelayBindingState = { state: "unbound" };
+	#lastRejected: RejectedInstall | null = null;
+	/** A rejection happened after the last accepted hello: it is the 503 reason until the bound install says hello again. */
+	#rejectionPending = false;
+	/** The bound install completed a hello at least once in this server's lifetime. */
+	#boundSeen = false;
+	#mismatchLogAt = new Map<string, number>();
 	#pendingRpc = new Map<
 		number,
 		{ resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
@@ -220,23 +289,136 @@ export class RelayBridge {
 			log?: (message: string, data?: Record<string, unknown>) => void;
 			/** Group tabs the agent actively drives under one per-window Chrome tab group. */
 			group?: { title: string; color: string } | null;
+			/** Binding file naming the one extension install this relay serves; default `~/.omp/browser-relay/binding.json`. */
+			bindingPath?: string;
 		} = {},
 	) {
 		this.#log = opts.log ?? (() => {});
 		this.#group = opts.group ?? null;
+		this.#bindingPath = opts.bindingPath ?? defaultRelayBindingPath();
 	}
 
-	/** True once the extension has completed its hello handshake. */
+	/** True once a compatible extension from the bound install has completed its hello handshake. */
 	get ready(): boolean {
-		return this.#ext !== null && this.#extInfo !== null;
+		return this.#ext !== null && this.#extInfo !== null && this.#bindingAccepts(this.#extInfo.installId);
 	}
 
-	/** True after the first hello, and stays true: separates a reaped service worker from an absent extension. */
+	/** True after the first accepted hello, and stays true: separates a reaped service worker from an absent extension. */
 	get extensionSeen(): boolean {
 		return this.#extensionSeen;
 	}
 
-	/** Payload for `GET /json/version`. `OMP-Browser-Generation` is present once a 0.2.0 extension has said hello. */
+	/** The last hello this relay refused for protocol reasons; cleared by the next accepted hello. */
+	get incompatibleExtension(): IncompatibleExtension | null {
+		return this.#incompatibleExtension;
+	}
+
+	/**
+	 * Re-read the binding file and enforce it against the connected extension
+	 * (a bind to another install while one is connected drops that one exactly
+	 * like a mismatched hello). Called on every hello and readiness query so
+	 * `bind`/`unbind` never need a relay restart.
+	 */
+	refreshBinding(): void {
+		this.#binding = readRelayBinding(this.#bindingPath);
+		if (
+			this.#ext &&
+			this.#extInfo &&
+			this.#binding.state === "bound" &&
+			this.#binding.binding.installId !== this.#extInfo.installId
+		) {
+			this.#rejectInstall(this.#ext, this.#extInfo.installId);
+		}
+	}
+
+	/** Binding as seen by `/json/version` 503 bodies (fingerprints only). */
+	profileBinding(): ProfileBindingInfo {
+		switch (this.#binding.state) {
+			case "invalid":
+				return { state: "invalid", error: this.#binding.error };
+			case "bound":
+				return {
+					state: "bound",
+					boundFingerprint: installFingerprint(this.#binding.binding.installId),
+					...(this.#lastRejected ? { lastRejected: this.#lastRejected } : {}),
+				};
+			case "unbound":
+				return {
+					state: "unbound",
+					...(this.#ext && this.#extInfo
+						? { connectedFingerprint: installFingerprint(this.#extInfo.installId) }
+						: {}),
+				};
+		}
+	}
+
+	/**
+	 * Payload for `GET /omp/binding` (loopback diagnostics for the pinning
+	 * tool). The full install id is exposed only while unbound and connected —
+	 * exactly what `bind --from-connected` needs.
+	 */
+	bindingInfo(): Record<string, unknown> {
+		const info: Record<string, unknown> = { ...this.profileBinding() };
+		if (this.#ext && this.#extInfo) {
+			if (this.#binding.state === "unbound") info.connectedInstallId = this.#extInfo.installId;
+			info.connectedFingerprint = installFingerprint(this.#extInfo.installId);
+			info.connectedBrowser = { browserVersion: this.#extInfo.browserVersion, userAgent: this.#extInfo.userAgent };
+		}
+		if (this.#lastRejected) info.lastRejected = this.#lastRejected;
+		return info;
+	}
+
+	/**
+	 * Why `/json/version` answers 503 right now (call after {@link refreshBinding}).
+	 * `reason` is absent when simply no extension has connected.
+	 */
+	unavailable(): {
+		reason?: RelayUnavailableReason;
+		error: string;
+		extensionIncompatible?: { version: string; required: string };
+		profileBinding: ProfileBindingInfo;
+		/** With `profile-mismatch`: the bound install was connected earlier in this server's lifetime (it may revive). */
+		boundSeen?: boolean;
+	} {
+		const profileBinding = this.profileBinding();
+		if (this.#ext && this.#extInfo) {
+			const fingerprint = installFingerprint(this.#extInfo.installId);
+			if (this.#binding.state === "invalid") {
+				return { reason: "profile-invalid", error: invalidBindingError(this.#binding.error), profileBinding };
+			}
+			return {
+				reason: "profile-unbound",
+				error: `relay extension from an unbound Chrome profile is connected (install ${fingerprint}); bind it with the launcher runbook (omp-relay-share bind --from-connected) or reload the approved profile's extension`,
+				profileBinding,
+			};
+		}
+		if (this.#incompatibleExtension) {
+			const { version, required, reason } = this.#incompatibleExtension;
+			return {
+				reason: "extension-incompatible",
+				error:
+					reason === "version"
+						? `relay extension ${version} is older than this relay requires (${required}); reinstall it (omp browser-relay install) and reload it in chrome://extensions`
+						: `relay extension ${version} reported no install id; reinstall it (omp browser-relay install) and reload it in chrome://extensions`,
+				extensionIncompatible: { version, required },
+				profileBinding,
+			};
+		}
+		if (this.#binding.state === "invalid") {
+			return { reason: "profile-invalid", error: invalidBindingError(this.#binding.error), profileBinding };
+		}
+		if (this.#binding.state === "bound" && this.#lastRejected && this.#rejectionPending) {
+			return {
+				reason: "profile-mismatch",
+				error: `relay extension install ${this.#lastRejected.fingerprint} was rejected: the relay is bound to Chrome profile install ${installFingerprint(this.#binding.binding.installId)}; rebind explicitly (omp-relay-share bind) if the approved profile changed`,
+				profileBinding,
+				boundSeen: this.#boundSeen,
+			};
+		}
+		return { error: "relay extension is not connected", profileBinding };
+	}
+
+	/** Payload for `GET /json/version` (only meaningful while {@link ready}). */
 	versionInfo(wsUrl: string): Record<string, string> {
 		const ua = this.#extInfo?.userAgent ?? "";
 		return {
@@ -246,9 +428,17 @@ export class RelayBridge {
 			"V8-Version": "",
 			"WebKit-Version": "",
 			webSocketDebuggerUrl: wsUrl,
+			"OMP-Relay-Protocol": String(RELAY_PROTOCOL_VERSION),
 			...(this.#extInfo?.generation ? { "OMP-Browser-Generation": this.#extInfo.generation } : {}),
 			...(this.#extInfo?.extensionVersion ? { "OMP-Extension-Version": this.#extInfo.extensionVersion } : {}),
+			...(this.#extInfo
+				? { "OMP-Profile-Binding": "bound", "OMP-Profile-Fingerprint": installFingerprint(this.#extInfo.installId) }
+				: {}),
 		};
+	}
+
+	#bindingAccepts(installId: string): boolean {
+		return this.#binding.state === "bound" && this.#binding.binding.installId === installId;
 	}
 
 	/** Marker of an OMP-created tab by page/tab target id; undefined for user tabs. */
@@ -284,19 +474,24 @@ export class RelayBridge {
 		this.#pendingRpc.clear();
 	}
 
-	/** A new extension socket connected; replaces any previous one. */
+	/**
+	 * A new extension socket connected. It is only a candidate until its hello
+	 * is validated: a socket from another Chrome profile must never displace
+	 * the bound extension merely by dialing in.
+	 */
 	extConnected(socket: RelaySocket): void {
-		if (this.#ext && this.#ext !== socket) {
-			this.#log("replacing extension socket");
-			for (const tab of this.#tabs.values()) this.#resetRuntime(tab);
-			this.#rejectPendingExtensionRpcs(new ExtensionReplacedError());
-			this.#ext.close();
-		}
-		this.#ext = socket;
+		if (socket !== this.#ext) this.#candidates.add(socket);
 	}
 
 	extClosed(socket: RelaySocket): void {
+		this.#candidates.delete(socket);
+		this.#candidateHellos.delete(socket);
 		if (this.#ext !== socket) return;
+		this.#dropExt();
+	}
+
+	/** Forget the accepted extension socket and everything only it could vouch for. */
+	#dropExt(): void {
 		this.#ext = null;
 		this.#extInfo = null;
 		this.#rejectPendingExtensionRpcs(new Error("relay extension disconnected"));
@@ -313,10 +508,31 @@ export class RelayBridge {
 			tab.ompGroupId = undefined;
 		}
 		this.#groupQueue.length = 0;
+		this.#promoteCandidate();
+	}
+
+	/**
+	 * With no accepted socket, replay cached hellos of still-open candidates
+	 * (installs ignored while unbound), newest first, until one is accepted.
+	 * An extension never re-hellos on an open socket, so without this a
+	 * `bind` to a waiting install (or the first install disconnecting) would
+	 * leave the relay not-ready until Chrome reaped that install's worker.
+	 */
+	#promoteCandidate(): void {
+		while (!this.#ext) {
+			const last = Array.from(this.#candidateHellos.entries()).at(-1);
+			if (!last) return;
+			const [socket, msg] = last;
+			this.#candidateHellos.delete(socket);
+			// A replay that is itself rejected (bound to a third install) closes
+			// that socket and leaves #ext free, so the loop tries the next one.
+			this.#onHello(socket, msg);
+		}
 	}
 
 	extMessage(socket: RelaySocket, raw: string): void {
-		if (socket !== this.#ext) return;
+		const accepted = socket === this.#ext;
+		if (!accepted && !this.#candidates.has(socket)) return;
 		let msg: ExtToRelayMessage;
 		try {
 			msg = JSON.parse(raw) as ExtToRelayMessage;
@@ -324,10 +540,17 @@ export class RelayBridge {
 			this.#log("dropping malformed extension message");
 			return;
 		}
+		if (msg.t === "hello") {
+			this.#onHello(socket, msg);
+			return;
+		}
+		if (msg.t === "ping") {
+			socket.send(JSON.stringify({ t: "pong" } satisfies RelayToExtMessage));
+			return;
+		}
+		// Only the accepted extension drives tab state.
+		if (!accepted) return;
 		switch (msg.t) {
-			case "hello":
-				this.#onHello(msg);
-				return;
 			case "rpcResult": {
 				const pending = this.#pendingRpc.get(msg.id);
 				if (!pending) return;
@@ -352,20 +575,98 @@ export class RelayBridge {
 			case "tabRemoved":
 				this.#onTabRemoved(msg.tabId);
 				return;
-			case "ping":
-				socket.send(JSON.stringify({ t: "pong" } satisfies RelayToExtMessage));
-				return;
 		}
 	}
 
-	#onHello(msg: Extract<ExtToRelayMessage, { t: "hello" }>): void {
+	/** Record a protocol-level refusal; the socket stays open and never receives RPCs. */
+	#refuseIncompatible(socket: RelaySocket, incompatible: IncompatibleExtension): void {
+		this.#incompatibleExtension = incompatible;
+		if (socket === this.#ext) {
+			this.#dropExt();
+			this.#candidates.add(socket);
+		}
+		logger.warn("Browser relay refused an incompatible extension", { ...incompatible });
+		this.#log("incompatible extension", { ...incompatible });
+	}
+
+	/** Close a socket whose install is not the bound one; the bound connection (if any other) is untouched. */
+	#rejectInstall(socket: RelaySocket, installId: string): void {
+		const fingerprint = installFingerprint(installId);
+		const now = Date.now();
+		this.#lastRejected = { fingerprint, at: new Date(now).toISOString() };
+		this.#rejectionPending = true;
+		this.#candidates.delete(socket);
+		if (socket === this.#ext) this.#dropExt();
+		const boundFingerprint =
+			this.#binding.state === "bound" ? installFingerprint(this.#binding.binding.installId) : undefined;
+		const lastLogged = this.#mismatchLogAt.get(installId) ?? 0;
+		if (now - lastLogged >= MISMATCH_LOG_INTERVAL_MS) {
+			this.#mismatchLogAt.set(installId, now);
+			logger.warn("Browser relay rejected an extension from an unbound Chrome profile", {
+				fingerprint,
+				boundFingerprint,
+			});
+		}
+		this.#log("profile mismatch", { fingerprint, boundFingerprint });
+		socket.close(RELAY_CLOSE_PROFILE_MISMATCH, "profile-mismatch");
+	}
+
+	#onHello(socket: RelaySocket, msg: Extract<ExtToRelayMessage, { t: "hello" }>): void {
+		const extensionVersion = typeof msg.extensionVersion === "string" ? msg.extensionVersion : undefined;
+		if (extensionProtocolOf(extensionVersion) < RELAY_PROTOCOL_VERSION) {
+			this.#refuseIncompatible(socket, {
+				version: extensionVersion ?? "0.1.0",
+				required: RELAY_EXTENSION_MIN_VERSION,
+				reason: "version",
+			});
+			return;
+		}
+		const installId = typeof msg.installId === "string" && msg.installId.length > 0 ? msg.installId : undefined;
+		if (installId === undefined) {
+			this.#refuseIncompatible(socket, {
+				version: extensionVersion ?? "0.1.0",
+				required: RELAY_EXTENSION_MIN_VERSION,
+				reason: "install-id",
+			});
+			return;
+		}
+		this.#binding = readRelayBinding(this.#bindingPath);
+		if (this.#binding.state === "bound" && this.#binding.binding.installId !== installId) {
+			this.#rejectInstall(socket, installId);
+			return;
+		}
+		this.#incompatibleExtension = null;
+		this.#candidates.delete(socket);
+		this.#candidateHellos.delete(socket);
+		if (this.#ext && this.#ext !== socket) {
+			if (this.#extInfo && this.#extInfo.installId !== installId) {
+				// Unbound relay, two different installs: the first stays connected
+				// (it is what `bind --from-connected` binds); the other stays a
+				// silent candidate instead of displacing it.
+				this.#candidates.add(socket);
+				this.#candidateHellos.set(socket, msg);
+				this.#log("ignoring hello from a second install while unbound", {
+					fingerprint: installFingerprint(installId),
+				});
+				return;
+			}
+			// Same install: a restarted service worker replaces its predecessor.
+			this.#log("replacing extension socket");
+			for (const tab of this.#tabs.values()) this.#resetRuntime(tab);
+			this.#rejectPendingExtensionRpcs(new ExtensionReplacedError());
+			this.#ext.close();
+		}
+		this.#ext = socket;
 		this.#extInfo = {
 			userAgent: msg.userAgent,
 			browserVersion: msg.browserVersion,
 			generation: typeof msg.generation === "string" && msg.generation.length > 0 ? msg.generation : undefined,
-			extensionVersion: typeof msg.extensionVersion === "string" ? msg.extensionVersion : undefined,
+			extensionVersion,
+			installId,
 		};
 		this.#extensionSeen = true;
+		if (this.ready) this.#boundSeen = true;
+		this.#rejectionPending = false;
 		const seen = new Set<number>();
 		const attachedNow = new Set(msg.attachedTabIds);
 		for (const snap of msg.tabs) {
@@ -388,7 +689,12 @@ export class RelayBridge {
 			}
 		}
 		this.#syncGrouping();
-		this.#log("extension connected", { tabs: this.#tabs.size, version: msg.browserVersion });
+		this.#log("extension connected", {
+			tabs: this.#tabs.size,
+			version: msg.browserVersion,
+			binding: this.#binding.state,
+			ready: this.ready,
+		});
 	}
 
 	// ---- downstream (puppeteer) lifecycle -------------------------------------
@@ -669,7 +975,10 @@ export class RelayBridge {
 				this.#reply(conn, msg, {
 					protocolVersion: "1.3",
 					product: this.#extInfo?.browserVersion ?? "Chrome/unknown",
-					revision: "",
+					// Proof bound to THIS connection that a protocol-2 relay answered
+					// (an HTTP probe can be answered by a different process than the
+					// one puppeteer ended up talking to). Other fields stay Chrome-like.
+					revision: relayRevision(this.profileBinding().state, this.#extInfo?.installId),
 					userAgent: this.#extInfo?.userAgent ?? "",
 					jsVersion: "",
 				});
@@ -1226,6 +1535,9 @@ export class RelayBridge {
 	#rpc(req: RelayRpcRequest, timeoutMs = RPC_TIMEOUT_MS): Promise<unknown> {
 		const ext = this.#ext;
 		if (!ext) return Promise.reject(new Error("relay extension is not connected"));
+		// An unbound (or newly unbound) install may stay connected for `bind
+		// --from-connected`, but the relay never drives it.
+		if (!this.ready) return Promise.reject(new Error("relay extension is not bound to this relay"));
 		const id = ++this.#rpcSeq;
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		const timer = setTimeout(() => {

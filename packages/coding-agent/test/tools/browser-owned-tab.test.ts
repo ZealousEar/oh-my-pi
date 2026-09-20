@@ -19,6 +19,7 @@ import { runBrowserTask } from "@oh-my-pi/pi-coding-agent/tools/browser/task/loo
 import { executeBrowserTask } from "@oh-my-pi/pi-coding-agent/tools/browser/task/run";
 import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
+import { removeRelayBindingFixture, TEST_HELLO_IDENTITY, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const FIXTURE_DIR = import.meta.dir + "/../fixtures/browser-task";
@@ -225,6 +226,7 @@ class FakeExtension {
 						browserVersion: "Chrome/151.0.0.0",
 						tabs: initialTabs,
 						attachedTabIds: [],
+						...TEST_HELLO_IDENTITY,
 					}),
 				);
 				resolve();
@@ -269,7 +271,8 @@ describe("browser open app.new_tab on the relay bridge", () => {
 	it("creates the tab in the background through the extension and removes it on close", async () => {
 		const port = await findFreeCdpPort();
 		const cdpUrl = `http://127.0.0.1:${port}`;
-		const relay: RelayServer = startRelayServer({ port });
+		const bindingPath = await writeRelayBindingFixture();
+		const relay: RelayServer = startRelayServer({ port, bindingPath });
 		const extension = new FakeExtension(port, []);
 		let handle: BrowserHandle | undefined;
 		try {
@@ -299,6 +302,7 @@ describe("browser open app.new_tab on the relay bridge", () => {
 			if (handle) await releaseBrowser(handle, { kill: false });
 			extension.close();
 			relay.stop();
+			await removeRelayBindingFixture(bindingPath);
 		}
 	}, 15_000);
 });

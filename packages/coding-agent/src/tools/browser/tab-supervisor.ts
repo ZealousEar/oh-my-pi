@@ -43,6 +43,7 @@ import {
 	holdBrowser,
 	type PuppeteerBrowserHandle,
 	releaseBrowser,
+	rootCdpConnection,
 } from "./registry";
 import {
 	originOf,
@@ -1562,20 +1563,6 @@ async function waitForTargetById(browser: Browser, targetId: string): Promise<Ta
 		browser.targets().find(isCreated) ??
 		(await browser.waitForTarget(isCreated, { timeout: BROWSER_PROTOCOL_TIMEOUT_MS }))
 	);
-}
-
-/**
- * Puppeteer's root CDP connection — the browser session itself. `browser.target()`
- * cannot stand in for it on the relay: the bridge announces no `browser` target
- * and its `Target.attachToTarget` only knows tab/page ids. Puppeteer's own
- * `newPage()` sends `Target.createTarget` on this connection.
- */
-function rootCdpConnection(browser: Browser): Connection {
-	// `_connection` is `@internal` on CdpBrowser and absent from the public
-	// `Browser` typings; nothing public exposes the browser session.
-	const internal = browser as unknown as { _connection?: Connection };
-	if (!internal._connection) throw new ToolError("Browser root CDP connection is unavailable");
-	return internal._connection;
 }
 
 function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
