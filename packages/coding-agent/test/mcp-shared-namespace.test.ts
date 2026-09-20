@@ -2,10 +2,11 @@
  * Shared managed-MCP-OAuth namespace (`OMP_SHARED_MCP_PROFILES`): the listed
  * profiles are channels of one user and share one credential per server URL.
  * Contracts: shared mode mints the url-keyed id every build parses back to the
- * URL; lookup precedence is url-keyed → own profile → sibling channel rows,
- * a sibling row minted for a different configured OAuth client is never
- * adopted; logout removes every channel's row but not a foreign profile's;
- * the env unset restores upstream profile-scoped behaviour; `/mcp reauth` and
+ * URL; lookup precedence is url-keyed → own profile → sibling channel rows;
+ * the credential-embedded DCR client wins over stale config refresh material;
+ * recorded resources, auth-server origins, and scopes cannot contradict the
+ * request; logout removes every channel's row but not a foreign profile's; the
+ * env unset restores upstream profile-scoped behaviour; `/mcp reauth` and
  * `/mcp unauth` follow the same rules end to end, including a build that only
  * honours the config `auth.credentialId` pointer.
  */
@@ -34,12 +35,12 @@ const SHARED = "stock,daily-fork,dev-fork";
 const AUTH_ERROR = new Error(
 	'HTTP 401: {"authorization_url":"https://auth.example.com/authorize","token_url":"https://auth.example.com/token"}',
 );
-const cred = (clientId?: string) => ({
+const cred = (identity: { clientId?: string; resource?: string; scopes?: string; tokenUrl?: string } = {}) => ({
 	type: "oauth" as const,
 	access: "at",
 	refresh: "rt",
 	expires: Date.now() + 3_600_000,
-	...(clientId ? { clientId } : {}),
+	...identity,
 });
 
 let storage: AuthStorage;
@@ -87,19 +88,90 @@ describe("shared MCP OAuth namespace", () => {
 		]);
 	});
 
-	test("a sibling channel's row is adopted without a config pointer unless it belongs to another OAuth client", async () => {
-		await storage.set(`mcp_oauth:profile:stock:${URL}`, cred("client-A"));
-		expect(lookupMcpOAuthCredential(storage, { type: "http", url: URL })?.credentialId).toBe(
-			`mcp_oauth:profile:stock:${URL}`,
+	test("a url-keyed DCR row keeps its embedded client when config carries another profile's client", async () => {
+		await storage.set(
+			`mcp_oauth:${URL}`,
+			cred({
+				clientId: "credential-dcr-client",
+				resource: "https://resource.example.test",
+				tokenUrl: "https://auth.example.test/oauth/token",
+			}),
 		);
 		expect(
-			lookupMcpOAuthCredential(storage, { type: "http", url: URL, oauth: { clientId: "client-B" } }),
-		).toBeUndefined();
-		// The own-profile row is never filtered by the client guard.
-		await storage.set(`mcp_oauth:profile:daily-fork:${URL}`, cred("client-A"));
+			lookupMcpOAuthCredential(storage, {
+				type: "http",
+				url: URL,
+				auth: {
+					type: "oauth",
+					clientId: "other-profile-client",
+					resource: "https://resource.example.test",
+					tokenUrl: "https://auth.example.test/token",
+				},
+			})?.credentialId,
+		).toBe(`mcp_oauth:${URL}`);
+	});
+
+	test("a url-keyed legacy row without recorded resource identity remains usable", async () => {
+		await storage.set(`mcp_oauth:${URL}`, cred());
 		expect(
-			lookupMcpOAuthCredential(storage, { type: "http", url: URL, oauth: { clientId: "client-B" } })?.credentialId,
-		).toBe(`mcp_oauth:profile:daily-fork:${URL}`);
+			lookupMcpOAuthCredential(storage, {
+				type: "http",
+				url: URL,
+				auth: { type: "oauth", resource: "https://resource.example.test" },
+			})?.credentialId,
+		).toBe(`mcp_oauth:${URL}`);
+	});
+
+	test("a sibling row for a different resource is not exposed to the request", async () => {
+		await storage.set(`mcp_oauth:profile:stock:${URL}`, cred({ resource: "https://other-resource.example.test" }));
+		expect(
+			lookupMcpOAuthCredential(storage, {
+				type: "http",
+				url: URL,
+				auth: { type: "oauth", resource: "https://resource.example.test" },
+			}),
+		).toBeUndefined();
+	});
+
+	test("token endpoints on the same authorization-server origin are compatible", async () => {
+		await storage.set(`mcp_oauth:${URL}`, cred({ tokenUrl: "https://auth.example.test/oauth/token" }));
+		expect(
+			lookupMcpOAuthCredential(storage, {
+				type: "http",
+				url: URL,
+				auth: { type: "oauth", tokenUrl: "https://auth.example.test/token-v2" },
+			})?.credentialId,
+		).toBe(`mcp_oauth:${URL}`);
+	});
+
+	test("a credential from a different authorization-server origin is not exposed", async () => {
+		await storage.set(`mcp_oauth:${URL}`, cred({ tokenUrl: "https://auth-a.example.test/token" }));
+		expect(
+			lookupMcpOAuthCredential(storage, {
+				type: "http",
+				url: URL,
+				auth: { type: "oauth", tokenUrl: "https://auth-b.example.test/token" },
+			}),
+		).toBeUndefined();
+	});
+
+	test("a recorded granted scope must cover every scope required by the server", async () => {
+		await storage.set(`mcp_oauth:${URL}`, cred({ scopes: "openid profile offline_access" }));
+		expect(
+			lookupMcpOAuthCredential(storage, { type: "http", url: URL, oauth: { scope: "profile openid" } })
+				?.credentialId,
+		).toBe(`mcp_oauth:${URL}`);
+		expect(
+			lookupMcpOAuthCredential(storage, { type: "http", url: URL, oauth: { scope: "profile email" } }),
+		).toBeUndefined();
+	});
+
+	test("default is a resolvable sibling when the shared profile list includes it", async () => {
+		process.env.OMP_SHARED_MCP_PROFILES = "stock,daily-fork,dev-fork,default";
+		await storage.set(`mcp_oauth:profile:default:${URL}`, cred());
+		expect(lookupMcpOAuthCredential(storage, { type: "http", url: URL })?.credentialId).toBe(
+			`mcp_oauth:profile:default:${URL}`,
+		);
 	});
 
 	test("logout removes the url-keyed row and every shared channel's row but not a foreign profile's", async () => {

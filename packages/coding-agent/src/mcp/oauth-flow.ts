@@ -112,6 +112,8 @@ export interface MCPStoredOAuthCredential extends OAuthCredential {
 	clientId?: string;
 	clientSecret?: string;
 	resource?: string;
+	/** Granted OAuth scopes (space-separated), when recorded by the issuer or login flow. */
+	scopes?: string;
 	/**
 	 * Authorization-server URL (the issuer the grant was minted against). Used
 	 * to filter same-origin resource indicators on refresh: RFC 8414 lets the
@@ -125,7 +127,7 @@ export interface MCPStoredOAuthCredential extends OAuthCredential {
 const DEFAULT_PORT = 3000;
 const CALLBACK_PATH = "/callback";
 
-function hasOAuthScope(scopes: string | null | undefined, scope: string): boolean {
+export function hasOAuthScope(scopes: string | null | undefined, scope: string): boolean {
 	return !!scopes && scopes.split(/\s+/).includes(scope);
 }
 

@@ -1,9 +1,11 @@
 import { isDefinitiveOAuthFailure, REMOTE_REFRESH_SENTINEL, type StoredOAuthRefreshResult } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { logger } from "@oh-my-pi/pi-utils";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import { expandEnvVarsDeep } from "../discovery/helpers";
 import type { AuthStorage } from "../session/auth-storage";
 import {
+	hasOAuthScope,
 	isManagedMCPOAuthCredentialId,
 	type MCPStoredOAuthCredential,
 	mcpOAuthCredentialId,
@@ -44,21 +46,73 @@ export function mcpOAuthCredentialIdsForServerUrl(serverUrl: string | undefined)
 }
 
 /**
- * A sibling profile's row is adopted only when it was minted for the same OAuth
- * client identity this config would use: an explicitly configured client id
- * must match the one embedded in the credential (DCR / discovered clients carry
- * none in the config and are accepted). Own-profile and url-keyed rows are
- * never filtered.
+ * A stored credential's embedded client is authoritative because dynamic client
+ * registration can mint a different client for every profile. Persisted auth
+ * blocks are refresh material, not an owner-declared client restriction.
+ *
+ * When both sides record them, the resource and authorization-server origin
+ * must agree and granted scopes must cover every required scope. Missing legacy
+ * metadata remains compatible.
  */
-function credentialMatchesConfiguredClient(
+function credentialMatchesRequestedIdentity(
 	credentialId: string,
 	credential: MCPStoredOAuthCredential,
-	expectedClientId: string | undefined,
+	{
+		expectedClientId,
+		expectedResource,
+		expectedTokenUrl,
+		requiredScopes,
+	}: {
+		expectedClientId?: string;
+		expectedResource?: string;
+		expectedTokenUrl?: string;
+		requiredScopes?: string;
+	},
 ): boolean {
-	if (!expectedClientId) return true;
-	const scopedProfile = mcpOAuthCredentialProfile(credentialId);
-	if (scopedProfile === undefined || scopedProfile === (getActiveProfile() ?? "default")) return true;
-	return !credential.clientId || credential.clientId === expectedClientId;
+	const reject = (reason: string): false => {
+		logger.debug("Rejected MCP OAuth credential with a different requested identity", {
+			credentialId,
+			reason,
+		});
+		return false;
+	};
+	const storedClientId = credential.clientId?.trim() || undefined;
+	const requestedClientId = expectedClientId?.trim() || undefined;
+	if (storedClientId && requestedClientId && storedClientId !== requestedClientId) {
+		logger.debug("Using MCP OAuth credential's embedded client instead of config refresh material", {
+			credentialId,
+			reason: "credential client id differs from the persisted auth block",
+		});
+	}
+
+	const storedResource = credential.resource?.trim() || undefined;
+	const requestedResource = expectedResource?.trim() || undefined;
+	if (storedResource && requestedResource && storedResource !== requestedResource) {
+		return reject("resource does not match");
+	}
+
+	const storedTokenUrl = credential.tokenUrl?.trim() || undefined;
+	const requestedTokenUrl = expectedTokenUrl?.trim() || undefined;
+	if (storedTokenUrl && requestedTokenUrl) {
+		try {
+			if (new URL(storedTokenUrl).origin !== new URL(requestedTokenUrl).origin) {
+				return reject("token endpoint origin does not match");
+			}
+		} catch {
+			return reject("token endpoint origin cannot be validated");
+		}
+	}
+
+	const grantedScopes = credential.scopes?.trim() || undefined;
+	const requestedScopes = requiredScopes?.trim() || undefined;
+	if (
+		grantedScopes &&
+		requestedScopes &&
+		!requestedScopes.split(/\s+/).every(scope => hasOAuthScope(grantedScopes, scope))
+	) {
+		return reject("granted scopes do not cover the required scopes");
+	}
+	return true;
 }
 
 export function hasMcpAuthorizationHeader(config: MCPServerConfig): boolean {
@@ -70,10 +124,22 @@ export function lookupMcpOAuthCredentialForServer(
 	authStorage: AuthStorage | null | undefined,
 	auth: MCPAuthConfig | undefined,
 	serverUrl: string | undefined,
-	options: { allowUrlKeyedFallback?: boolean; expectedClientId?: string } = {},
+	options: {
+		allowUrlKeyedFallback?: boolean;
+		expectedClientId?: string;
+		expectedResource?: string;
+		expectedTokenUrl?: string;
+		requiredScopes?: string;
+	} = {},
 ): MCPOAuthCredentialLookup | undefined {
 	if (!authStorage) return undefined;
 	if (auth && auth.type !== "oauth") return undefined;
+	const requestedIdentity = {
+		expectedClientId: options.expectedClientId ?? auth?.clientId,
+		expectedResource: options.expectedResource ?? auth?.resource,
+		expectedTokenUrl: options.expectedTokenUrl ?? auth?.tokenUrl,
+		requiredScopes: options.requiredScopes,
+	};
 	const urlKeyedCredentialIds = mcpOAuthCredentialIdsForServerUrl(serverUrl);
 	if (
 		auth?.credentialId &&
@@ -82,7 +148,7 @@ export function lookupMcpOAuthCredentialForServer(
 		const credential = authStorage.get(auth.credentialId);
 		if (
 			credential?.type === "oauth" &&
-			credentialMatchesConfiguredClient(auth.credentialId, credential, options.expectedClientId)
+			credentialMatchesRequestedIdentity(auth.credentialId, credential, requestedIdentity)
 		) {
 			return { credentialId: auth.credentialId, credential };
 		}
@@ -92,7 +158,7 @@ export function lookupMcpOAuthCredentialForServer(
 		const credential = authStorage.get(credentialId);
 		if (
 			credential?.type === "oauth" &&
-			credentialMatchesConfiguredClient(credentialId, credential, options.expectedClientId)
+			credentialMatchesRequestedIdentity(credentialId, credential, requestedIdentity)
 		) {
 			return { credentialId, credential };
 		}
@@ -105,17 +171,21 @@ export function lookupMcpOAuthCredential(
 	config: MCPServerConfig,
 ): MCPOAuthCredentialLookup | undefined {
 	const auth = config.auth;
-	if (config.type !== "http" && config.type !== "sse") {
-		return lookupMcpOAuthCredentialForServer(authStorage, auth, undefined);
-	}
 	const expectedClientId = config.oauth?.clientId?.trim() || auth?.clientId?.trim() || undefined;
+	const expectedResource = auth?.resource?.trim() || undefined;
+	const expectedTokenUrl = auth?.tokenUrl?.trim() || undefined;
+	const requiredScopes = config.oauth?.scope?.trim() || undefined;
+	const requestedIdentity = { expectedClientId, expectedResource, expectedTokenUrl, requiredScopes };
+	if (config.type !== "http" && config.type !== "sse") {
+		return lookupMcpOAuthCredentialForServer(authStorage, auth, undefined, requestedIdentity);
+	}
 	if (hasMcpAuthorizationHeader(config)) {
 		return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, {
 			allowUrlKeyedFallback: false,
-			expectedClientId,
+			...requestedIdentity,
 		});
 	}
-	return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, { expectedClientId });
+	return lookupMcpOAuthCredentialForServer(authStorage, auth, config.url, requestedIdentity);
 }
 
 export function selectMcpOAuthRefreshMaterial(
