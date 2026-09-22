@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Updated default models for anthropic, amazon-bedrock, cloudflare-ai-gateway, kilo, litellm, opencode-zen, vercel-ai-gateway, and zenmux to claude-opus-5-5
+- Updated default model for commandcode to claude-sonnet-5
+
+## [18.2.9] - 2026-09-22
+
+### Fixed
+
+- Local OpenAI-compatible backends—including llama.cpp, LM Studio, vLLM, Ollama, and custom loopback or LAN hosts—now support maxTokens values above 64k without incorrectly applying the hosted OpenAI limit.
+- Fixed Union Alpha requests on OpenCode Go and Zen by using the correct Messages API.
+- Updated SuperGrok’s Grok 4.7 metadata to expose its documented 500K context window and low, medium, high, and xhigh thinking levels.
+- Fixed GPT-OSS tool interactions on Google Antigravity and Gemini CLI so function-call history is preserved correctly.
+- Fixed Devin model discovery for Enterprise credentials by falling back to the legacy Windsurf catalog when native discovery does not return the full model list.
+- Curated Xiaomi Token Plan (China) MiMo V2.6 metadata: context/output limits, reasoning, and image input ([#12841](https://github.com/can1357/oh-my-pi/pull/12841) by [@roboomp](https://github.com/roboomp)).
+
+## [18.2.8] - 2026-09-21
+
+### Added
+
+- Expanded OpenRouter provider support with embedding, reranking, video generation, text-to-speech, and speech-to-text capabilities, including five new speech-to-text models.
+- Added speech-to-text support to the OpenAI provider.
+
+## [18.2.7] - 2026-09-21
+
+### Added
+
+- Added model-kind and grounded-search capability metadata, along with catalogs for local inference and search-engine models.
+- Added OpenRouter image-model discovery and live TypeSafe judge-model discovery.
+- Added the `buildDiscoveredModel` helper for defining custom providers.
+- Added glob-based patterns for identity overrides.
+
+### Changed
+
+- Updated input cost for TypeSafe models to 0.042
+- Improved model routing and thinking-policy handling for llama.cpp Qwen models, Bonsai lineage aliases, and custom provider names.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added

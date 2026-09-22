@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Updated server-side fallback documentation and logic to target claude-opus-5-5
+- Added support for claude-opus-5-5 to model priority registry
+
+## [18.2.9] - 2026-09-22
+
 ### Added
 
 - Added model presets to `/models` for saving, loading, and deleting named routing configurations. Loading is session-only, preserves the automatic-fallback policy, and rolls back routing on a failed switch; later explicit routing edits take effect immediately.
