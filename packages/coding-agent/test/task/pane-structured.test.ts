@@ -9,6 +9,7 @@ import { PANE_RESULT_SENTINEL } from "../../src/task/pane/herdr-backend";
 import { HERDR_OMP_EXTENSION_RELPATH } from "../../src/task/pane/preflight";
 import { runStructuredSubagent, type StructuredSubagentRequest } from "../../src/task/structured-subagent";
 import type { AgentDefinition } from "../../src/task/types";
+import type { Rule } from "../../src/capability/rule";
 import type { ToolSession } from "../../src/tools";
 import { createFakeHerdr, envelope, type FakeHerdr, type FakeHerdrResponse, runningStatus } from "./pane-fake-herdr";
 
@@ -77,7 +78,7 @@ function install(herdr: FakeHerdr): void {
 	process.env.PATH = `${herdr.dir}${path.delimiter}${originalPath ?? ""}`;
 }
 
-function session(): ToolSession {
+function session(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
 		cwd: path.dirname(artifactsDir()),
 		hasUI: false,
@@ -91,7 +92,19 @@ function session(): ToolSession {
 		getSessionFile: () => `${artifactsDir()}.jsonl`,
 		getSessionSpawns: () => "*",
 		getPlanModeState: () => undefined,
+		...overrides,
 	} as unknown as ToolSession;
+}
+
+function rule(name: string, content: string, extra: Partial<Rule> = {}): Rule {
+	return {
+		name,
+		path: `/rules/${name}.md`,
+		content,
+		alwaysApply: true,
+		_source: { provider: "project", providerName: "project", path: `/rules/${name}.md`, level: "project" },
+		...extra,
+	};
 }
 
 function request(overrides: Partial<StructuredSubagentRequest> = {}): StructuredSubagentRequest {
@@ -156,5 +169,61 @@ describe("structured subagent on the pane backend", () => {
 		expect(settled.result.outputPath).toBeUndefined();
 		expect(settled.result.stderr).toContain("still investigating");
 		expect(settled.result.resolvedModelVerified).toBe(false);
+	});
+
+	it("delivers only the parent's agent-scoped always-apply rules in the pane prompt", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [AGENT], projectAgentsDir: null });
+		fake = createFakeHerdr(scenario());
+		install(fake);
+
+		const settled = await runStructuredSubagent(
+			request({
+				session: session({
+					rules: [
+						rule("every-agent", "ALWAYS-RULE: never delete fixtures."),
+						rule("worker-only", "WORKER-RULE: report line counts.", { agents: ["worker"] }),
+						rule("other-agent", "REVIEWER-RULE: only comment.", { agents: ["reviewer"] }),
+						rule("on-request", "REQUESTED-RULE: not always.", {
+							alwaysApply: false,
+							description: "Only when asked",
+						}),
+					],
+				}),
+			}),
+		);
+		expect(settled.result.exitCode).toBe(0);
+
+		const promptCall = fake.calls().find(argv => argv.includes("prompt")) ?? [];
+		const text = promptCall[promptCall.indexOf("prompt") + 2] ?? "";
+		// The child rediscovers unscoped rules from disk itself, so only rules the
+		// parent bucketed for this agent by `agents` scope are delivered; rules for
+		// other agents and rulebook rules stay out.
+		expect(text).toContain("WORKER-RULE: report line counts.");
+		expect(text).not.toContain("ALWAYS-RULE");
+		expect(text).not.toContain("REVIEWER-RULE");
+		expect(text).not.toContain("REQUESTED-RULE");
+		expect(text.indexOf("# Rules")).toBeLessThan(text.indexOf("# Assignment"));
+	});
+
+	it("omits the rules section when no parent rule is scoped to this agent", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [AGENT], projectAgentsDir: null });
+		fake = createFakeHerdr(scenario());
+		install(fake);
+
+		await runStructuredSubagent(
+			request({
+				session: session({
+					rules: [
+						rule("every-agent", "ALWAYS-RULE: never delete fixtures."),
+						rule("other-agent", "REVIEWER-RULE: only comment.", { agents: ["reviewer"] }),
+					],
+				}),
+			}),
+		);
+
+		const promptCall = fake.calls().find(argv => argv.includes("prompt")) ?? [];
+		const text = promptCall[promptCall.indexOf("prompt") + 2] ?? "";
+		expect(text).not.toContain("# Rules");
+		expect(text).toContain("# Assignment");
 	});
 });

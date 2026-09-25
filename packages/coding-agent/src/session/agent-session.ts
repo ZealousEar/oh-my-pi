@@ -279,9 +279,12 @@ import { writeArtifact } from "./artifacts";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
+	ASYNC_NOTICE_MESSAGE_TYPE,
 	ASYNC_PREVIEW_MAX_CHARS,
 	ASYNC_RESULT_MESSAGE_TYPE,
+	type AsyncNoticeEntry,
 	type AsyncResultEntry,
+	buildAsyncNoticeBatchMessage,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
@@ -718,6 +721,8 @@ export class AgentSession {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/** Clears this session's owner notice sink registration (no-progress warnings); set with the delivery sink. */
+	#unregisterAsyncNoticeSink: (() => void) | undefined;
 	/**
 	 * Async-delivery generation, bumped on every session transition that evicts
 	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
@@ -1762,6 +1767,18 @@ export class AgentSession {
 				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
 			});
+			// One-shot no-progress warnings ride the same queue: a non-interrupting
+			// aside at the next step boundary while streaming, an idle-flush turn
+			// otherwise. A notice whose job has since settled is dropped at flush.
+			this.#unregisterAsyncNoticeSink = manager.registerNoticeSink(
+				this.#agentId,
+				(jobId, text, job) => this.#deliverAsyncJobNotice(jobId, text, job),
+				{ noProgressWarnMs: Math.max(0, this.settings.get("async.noProgressWarnMs")) },
+			);
+			this.yieldQueue.register<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || entry.job.status !== "running",
+				build: buildAsyncNoticeBatchMessage,
+			});
 		}
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
@@ -2325,6 +2342,7 @@ export class AgentSession {
 		// prior session's background result cannot inject into the next transcript.
 		this.#asyncDeliveryEpoch += 1;
 		this.yieldQueue.clear("async-result");
+		this.yieldQueue.clear(ASYNC_NOTICE_MESSAGE_TYPE);
 	}
 
 	/**
@@ -2431,6 +2449,21 @@ export class AgentSession {
 			job,
 			durationMs,
 			epoch,
+		});
+	}
+
+	/**
+	 * Notice sink for running jobs owned by this agent (no-progress warning):
+	 * enqueue on the yield queue so delivery is non-interrupting while streaming
+	 * and wakes an idle session the same way an async-result does.
+	 */
+	#deliverAsyncJobNotice(jobId: string, text: string, job: AsyncJob): void {
+		if (this.#isDisposed) return;
+		this.yieldQueue.enqueue<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+			jobId,
+			text,
+			job,
+			epoch: this.#asyncDeliveryEpoch,
 		});
 	}
 
@@ -4721,6 +4754,8 @@ export class AgentSession {
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
+		this.#unregisterAsyncNoticeSink?.();
+		this.#unregisterAsyncNoticeSink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The shutdown reason is reserved for the top-level session that OWNS the
 		// manager — the genuine process/handled-shutdown path — so the task

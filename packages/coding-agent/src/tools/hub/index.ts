@@ -94,6 +94,9 @@ const hubSchema = type({
 	"detached?": type("boolean").describe(
 		"start: survive every omp and broker exit; implies persist and disables PTY input",
 	),
+	"lifetime?": type("number > 0").describe(
+		"start: max total seconds before the broker stops it (finite runs); omit for services",
+	),
 	"lines?": type("number > 0").describe("logs: output lines; default 100, max 1000"),
 	"head?": type("boolean").describe("logs: read from the beginning instead of the tail"),
 	"grep?": type("string > 0").describe("logs: regex filter"),

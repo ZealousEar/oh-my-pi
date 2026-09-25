@@ -8,6 +8,7 @@ import type { JsStatusEvent } from "./js/shared/types";
 import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
 import { getActiveEvalShadowCell } from "./speculation/runtime-context";
+import { firedTimeoutMs } from "./wall-cap";
 
 /**
  * Constructor for a language executor's cancellation error. Each backend
@@ -524,7 +525,10 @@ export async function executeWithKernelBase<
 		if (result.cancelled || abortShield.abortRequested) {
 			const timedOut = result.timedOut || abortShield.timedOut;
 			const annotation = timedOut
-				? formatKernelTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs, result.kernelKilled ?? false)
+				? formatKernelTimeoutAnnotation(
+						firedTimeoutMs(abortSource?.reason, executionTimeoutMs ?? options?.idleTimeoutMs),
+						result.kernelKilled ?? false,
+					)
 				: result.kernelKilled && !abortShield.abortRequested
 					? "Kernel died during execution; completion is uncertain. The cell was not replayed; check for partial side effects before retrying."
 					: undefined;
@@ -583,7 +587,11 @@ export async function executeWithKernelBase<
 		if (isCancellationError(err, cancelledErrorClass) || abortShield.abortRequested || abortShield.signal?.aborted) {
 			const timedOut = abortShield.timedOut || isTimedOutCancellation(err, cancelledErrorClass, abortShield.signal);
 			const dumped = await sink.dump(
-				timedOut ? formatTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs) : undefined,
+				timedOut
+					? formatTimeoutAnnotation(
+							firedTimeoutMs(abortSource?.reason, executionTimeoutMs ?? options?.idleTimeoutMs),
+						)
+					: undefined,
 			);
 			return {
 				exitCode: undefined,

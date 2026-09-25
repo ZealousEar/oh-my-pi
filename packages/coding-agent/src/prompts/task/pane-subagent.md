@@ -2,6 +2,16 @@
 
 {{role}}
 
+{{/if}}{{#if rules.length}}# Rules
+
+These rules from the parent session are scoped to your agent and apply to you exactly as they would to an in-process subagent.
+
+<generic-rules>
+{{#each rules}}
+{{this}}
+{{/each}}
+</generic-rules>
+
 {{/if}}# Assignment
 
 {{assignment}}

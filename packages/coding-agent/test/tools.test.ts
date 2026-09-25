@@ -2630,10 +2630,10 @@ function b() {
 			expect(result.details?.requestedTimeoutSeconds).toBe(7200);
 		});
 
-		it("should disable the command deadline when timeout is zero", async () => {
+		it("should bound a zero timeout by the wall cap instead of disabling the deadline", async () => {
 			vi.spyOn(toolTimeouts, "clampTimeout").mockReturnValue(0.05);
 
-			const result = await bashTool.execute("test-call-timeout-disabled", {
+			const result = await bashTool.execute("test-call-timeout-zero", {
 				command: "printf 'start\\n'; sleep 0.1; printf 'done\\n'",
 				timeout: 0,
 			});
@@ -2641,8 +2641,11 @@ function b() {
 			const output = getTextOutput(result);
 			expect(output).toContain("start");
 			expect(output).toContain("done");
-			expect(result.details?.timeoutDisabled).toBe(true);
-			expect(result.details?.timeoutSeconds).toBeUndefined();
+			// `timeout: 0` skips the per-call clamp (0.05s here would have killed
+			// the command) but the harness wall cap still sets a finite deadline.
+			expect(result.details?.timeoutDisabled).toBeUndefined();
+			expect(result.details?.timeoutSeconds).toBe(3600);
+			expect(result.details?.requestedTimeoutSeconds).toBe(0);
 		});
 
 		it("should respect timeout", async () => {

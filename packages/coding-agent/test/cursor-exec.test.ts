@@ -701,18 +701,19 @@ describe("pi_bash timeout presence", () => {
 		await removeWithRetries(cwd);
 	});
 
-	it("disables the deadline for an explicit zero instead of applying the default", async () => {
-		// `timeout` is `optional int32` and `bash` documents `0` as "disables
-		// the command deadline". Folding a supplied `0` into `undefined` applies
-		// the 300s default, killing the long-running command that asked not to
-		// be killed.
-		const disabled = await handlers.piBash({
+	it("passes an explicit zero through instead of applying the default", async () => {
+		// `timeout` is `optional int32` and `bash` documents `0` as "no per-call
+		// deadline". Folding a supplied `0` into `undefined` applies the 300s
+		// default, killing the long-running command that asked not to be killed.
+		// The harness wall cap (tools.wallCapMs, 3600s by default) still bounds
+		// the call, so the effective deadline is the cap, not the 300s default.
+		const zero = await handlers.piBash({
 			toolCallId: "b1",
 			args: { command: "echo hi", timeout: 0 },
 		} as never);
-		const disabledDetails = disabled.details as { timeoutDisabled?: boolean; timeoutSeconds?: number };
-		expect(disabledDetails.timeoutDisabled).toBe(true);
-		expect(disabledDetails.timeoutSeconds).toBeUndefined();
+		const zeroDetails = zero.details as { requestedTimeoutSeconds?: number; timeoutSeconds?: number };
+		expect(zeroDetails.requestedTimeoutSeconds).toBe(0);
+		expect(zeroDetails.timeoutSeconds).toBe(3600);
 
 		const defaulted = await handlers.piBash({
 			toolCallId: "b2",

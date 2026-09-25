@@ -22,6 +22,13 @@ import { truncateMiddle } from "@oh-my-pi/pi-tui/tools/streaming-output";
  * yield: a result injected after the yield supersedes that yield's payload.
  */
 export const ASYNC_RESULT_MESSAGE_TYPE = "async-result";
+/**
+ * `customType` of an owner-routed notice about a job that is still running
+ * (the one-shot no-progress warning). Rides the same yield queue as
+ * {@link ASYNC_RESULT_MESSAGE_TYPE}: a non-interrupting aside at the next step
+ * boundary while streaming, an agent-initiated turn when idle.
+ */
+export const ASYNC_NOTICE_MESSAGE_TYPE = "async-notice";
 
 /** Result payloads longer than this spill to an artifact with an inline preview. */
 export const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
@@ -40,6 +47,34 @@ export interface AsyncResultEntry {
 	 * the manager's per-id suppression marker.
 	 */
 	epoch: number;
+}
+
+export interface AsyncNoticeEntry {
+	jobId: string;
+	/** Rendered notice text (already wrapped in `<system-notice>`). */
+	text: string;
+	job: AsyncJob;
+	/** See {@link AsyncResultEntry.epoch}. */
+	epoch: number;
+}
+
+export type AsyncNoticeDetails = {
+	jobs: Array<{ jobId: string; type: AsyncJobType; label: string }>;
+};
+
+export function buildAsyncNoticeBatchMessage(entries: AsyncNoticeEntry[]): CustomMessage<AsyncNoticeDetails> | null {
+	if (entries.length === 0) return null;
+	return {
+		role: "custom",
+		customType: ASYNC_NOTICE_MESSAGE_TYPE,
+		content: entries.map(entry => entry.text).join("\n\n"),
+		display: true,
+		attribution: "agent",
+		details: {
+			jobs: entries.map(entry => ({ jobId: entry.jobId, type: entry.job.type, label: entry.job.label })),
+		},
+		timestamp: Date.now(),
+	};
 }
 
 type AsyncResultJobDetails = {

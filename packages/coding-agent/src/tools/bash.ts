@@ -311,7 +311,7 @@ async function saveBashOriginalArtifact(session: ToolSession, originalText: stri
 	}
 }
 
-const BASH_TIMEOUT_DESCRIPTION = `timeout in seconds; 0 disables the command deadline; nonzero values are clamped to ${TOOL_TIMEOUTS.bash.min}-${TOOL_TIMEOUTS.bash.max}`;
+const BASH_TIMEOUT_DESCRIPTION = `timeout in seconds; 0 disables the per-call deadline (the session wall-clock cap still applies); nonzero values are clamped to ${TOOL_TIMEOUTS.bash.min}-${TOOL_TIMEOUTS.bash.max}`;
 
 const bashSchemaBase = type({
 	command: type("string").describe("command to execute"),
@@ -425,6 +425,12 @@ function formatTimeoutClampNotice(
 		? `global tools.maxTimeout ceiling ${maxTimeout}s`
 		: `allowed range ${TOOL_TIMEOUTS.bash.min}-${TOOL_TIMEOUTS.bash.max}s`;
 	return `Timeout clamped to ${effectiveTimeoutSec}s (requested ${requestedTimeoutSec}s; ${limit}).`;
+}
+
+/** Timeout annotation suffix naming `tools.wallCapMs` as the limit that fired. */
+function formatWallCapNotice(wallCapMs: number, requestedTimeoutSec: number | undefined): string {
+	const requested = requestedTimeoutSec === 0 ? "timeout: 0 does not lift it" : `requested ${requestedTimeoutSec}s`;
+	return `Deadline set by wall-clock cap tools.wallCapMs=${wallCapMs} (${wallCapMs / 1000}s), which bounds every bash call; ${requested}.`;
 }
 
 /**
@@ -619,6 +625,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutSec: number | undefined,
 		options: {
 			requestedTimeoutSec?: number;
+			/** Set when `tools.wallCapMs` is what bounds this call; named in the timeout annotation. */
+			wallCapMs?: number;
 			notices?: readonly string[];
 			wallTimeMs?: number;
 			command?: string;
@@ -690,6 +698,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			// has not, so provide the LLM-facing annotation exactly once.
 			if (!normalizeResultOutput(result).startsWith(`[${message}]\n`)) {
 				outputLines.push("", `[${message}]`);
+			}
+			if (options.wallCapMs !== undefined) {
+				outputLines.push(`[${formatWallCapNotice(options.wallCapMs, options.requestedTimeoutSec)}]`);
 			}
 			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), inlineCap);
 			return toolResult(details)
@@ -823,6 +834,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
+		wallCapMs?: number;
 		notices?: readonly string[];
 		identity: string;
 		recoveryRead: boolean;
@@ -869,6 +881,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
+						wallCapMs: options.wallCapMs,
 						notices: options.notices ?? [],
 						wallTimeMs,
 						command: options.command,
@@ -912,6 +925,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 			{
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				timeoutMs: options.timeoutMs,
 				onProgress: async text => {
 					latestText = text;
 					if (!forwardUpdates) return;
@@ -1043,16 +1057,24 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
 
-		// A timeout of 0 is an explicit long-running-command contract: the user
-		// must still cancel the call or job, but OMP does not impose a deadline.
+		// A timeout of 0 asks for no per-call deadline, but the harness wall cap
+		// (`tools.wallCapMs`) still bounds the call: the effective deadline is
+		// min(requested-or-unbounded, wall cap). Explicit timeouts below the cap
+		// are untouched.
 		const requestedTimeoutSec = rawTimeout;
-		const timeoutDisabled = requestedTimeoutSec === 0;
 		const maxTimeout = this.session.settings.get("tools.maxTimeout");
-		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
+		const wallCapSetting = this.session.settings.get("tools.wallCapMs");
+		const wallCapSec = Number.isFinite(wallCapSetting) && wallCapSetting > 0 ? wallCapSetting / 1000 : undefined;
+		const clampedTimeoutSec =
+			requestedTimeoutSec === 0 ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
+		const wallCapped =
+			wallCapSec !== undefined && (clampedTimeoutSec === undefined || clampedTimeoutSec > wallCapSec);
+		const timeoutSec = wallCapped ? wallCapSec : clampedTimeoutSec;
 		const timeoutMs = timeoutSec === undefined ? undefined : timeoutSec * 1000;
+		const wallCapMs = wallCapped ? wallCapSetting : undefined;
 		const pendingNotices: string[] = [];
-		if (timeoutSec !== undefined) {
-			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec, maxTimeout);
+		if (clampedTimeoutSec !== undefined) {
+			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, clampedTimeoutSec, maxTimeout);
 			if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
 		}
 
@@ -1066,6 +1088,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
+				wallCapMs,
 				notices: pendingNotices,
 				identity: toolCallId,
 				recoveryRead,
@@ -1106,6 +1129,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
+				wallCapMs,
 				notices: pendingNotices,
 				identity: toolCallId,
 				recoveryRead,
@@ -1276,6 +1300,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					};
 					return this.#buildCompletedResult(timedOutResult, timeoutSec, {
 						requestedTimeoutSec,
+						wallCapMs,
 						notices: pendingNotices,
 						wallTimeMs: performance.now() - bridgeWallTimeStart,
 					});
@@ -1351,6 +1376,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						};
 						return this.#buildCompletedResult(timedOutResult, timeoutSec, {
 							requestedTimeoutSec,
+							wallCapMs,
 							notices: pendingNotices,
 							wallTimeMs: performance.now() - bridgeWallTimeStart,
 						});
@@ -1419,6 +1445,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
+					wallCapMs,
 					notices: bridgeNotices,
 					wallTimeMs: performance.now() - bridgeWallTimeStart,
 					command,
@@ -1509,6 +1536,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,
+			wallCapMs,
 			notices: pendingNotices,
 			wallTimeMs,
 			command,

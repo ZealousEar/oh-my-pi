@@ -8,8 +8,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { $env, getAgentDir, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { bucketRules } from "../capability/rule-buckets";
 import { normalizeModelPatternList, resolveAgentModelSelection } from "../config/model-resolver";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
+import { TtsrManager } from "../export/ttsr";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { Skill } from "../extensibility/skills";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -715,6 +717,18 @@ async function runPaneBackendIfRequested(args: {
 		request.effort !== undefined
 			? resolveTaskEffortLevel(undefined, request.effort, request.session.settings.get("task.maxEffort"))
 			: effectiveAgent.thinkingLevel;
+	// A pane child is a fresh top-level omp process: it re-discovers unscoped
+	// rules from disk itself, but as `main`, so the parent's rules scoped to
+	// this agent never reach it. Bucket the parent's discovery result exactly
+	// as an in-process child would (same disable/builtin/TTSR precedence) and
+	// ship only the agent-scoped always-apply bodies, so nothing is duplicated.
+	const ttsrSettings = request.session.settings.getGroup("ttsr");
+	const { alwaysApplyRules } = bucketRules(options.rules ?? [], new TtsrManager(ttsrSettings), {
+		builtinRules: ttsrSettings.builtinRules,
+		disabledRules: ttsrSettings.disabledRules,
+		agentName: policy.agent.name.trim().toLowerCase(),
+	});
+	const scopedRules = alwaysApplyRules.filter(rule => rule.agents !== undefined && rule.agents.length > 0);
 	const outcome = await runPaneSubagent({
 		cli: preflight.cli,
 		target: preflight.target,
@@ -724,6 +738,7 @@ async function runPaneBackendIfRequested(args: {
 		agentName: policy.agent.name,
 		agentSource: policy.agent.source,
 		systemPrompt: effectiveAgent.systemPrompt,
+		...(scopedRules.length > 0 ? { rules: scopedRules.map(rule => rule.content) } : {}),
 		task: options.task,
 		assignment: options.assignment ?? request.assignment.trim(),
 		...(options.description ? { description: options.description } : {}),

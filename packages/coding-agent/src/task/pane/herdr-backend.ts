@@ -67,6 +67,8 @@ export interface PaneSubagentOptions {
 	agentSource: AgentSource;
 	/** The resolved agent system prompt, delivered as the prompt's role section. */
 	systemPrompt?: string;
+	/** Parent-session always-apply rule bodies scoped to this agent (unscoped ones the child rediscovers itself), delivered as the prompt's rules section. */
+	rules?: string[];
 	/** Rendered subagent user prompt, retained verbatim on the result. */
 	task: string;
 	assignment: string;
@@ -440,6 +442,7 @@ class PaneRun {
 		const { promptTimeoutMs } = this.#options;
 		const text = prompt.render(paneSubagentPrompt, {
 			role: this.#options.systemPrompt?.trim(),
+			rules: this.#options.rules ?? [],
 			assignment: this.#options.assignment,
 			outputPath: this.#outputPath,
 			paneId: this.#paneId,

@@ -220,6 +220,8 @@ export interface DaemonSpec {
 	restart: DaemonRestartPolicy;
 	persist: boolean;
 	detached: boolean;
+	/** Total wall-clock lifetime across restarts; the broker stops the daemon when it elapses. Absent = unbounded service. */
+	lifetimeMs?: number;
 }
 
 /** Serializable daemon state visible to every client in one broker scope. */
@@ -242,6 +244,8 @@ export interface DaemonSnapshot {
 	readyPending?: ("log" | "port")[];
 	persist: boolean;
 	detached: boolean;
+	/** Absolute epoch-ms deadline fixed at first launch when the spec carries `lifetimeMs`; restarts do not move it. */
+	deadlineAt?: number;
 }
 /** Serializable peer message retained in hub result snapshots. */
 export interface IrcMessage {
@@ -282,6 +286,7 @@ export interface LaunchParams {
 	restart?: "no" | "on-failure" | "always";
 	persist?: boolean;
 	detached?: boolean;
+	lifetime?: number;
 	lines?: number;
 	head?: boolean;
 	grep?: string;
@@ -756,6 +761,10 @@ function daemonMeta(daemon: DaemonSnapshot, theme: Theme): string[] {
 	}
 	const lifespan = formatDuration((daemon.exitedAt ?? Date.now()) - daemon.startedAt);
 	meta.push(daemon.exitedAt === undefined ? `up ${lifespan}` : `ran ${lifespan}`);
+	if (daemon.exitedAt === undefined && daemon.deadlineAt !== undefined) {
+		meta.push(`lifetime left ${formatDuration(Math.max(0, daemon.deadlineAt - Date.now()))}`);
+	}
+	if (daemon.state === "exited" && daemon.exitReason) meta.push(theme.fg("warning", replaceTabs(daemon.exitReason)));
 	if (daemon.restartCount > 0) meta.push(`restarts ${daemon.restartCount}`);
 	if (daemon.detached) meta.push("detached");
 	else if (daemon.persist) meta.push("persistent");

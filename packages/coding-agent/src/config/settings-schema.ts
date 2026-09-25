@@ -5064,6 +5064,21 @@ export const SETTINGS_SCHEMA = {
 		default: 100,
 	},
 
+	// Bounded runs: one owner-visible warning when a running async job (bash, eval, task)
+	// produces no progress for this long. 0 disables. Warns once per job.
+	"async.noProgressWarnMs": {
+		type: "number",
+		default: 60_000,
+	},
+
+	// Bounded runs: absolute wall-clock cap for one eval or bash call, including time an eval
+	// cell spends paused on agent()/completion() waits and bash calls with `timeout: 0`.
+	// Unlike the per-tool `timeout`, it is never paused or disabled per call. 0 disables.
+	"tools.wallCapMs": {
+		type: "number",
+		default: 3_600_000,
+	},
+
 	"irc.timeoutMs": {
 		type: "number",
 		default: 120_000,

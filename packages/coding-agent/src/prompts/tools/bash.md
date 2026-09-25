@@ -22,5 +22,5 @@ Use ONLY for one binary or a short pipeline that computes a fact (`wc -l`, `sort
 </critical>
 
 {{#if autoBackgroundEnabled}}Long foreground calls may auto-background by the configured threshold and deliver later.
-`timeout: 0` disables the job deadline; otherwise `timeout` sets it without extending foreground waiting.{{/if}}
+`timeout: 0` disables the per-call deadline (the session wall-clock cap still applies); otherwise `timeout` sets it without extending foreground waiting.{{/if}}
 No truncation footer means the displayed output is complete.

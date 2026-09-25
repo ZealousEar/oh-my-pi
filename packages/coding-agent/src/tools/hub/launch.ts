@@ -135,6 +135,7 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	}
 	if (ready && !ready.log && ready.port === undefined) throw new ToolError("ready requires log or port");
+	if (params.lifetime !== undefined && !(params.lifetime > 0)) throw new ToolError("lifetime must be > 0 seconds");
 	return {
 		name,
 		application: params.application,
@@ -153,6 +154,7 @@ function commandSpec(params: LaunchParams, session: ToolSession): DaemonSpec {
 		restart: params.restart ?? "no",
 		persist: (params.persist ?? false) || detached,
 		detached,
+		...(params.lifetime === undefined ? {} : { lifetimeMs: Math.round(params.lifetime * 1_000) }),
 	};
 }
 
@@ -213,9 +215,14 @@ function operationFor(params: LaunchParams, session: ToolSession): DaemonOperati
 function daemonLabel(daemon: DaemonSnapshot): string {
 	const pid = daemon.pid === undefined ? "" : ` pid=${daemon.pid}`;
 	const exit = daemon.exitCode === undefined ? "" : ` exit=${daemon.exitCode}`;
+	const lifetime =
+		daemon.exitedAt === undefined && daemon.deadlineAt !== undefined
+			? ` lifetime-left=${formatDuration(Math.max(0, daemon.deadlineAt - Date.now()))}`
+			: "";
+	const reason = daemon.state === "exited" && daemon.exitReason ? ` (${daemon.exitReason})` : "";
 	return `${daemon.name}: ${daemon.state}${pid}${exit} uptime=${formatDuration(
 		(daemon.exitedAt ?? Date.now()) - daemon.startedAt,
-	)} restarts=${daemon.restartCount}${daemon.detached ? " detached" : daemon.persist ? " persistent" : ""}`;
+	)}${lifetime} restarts=${daemon.restartCount}${daemon.detached ? " detached" : daemon.persist ? " persistent" : ""}${reason}`;
 }
 
 function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
@@ -266,7 +273,7 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 				daemonLabel(result.daemon),
 				`Command: ${[result.spec.application, ...result.spec.args].join(" ")}`,
 				`Cwd: ${shortenPath(result.spec.cwd)}`,
-				`PTY: ${result.spec.pty}; restart=${result.spec.restart}; persist=${result.spec.persist}; detached=${result.spec.detached}`,
+				`PTY: ${result.spec.pty}; restart=${result.spec.restart}; persist=${result.spec.persist}; detached=${result.spec.detached}${result.spec.lifetimeMs === undefined ? "" : `; lifetime=${formatDuration(result.spec.lifetimeMs)}`}`,
 			].join("\n");
 	}
 }

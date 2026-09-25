@@ -62,4 +62,4 @@ Prior top-level names survive into the next cell — reuse; NEVER re-import/re-d
 </critical>
 
 {{#if autoBackgroundEnabled}}Long-running cells may auto-background by the configured threshold and deliver later; the kernel stays busy until the cell finishes.
-`timeout: 0` disables the cell deadline; otherwise `timeout` sets it without extending foreground waiting.{{/if}}
+`timeout: 0` disables the cell deadline (the session wall-clock cap still applies); otherwise `timeout` sets it without extending foreground waiting.{{/if}}

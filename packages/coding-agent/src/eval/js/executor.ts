@@ -2,6 +2,7 @@ import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
+import { firedTimeoutMs } from "../wall-cap";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
 import type { JsStatusEvent } from "./shared/types";
 
@@ -143,7 +144,11 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		if (signal?.aborted || isAbortError(error)) {
 			const timedOut = Boolean(timeoutSignal?.aborted) || isTimeoutReason(options.signal?.reason);
 			if (timedOut) {
-				outputSink.push(formatJsTimeoutAnnotation(legacyTimeoutMs ?? options.idleTimeoutMs));
+				outputSink.push(
+					formatJsTimeoutAnnotation(
+						firedTimeoutMs(options.signal?.reason, legacyTimeoutMs ?? options.idleTimeoutMs),
+					),
+				);
 			}
 			const summary = await outputSink.dump();
 			return {
