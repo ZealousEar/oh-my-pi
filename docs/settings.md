@@ -692,6 +692,7 @@ compaction:
   methodOrder: [remote, snapcompact, handoff, shake, soft]
   midTurnEnabled: true # check thresholds between tool-loop provider requests
   thresholdPercent: -1 # -1 = default reserve-based behavior
+  thresholdMinContextWindow: -1 # percent applies only to windows >= this; -1 = all
   thresholdTokens: -1 # fixed token limit when > 0
 memory:
   backend: off # off, local, hindsight, mnemopi
@@ -706,6 +707,7 @@ memory:
 | `compaction.midTurnEnabled`   | boolean | `true`                                   | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request.                                                                                                                                                  |
 | `compaction.methodOrder`      | array   | `remote, snapcompact, handoff, shake, soft` | Ordered fallbacks. `remote` uses provider-native server compaction (OpenAI Responses compact, Anthropic compaction beta); unavailable or failed methods advance. |
 | `compaction.thresholdPercent` | number  | `-1`                                     | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
+| `compaction.thresholdMinContextWindow` | number | `-1` | Smallest context window `thresholdPercent` applies to; smaller windows use the reserve-based default. `-1` = every window. |
 | `compaction.thresholdTokens`  | number  | `-1`                                     | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
 | `task.agentCompactionThresholdOverrides` | record | `{}` | Exact-name task/eval agent → compaction trigger: a positive token count (`90000`) or a percentage string (`"80%"`). See below. |
 | `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |

@@ -129,6 +129,25 @@ export const cfgCompactionThresholdPercent = register({
 	},
 });
 
+export const cfgCompactionThresholdMinContextWindow = register({
+	id: "compaction.thresholdMinContextWindow",
+	type: "number",
+	default: -1,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Compaction Threshold Min Window",
+		description:
+			"Smallest context window the percent threshold applies to; smaller windows use the legacy reserve-based threshold",
+		options: [
+			{ value: "-1", label: "All windows", description: "Apply the percent threshold to every model" },
+			{ value: "256000", label: "256K+", description: "Only models with a 256K or larger window" },
+			{ value: "512000", label: "512K+", description: "Only models with a 512K or larger window" },
+			{ value: "1000000", label: "1M+", description: "Only models with a 1M or larger window" },
+		],
+	},
+});
+
 export const cfgCompactionThresholdTokens = register({
 	id: "compaction.thresholdTokens",
 	type: "number",
@@ -330,6 +349,7 @@ export const cfgCompaction = combine({
 	experimentalContextManagement: cfgCompactionExperimentalContextManagement,
 	methodOrder: cfgCompactionMethodOrder,
 	thresholdPercent: cfgCompactionThresholdPercent,
+	thresholdMinContextWindow: cfgCompactionThresholdMinContextWindow,
 	thresholdTokens: cfgCompactionThresholdTokens,
 	reserveTokens: cfgCompactionReserveTokens,
 	keepRecentTokens: cfgCompactionKeepRecentTokens,

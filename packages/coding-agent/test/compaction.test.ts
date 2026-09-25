@@ -309,6 +309,23 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(90_001, 100_000, settings)).toBe(true);
 	});
 
+	it("applies threshold percent only at or above thresholdMinContextWindow", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			thresholdPercent: 45,
+			thresholdMinContextWindow: 512_000,
+			keepRecentTokens: 20_000,
+		};
+
+		expect(resolveThresholdTokens(1_000_000, settings)).toBe(450_000);
+		expect(resolveThresholdTokens(512_000, settings)).toBe(230_400);
+		// Below the gate: reserve-based default, window - max(15%, 16384).
+		expect(resolveThresholdTokens(511_999, settings)).toBe(435_200);
+		expect(resolveThresholdTokens(200_000, settings)).toBe(170_000);
+		// A fixed token threshold is not gated.
+		expect(resolveThresholdTokens(200_000, { ...settings, thresholdTokens: 100_000 })).toBe(100_000);
+	});
+
 	it("should use legacy reserve behavior when threshold is set to default sentinel", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
