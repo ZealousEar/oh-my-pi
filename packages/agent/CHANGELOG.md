@@ -2,10 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed tool calls that put their payload in the intent field `i` (for example a file body in `write`) silently running with the leftover arguments; they now fail with an error telling the model to retry ([#13140](https://github.com/can1357/oh-my-pi/issues/13140), [#13141](https://github.com/can1357/oh-my-pi/pull/13141) by [@radkawar](https://github.com/radkawar))
+
+## [18.3.1] - 2026-09-25
+
 ### Added
 
-- Added passive tool-call context: `beforeToolCall` can return `additionalContext`, and tools can report context through `ToolCallContext.addAdditionalContext`; it is sent as a developer message after the batch's tool results ([#11998](https://github.com/can1357/oh-my-pi/pull/11998) by [@H4vC](https://github.com/H4vC))
-- Added `fitOutputTokensToContextWindow` to lower a request's output cap so prompt plus output fits the model's context window ([#13137](https://github.com/can1357/oh-my-pi/pull/13137) by [@radkawar](https://github.com/radkawar)).
+- Added live steering support for Codex WebSocket transports, allowing users to provide input while a response is in progress.
+- Added passive tool-call context support, allowing hooks and tools to supply additional context for subsequent model processing.
+- Improved context-window handling by automatically adjusting output-token limits and supporting models that truncate output at the context-window limit.
+
+### Changed
+
+- Improved prompt token counting for requests with anchored prefixes by using provider-reported usage and limiting local estimation to new message content.
 
 ## [18.3.0] - 2026-09-24
 

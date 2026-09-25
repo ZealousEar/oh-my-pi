@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
+## [18.3.1] - 2026-09-25
+
 ### Fixed
 
-- Fixed dated log paths using the UTC day instead of the local day the rotating sink names its files with ([#13042](https://github.com/can1357/oh-my-pi/pull/13042) by [@jchanghong023](https://github.com/jchanghong023)).
+- Fixed log rotation near local-day boundaries so dated log files are consistently assigned to the correct local date.
 
 ## [18.2.7] - 2026-09-21
 

@@ -2,20 +2,29 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- Fixed blockquote dimmed styling resetting to full terminal contrast after inline code spans ([#13016](https://github.com/can1357/oh-my-pi/pull/13016) by [@harshaygadekar](https://github.com/harshaygadekar)).
-- Fixed `write xd://<tool>` calls to active top-level tools (extension or MCP tools) rendering the generic card instead of the tool's own call/result renderer ([#12951](https://github.com/can1357/oh-my-pi/pull/12951) by [@kouhe3](https://github.com/kouhe3)).
-- Fixed clicking a file path on a pending Read or Write card opening a guessed browser URL; pending paths now link to the local file, including `~`, archive and database targets ([#12879](https://github.com/can1357/oh-my-pi/pull/12879) by [@wn-mitch](https://github.com/wn-mitch)).
+## [18.3.1] - 2026-09-25
 
 ### Breaking Changes
 
-- Replaced `CustomEditor`'s `onSpaceHoldStart`, `onSpaceHoldEnd` and `sttHoldEnabled` with `spaceHold.handler` ([#12963](https://github.com/can1357/oh-my-pi/pull/12963) by [@HACKE-RC](https://github.com/HACKE-RC)).
-- Removed `Editor.cursorOverrideWidth`; the width of a `cursorOverride` glyph is always measured ([#12963](https://github.com/can1357/oh-my-pi/pull/12963) by [@HACKE-RC](https://github.com/HACKE-RC)).
+- Replaced the `CustomEditor` space-hold callbacks and `sttHoldEnabled` option with the `spaceHold.handler` API.
+- Removed `Editor.cursorOverrideWidth`; widths for `cursorOverride` glyphs are now measured automatically.
 
 ### Added
 
-- `Input` supports hold-Space push-to-talk, live dictation text, and `cursorOverride` ([#12963](https://github.com/can1357/oh-my-pi/pull/12963) by [@HACKE-RC](https://github.com/HACKE-RC)).
+- Added push-to-talk dictation to `Input`, with live transcription and `cursorOverride` support.
+- Added visual indicators for live-steered user messages and paginated content in read-tool results.
+- Added transcript support for `cfg://` configuration read and write tool calls.
+- Added an Anthropic slow-mode badge to the status-line model segment, showing the priority state, end time, and remaining request percentage when available.
+
+### Changed
+
+- Updated the settings selector so clearing an input field fully unsets the corresponding setting.
+
+### Fixed
+
+- Fixed dimmed blockquote styling after inline code spans.
+- Fixed rendering of tool calls and results for top-level extension and MCP tools invoked through `xd://` links.
+- Fixed file links in pending Read and Write cards so they open the correct local targets, including paths in the home directory, archives, and databases.
 
 ## [18.3.0] - 2026-09-24
 

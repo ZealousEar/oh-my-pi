@@ -2,10 +2,17 @@
 
 ## [Unreleased]
 
+## [18.3.1] - 2026-09-25
+
+### Added
+
+- Added support for asynchronous file I/O and custom filesystem providers in native shell execution, including resolving arbitrary `scheme://` paths through native operation options.
+
 ### Fixed
 
-- Fixed `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`, and `/dev/tty` in the bash tool reaching omp's own descriptors instead of the command's; `cat /dev/stdin <<'EOF'` no longer hangs the TUI ([#13121](https://github.com/can1357/oh-my-pi/pull/13121) by [@radkawar](https://github.com/radkawar))
-- Fixed task-backed native operations (grep, glob, ast, shell, vcs, …) ignoring an `AbortSignal` that was already aborted when the call started ([#13039](https://github.com/can1357/oh-my-pi/pull/13039) by [@HeyItsGilbert](https://github.com/HeyItsGilbert)).
+- Fixed shell access to standard and special file descriptors, including `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`, and `/dev/tty`, preventing heredoc commands from hanging the TUI.
+- Fixed native operations such as grep, glob, AST, shell, and VCS calls to promptly honor an `AbortSignal` that was already aborted when the operation starts.
+- Fixed Windows path formatting in the shell’s `fd` and `find` builtins so POSIX path patterns match correctly.
 
 ## [18.3.0] - 2026-09-24
 
