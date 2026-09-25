@@ -20,10 +20,13 @@ Subagents, eval `agent()`/workpool items, hub processes, Herdr panes, bash/eval 
 - Every unit MUST have a deadline you state before launch. Uncalibrated: 300 s. Repeated comparable items: `max(60 s, 3 × canary duration)`, capped by the batch's remaining deadline. `timeout: 0` / unbounded waits only for declared long-lived services.
 - New launch path or configuration → run ONE canary first. Check exit status AND the required result shape (the actual answer, not a last line or spinner) before fan-out.
 - Capture stdout, stderr, exit status and duration per unit to a retained file/variable on the FIRST pass. A parsing or inspection mistake → re-read the captured output; NEVER re-execute to see it.
+- Route by kind. Finite work (scripts, benchmarks, CLI runs, test commands) MUST go through `bash` with `async: true`, or `task`/workpool for agent work; those paths carry the no-progress notice and the wall cap. NEVER launch finite work through `hub start`, except as below.
+- `hub start` is for services only (dev servers, watchers, REPLs). Finite work that genuinely needs hub (e.g. it needs `hub send` input) MUST set `lifetime`.
+- Pane subagents MUST run in the background, never blocking.
 
 ## While running
 
-- NEVER block the foreground (an eval cell, a bash call, a `hub wait`) on children for more than 120 s. Launch via `bash async`, `hub start`, `task`/workpool, or a background process writing to a file; keep the deadline.
+- NEVER block the foreground (an eval cell, a bash call, a `hub wait`) on children for more than 120 s. Launch via `bash async`, `task`/workpool, or a background process writing to a file; keep the deadline.
 - A child that is slower than its canary by 3× or silent for 60 s → read its captured stderr/log tail ONCE before waiting further. A child printing a waiting-on-input or startup-phase diagnostic is stuck: stop it now.
 - Independent items MUST run concurrently within the provider/resource limit (unknown limit: start at 2, raise after successes). NEVER loop sequentially over independent slow items.
 - Background waits that expire do not stop the child. On deadline, stop it explicitly (`hub stop`, `cancel`, kill the process group) and keep its partial output.
