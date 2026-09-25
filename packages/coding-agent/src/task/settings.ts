@@ -295,6 +295,78 @@ export const cfgTaskMaxRuntimeMs = register({
 	},
 });
 
+// Pane execution backend (HerdR)
+export const cfgTaskPaneBackend = register({
+	id: "task.paneBackend",
+	type: "enum",
+	values: ["auto", "native", "herdr"] as const,
+	default: "native",
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Task Execution Backend",
+		description:
+			"Where task subagents run. 'native' keeps every subagent in-process (no visible terminal). 'herdr' runs each subagent as a visible HerdR pane agent and fails loudly when the prerequisites are missing. 'auto' uses a pane only when omp itself is running inside a HerdR pane and preflight passes, otherwise native. Per-spawn `visible: true` requests a pane regardless. OMP_TASK_HERDR=0 disables panes outright; =1 enables the auto path.",
+		options: [
+			{ value: "native", label: "Native (in-process)", description: "Default" },
+			{ value: "auto", label: "Auto (pane when inside HerdR)" },
+			{ value: "herdr", label: "HerdR pane" },
+		],
+	},
+});
+
+export const cfgTaskHerdrSession = register({
+	id: "task.herdr.session",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "HerdR Task Session",
+		description:
+			"Dedicated named HerdR session that hosts pane subagents, e.g. 'omp-tasks'. Each spawn gets its own workspace there, which keeps task panes out of the session you drive by hand; 'default' is rejected for that reason. Leave empty to create sibling panes in the pane omp itself is running in.",
+	},
+});
+
+export const cfgTaskHerdrReadyTimeoutMs = register({
+	id: "task.herdr.readyTimeoutMs",
+	type: "number",
+	default: 30_000,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "HerdR Pane Ready Timeout",
+		description:
+			"How long `herdr agent start` may take to detect the child omp in its pane and consider it ready for input. On timeout the spawn fails and the pane is retained so you can see what the child is stuck on.",
+	},
+});
+
+export const cfgTaskHerdrPromptTimeoutMs = register({
+	id: "task.herdr.promptTimeoutMs",
+	type: "number",
+	default: 600_000,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "HerdR Pane Prompt Timeout",
+		description:
+			"How long a pane subagent may work on its prompt before HerdR stops waiting for a settled idle/blocked state.",
+	},
+});
+
+export const cfgTaskHerdrKeepPane = register({
+	id: "task.herdr.keepPane",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Keep HerdR Panes",
+		description:
+			"Leave each pane subagent's pane (and workspace) open after it finishes, instead of closing the pane this spawn created. Panes are always retained when the child is blocked or never became ready.",
+	},
+});
+
 export const cfgTaskAgentIdleTtlMs = register({
 	id: "task.agentIdleTtlMs",
 	type: "number",

@@ -3,6 +3,7 @@
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
 import { register } from "../../config/registry";
+import { EMPTY_AUTOMATION_PERMISSION_GRANTS } from "../settings";
 
 export const cfgBrowserEnabled = register({
 	id: "browser.enabled",
@@ -111,6 +112,32 @@ export const cfgBrowserIdleCloseSec = register({
 	},
 });
 
+export const cfgBrowserPermissionsGrants = register({
+	id: "browser.permissions.grants",
+	type: "array",
+	default: EMPTY_AUTOMATION_PERMISSION_GRANTS,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Browser Permission Grants",
+		description:
+			'Pre-authorized browser capabilities. Ordinary mutations use exact origin/action targets with no wildcards. Raw actions are never site-confined and require rawAccess:"broad" for the whole browser identity or an exact codeFingerprints entry; actions:"*" never covers raw. Optional ttlMinutes expires a grant within this session.',
+	},
+});
+
+export const cfgBrowserTabsAbandonedIdleHours = register({
+	id: "browser.tabs.abandonedIdleHours",
+	type: "number",
+	default: 6,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Abandoned Browser Tab Timeout",
+		description:
+			"Close OMP-created browser tabs idle this many hours unless protected (in-flight run, persist, login/unsaved input, download, foreground tab, other live owner). Set 0 to disable.",
+	},
+});
+
 export const cfgBrowserScreenshotDir = register({
 	id: "browser.screenshotDir",
 	type: "string",
@@ -121,5 +148,56 @@ export const cfgBrowserScreenshotDir = register({
 		label: "Screenshot Directory",
 		description:
 			"Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
+	},
+});
+
+// browser.task (bounded goal loop)
+export const cfgBrowserTaskMaxActions = register({
+	id: "browser.task.maxActions",
+	type: "number",
+	default: 25,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Browser Task Action Bound",
+		description: "Maximum page actions one browser.task run may execute before it stops with status exhausted.",
+	},
+});
+
+export const cfgBrowserTaskMaxCalls = register({
+	id: "browser.task.maxCalls",
+	type: "number",
+	default: 60,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Browser Task Call Bound",
+		description:
+			"Maximum judgment requests one browser.task run may make, including the completion check and failed calls.",
+	},
+});
+
+export const cfgBrowserTaskDeadlineSec = register({
+	id: "browser.task.deadlineSec",
+	type: "number",
+	default: 120,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Browser Task Deadline",
+		description: "Wall-clock budget in seconds for one browser.task run when the call supplies no explicit timeout.",
+	},
+});
+
+export const cfgBrowserTaskAllowConsequential = register({
+	id: "browser.task.allowConsequential",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tools",
+		group: "Grep & Browser",
+		label: "Browser Task Consequential Actions",
+		description:
+			"Allow browser.task to click submit/buy/pay/checkout/send/delete/confirm/transfer/sign controls without a per-call allowConsequential flag.",
 	},
 });

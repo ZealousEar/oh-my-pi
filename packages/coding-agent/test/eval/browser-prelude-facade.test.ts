@@ -7,6 +7,7 @@ import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/prelu
 import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import { grantBrowserFixtureScope } from "../tools/browser-scope";
 import { chromiumAvailable } from "../tools/chromium-probe";
 
 interface FacadeResponse {
@@ -58,7 +59,8 @@ function responseFor(parameters: unknown): FacadeResponse {
 }
 
 function makeSession(getPreludes?: () => readonly EvalPreludeDefinition[]): ToolSession {
-	return {
+	// Fixture scope: the facade E2E drives clicks/types/raw runs; the gate is covered in lifecycle tests.
+	return grantBrowserFixtureScope({
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionFile: () => null,
@@ -70,7 +72,7 @@ function makeSession(getPreludes?: () => readonly EvalPreludeDefinition[]): Tool
 			"browser.cmux": false,
 		}),
 		...(getPreludes === undefined ? {} : { getEvalPreludes: getPreludes }),
-	};
+	});
 }
 
 function recorderDefinition(session: ToolSession, calls: unknown[]): EvalPreludeDefinition {

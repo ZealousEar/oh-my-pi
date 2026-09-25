@@ -50,7 +50,6 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
-	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AnthropicFallbackCreditHandle,
@@ -287,9 +286,12 @@ import { writeArtifact } from "./artifacts";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
+	ASYNC_NOTICE_MESSAGE_TYPE,
 	ASYNC_PREVIEW_MAX_CHARS,
 	ASYNC_RESULT_MESSAGE_TYPE,
+	type AsyncNoticeEntry,
 	type AsyncResultEntry,
+	buildAsyncNoticeBatchMessage,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
@@ -393,6 +395,7 @@ import {
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
+	type ShakeOptions,
 } from "./session-maintenance";
 import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -463,6 +466,7 @@ import {
 } from "./context-settings";
 import { cfgTitleRefreshOnReplan } from "../goals/settings";
 import {
+	cfgAsyncNoProgressWarnMs,
 	cfgComputerEnabled,
 	cfgDevAutoqa,
 	cfgDevAutoqaConsent,
@@ -802,6 +806,8 @@ export class AgentSession implements SettingsScope {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/** Clears this session's owner notice sink registration (no-progress warnings); set with the delivery sink. */
+	#unregisterAsyncNoticeSink: (() => void) | undefined;
 	/**
 	 * Async-delivery generation, bumped on every session transition that evicts
 	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
@@ -1732,7 +1738,9 @@ export class AgentSession implements SettingsScope {
 		// processes) queue here for the same boundary; peeking them lets a
 		// `wait` return early rather than miss a queued completion.
 		this.agent.hasBackgroundCompletions = () =>
-			this.yieldQueue.has(LAUNCH_COMPLETION_MESSAGE_TYPE) || this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE);
+			this.yieldQueue.has(LAUNCH_COMPLETION_MESSAGE_TYPE) ||
+			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE) ||
+			this.yieldQueue.has(ASYNC_NOTICE_MESSAGE_TYPE);
 		this.agent.setAsideMessageProvider(() => {
 			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
 			thunks.push(...this.yieldQueue.drainLazy());
@@ -1874,6 +1882,18 @@ export class AgentSession implements SettingsScope {
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
 				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
+			});
+			// One-shot no-progress warnings ride the same queue: a non-interrupting
+			// aside at the next step boundary while streaming, an idle-flush turn
+			// otherwise. A notice whose job has since settled is dropped at flush.
+			this.#unregisterAsyncNoticeSink = manager.registerNoticeSink(
+				this.#agentId,
+				(jobId, text, job) => this.#deliverAsyncJobNotice(jobId, text, job),
+				{ noProgressWarnMs: Math.max(0, cfgAsyncNoProgressWarnMs.get(this.settings)) },
+			);
+			this.yieldQueue.register<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || entry.job.status !== "running",
+				build: buildAsyncNoticeBatchMessage,
 			});
 		}
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
@@ -2570,6 +2590,7 @@ export class AgentSession implements SettingsScope {
 		// prior session's background result cannot inject into the next transcript.
 		this.#asyncDeliveryEpoch += 1;
 		this.yieldQueue.clear("async-result");
+		this.yieldQueue.clear(ASYNC_NOTICE_MESSAGE_TYPE);
 	}
 
 	/**
@@ -2595,7 +2616,8 @@ export class AgentSession implements SettingsScope {
 			// longer reports it. Without this leg a terminal yield in the
 			// (idle-flush delay / step-boundary) handoff window would read as
 			// quiescent and the run driver would drop the queued result.
-			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE)
+			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE) ||
+			this.yieldQueue.has(ASYNC_NOTICE_MESSAGE_TYPE)
 		);
 	}
 
@@ -2676,6 +2698,21 @@ export class AgentSession implements SettingsScope {
 			job,
 			durationMs,
 			epoch,
+		});
+	}
+
+	/**
+	 * Notice sink for running jobs owned by this agent (no-progress warning):
+	 * enqueue on the yield queue so delivery is non-interrupting while streaming
+	 * and wakes an idle session the same way an async-result does.
+	 */
+	#deliverAsyncJobNotice(jobId: string, text: string, job: AsyncJob): void {
+		if (this.#isDisposed) return;
+		this.yieldQueue.enqueue<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+			jobId,
+			text,
+			job,
+			epoch: this.#asyncDeliveryEpoch,
 		});
 	}
 
@@ -4994,6 +5031,8 @@ export class AgentSession implements SettingsScope {
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
+		this.#unregisterAsyncNoticeSink?.();
+		this.#unregisterAsyncNoticeSink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The shutdown reason is reserved for the top-level session that OWNS the
 		// manager — the genuine process/handled-shutdown path — so the task
@@ -5904,7 +5943,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Reduce stored context with the selected shake strategy. */
-	shake(mode: ShakeMode, opts: { config?: ShakeConfig; signal?: AbortSignal } = {}): Promise<ShakeResult> {
+	shake(mode: ShakeMode, opts: ShakeOptions = {}): Promise<ShakeResult> {
 		return this.#maintenance.shake(mode, opts);
 	}
 

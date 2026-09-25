@@ -1,44 +1,71 @@
 /**
- * Durable ownership registry for targets in the project-shared broker-owned
- * Chromium (`omp.browser.headless`/`omp.browser.headed`).
+ * Durable ownership registry for page targets OMP created in browsers that
+ * outlive a single omp process: the machine-global agent Chromium
+ * (`omp.browser.headless`/`omp.browser.headed`) and relay-driven Chrome
+ * (`app.new_tab` targets on `omp.browser.relay`).
  *
- * The shared browser outlives any single omp process, but tab ownership is
- * otherwise tracked only in that process's memory (`tab-supervisor`'s `tabs`
- * map). When a session ends abnormally (crash, SIGKILL, cleanup timeout) its
- * in-process map dies with it and the pages it opened stay open in the shared
- * Chromium forever, accumulating into multi-GB orphan targets (issue #10022).
+ * Tab lifecycle is otherwise tracked only in the creating process's memory
+ * (`tab-supervisor`'s `tabs` map). When a session ends abnormally (crash,
+ * SIGKILL, cleanup timeout) that map dies with it and the pages it opened stay
+ * open forever (issue #10022). This module records, atomically on disk beside
+ * the broker runtime dir, which OS process created each target together with
+ * the metadata a reaper needs: creator session and channel, logical tab name,
+ * `persist`, creation time, last MEANINGFUL activity (tool-driven actions only
+ * — websocket keepalives, freeze/unfreeze and passive reloads never count),
+ * and the browser generation the target id belongs to. Each owner file is a
+ * PID lease refreshed by a heartbeat while the process holds targets.
  *
- * This module records, on disk under the broker runtime dir, which OS process
- * created each shared-browser page target. Any live omp process can then reap
- * targets whose owning process is gone. It only ever touches OMP-owned
- * shared-browser targets — user-owned connected/relay/spawned browsers have no
- * registry and are never scanned.
- *
- * Ownership is authoritative in the safe direction: a target is reaped only
- * when its owner PID reports `ESRCH` (definitively dead). A live PID is never
- * reaped, so a live session's tabs cannot be yanked out from under it; the
- * worst case (recycled PID) leaves an orphan uncollected rather than closing a
- * live page.
+ * Ownership is authoritative in the safe direction:
+ * - only targets with a record are ever closed by a reaper — an adopted user
+ *   tab has no record and cannot be reached from here;
+ * - a live owner PID's targets are never touched by another process;
+ * - a dead owner (`ESRCH`) is reaped only after a grace window;
+ * - a record from another browser generation is discarded, never acted on;
+ * - torn, malformed or metadata-less records fail SAFE: legacy `string[]`
+ *   target lists still prove OMP creation (crash reap applies) but carry no
+ *   activity clock, so the idle reaper retains them.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import type { Browser } from "puppeteer-core";
-import { daemonRuntimeDir } from "../../launch/paths";
 
-/** Identifies one shared-browser daemon's target registry. */
+/** Identifies one browser daemon's target registry. */
 export interface SharedTargetScope {
-	/** Canonical project directory owning the broker (as stamped on the handle). */
-	projectDir: string;
-	/** Broker daemon name, e.g. `omp.browser.headless`. */
+	/** Broker runtime directory the registry lives beside (global agent-browser or relay scope). */
+	runtimeDir: string;
+	/** Broker daemon name, e.g. `omp.browser.headless` or `omp.browser.relay`. */
 	daemonName: string;
 }
 
-/** On-disk ownership record: one file per owning omp process. */
+/** Durable per-target metadata; everything a reaper needs after the creating process is gone. */
+export interface SharedTargetRecord {
+	targetId: string;
+	/** Logical tab name the creator used (`main`, `omp-architecture-image`, ...). */
+	name: string;
+	/** Creating session id when the acquirer identified itself. */
+	ownerSessionId?: string;
+	/** OMP channel/profile of the creator (`OMP_PROFILE`, `default` when unset). */
+	channel: string;
+	/** Creator opted the tab out of idle reaping. */
+	persist: boolean;
+	createdAt: number;
+	/** Last tool-driven action (create, reuse, run start/end). Never refreshed by keepalives or freeze/unfreeze. */
+	lastMeaningfulActivityAt: number;
+	/** Browser launch identity the target id is valid in. */
+	generation: string;
+	/** Relay tabs: extension-minted per-tab UUID; a live tab must carry the same marker before it is closed. */
+	marker?: string;
+}
+
+/** On-disk ownership record: one file per owning omp process (a PID lease). */
 interface OwnershipFile {
+	version?: 2;
 	pid: number;
+	/** Heartbeat: refreshed on every write and by the lease timer while targets are held. */
 	updatedAt: number;
-	targets: string[];
+	/** v2: full records. Legacy files carry `string[]` target ids with no metadata. */
+	targets: Array<SharedTargetRecord | string>;
 }
 
 /**
@@ -48,14 +75,18 @@ interface OwnershipFile {
  * process's very fresh records around briefly in case it is being restarted.
  */
 const DEFAULT_GRACE_MS = 15_000;
+/** Lease heartbeat cadence while this process holds any recorded target. */
+const HEARTBEAT_MS = 60_000;
 
-/** In-process set of shared-browser targets this process created, keyed by registry dir. */
-const ownedByDir = new Map<string, Set<string>>();
+/** In-process records of targets this process created, keyed by registry dir then target id. */
+const ownedByDir = new Map<string, Map<string, SharedTargetRecord>>();
 /** Per-registry-dir write serialization so concurrent record/forget can't tear the file. */
 const writeChains = new Map<string, Promise<void>>();
+/** Unref'd heartbeat timers per registry dir. */
+const heartbeats = new Map<string, NodeJS.Timeout>();
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(scope.runtimeDir, `${scope.daemonName}.targets`);
 }
 
 /** Serialize a write against others for the same registry dir. */
@@ -69,35 +100,83 @@ function chain(dir: string, task: () => Promise<void>): Promise<void> {
 	return next;
 }
 
+/** Atomic JSON write: temp file beside the destination, then rename. */
+async function writeAtomic(file: string, record: OwnershipFile): Promise<void> {
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		await Bun.write(tmp, JSON.stringify(record));
+		await fs.rename(tmp, file);
+	} catch (error) {
+		await fs.rm(tmp, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
 /** Persist (or, when empty, remove) this process's ownership file for a registry dir. */
 async function flush(dir: string): Promise<void> {
 	const owned = ownedByDir.get(dir);
 	const file = path.join(dir, `${process.pid}.json`);
 	if (!owned || owned.size === 0) {
+		stopHeartbeat(dir);
 		await fs.rm(file, { force: true }).catch(() => undefined);
 		return;
 	}
-	const record: OwnershipFile = { pid: process.pid, updatedAt: Date.now(), targets: [...owned] };
-	const tmp = `${file}.${process.pid}.tmp`;
 	await fs.mkdir(dir, { recursive: true });
-	await Bun.write(tmp, JSON.stringify(record));
-	await fs.rename(tmp, file);
+	await writeAtomic(file, { version: 2, pid: process.pid, updatedAt: Date.now(), targets: [...owned.values()] });
+	startHeartbeat(dir);
 }
 
-/** Record that this process created `targetId` in the given shared browser. */
-export async function recordSharedTarget(scope: SharedTargetScope, targetId: string): Promise<void> {
-	const dir = registryDir(scope);
-	let owned = ownedByDir.get(dir);
-	if (!owned) {
-		owned = new Set();
-		ownedByDir.set(dir, owned);
-	}
-	owned.add(targetId);
-	await chain(dir, () => flush(dir)).catch(err =>
-		logger.debug("Failed to record shared-browser target ownership", {
+function startHeartbeat(dir: string): void {
+	if (heartbeats.has(dir)) return;
+	const timer = setInterval(() => {
+		void chain(dir, () => flush(dir)).catch(() => undefined);
+	}, HEARTBEAT_MS);
+	timer.unref();
+	heartbeats.set(dir, timer);
+}
+
+function stopHeartbeat(dir: string): void {
+	const timer = heartbeats.get(dir);
+	if (timer === undefined) return;
+	heartbeats.delete(dir);
+	clearInterval(timer);
+}
+
+function persistQuietly(dir: string, what: string): Promise<void> {
+	return chain(dir, () => flush(dir)).catch(err =>
+		logger.debug(`Failed to ${what} shared-browser target ownership`, {
 			error: err instanceof Error ? err.message : String(err),
 		}),
 	);
+}
+
+/** Record that this process created a target in the given browser, with its lifecycle metadata. */
+export async function recordSharedTarget(scope: SharedTargetScope, record: SharedTargetRecord): Promise<void> {
+	const dir = registryDir(scope);
+	let owned = ownedByDir.get(dir);
+	if (!owned) {
+		owned = new Map();
+		ownedByDir.set(dir, owned);
+	}
+	owned.set(record.targetId, record);
+	await persistQuietly(dir, "record");
+}
+
+/**
+ * Refresh durable lifecycle fields of an owned target. Only tool-driven
+ * activity may pass `lastMeaningfulActivityAt`; `persist` follows the
+ * creator's later decision. Unknown targets are ignored.
+ */
+export async function touchSharedTarget(
+	scope: SharedTargetScope,
+	targetId: string,
+	patch: Partial<Pick<SharedTargetRecord, "lastMeaningfulActivityAt" | "persist" | "marker">>,
+): Promise<void> {
+	const dir = registryDir(scope);
+	const record = ownedByDir.get(dir)?.get(targetId);
+	if (!record) return;
+	Object.assign(record, patch);
+	await persistQuietly(dir, "update");
 }
 
 /** Drop `targetId` from this process's ownership file (closed the normal way). */
@@ -105,11 +184,7 @@ export async function forgetSharedTarget(scope: SharedTargetScope, targetId: str
 	const dir = registryDir(scope);
 	const owned = ownedByDir.get(dir);
 	if (!owned?.delete(targetId)) return;
-	await chain(dir, () => flush(dir)).catch(err =>
-		logger.debug("Failed to update shared-browser target ownership", {
-			error: err instanceof Error ? err.message : String(err),
-		}),
-	);
+	await persistQuietly(dir, "update");
 }
 
 /** True when `pid` names a live process; non-`ESRCH` probe failures are treated as alive (safe direction). */
@@ -132,17 +207,62 @@ export interface CollectOrphanOptions {
 	graceMs?: number;
 }
 
+/** One orphaned target with whatever metadata its record carried (undefined for legacy id-only records). */
+export interface OrphanTarget {
+	targetId: string;
+	record?: SharedTargetRecord;
+}
+
 /** Targets belonging to one dead process, kept grouped so partial failures remain retryable. */
 export interface OrphanOwner {
 	file: string;
 	pid: number;
 	updatedAt: number;
-	targetIds: string[];
+	targets: OrphanTarget[];
 }
 
 /** Orphan-scan result grouped by durable ownership file. */
 export interface OrphanScan {
 	owners: OrphanOwner[];
+}
+
+function parseTargets(raw: unknown[]): OrphanTarget[] {
+	const out: OrphanTarget[] = [];
+	for (const entry of raw) {
+		if (typeof entry === "string") {
+			out.push({ targetId: entry });
+			continue;
+		}
+		if (entry === null || typeof entry !== "object") continue;
+		const record = entry as Partial<SharedTargetRecord>;
+		if (typeof record.targetId !== "string") continue;
+		// A record missing its clock or generation is not trustworthy metadata:
+		// keep the id (OMP created it) but strip the metadata so the idle path
+		// retains it and the generation check discards nothing by accident.
+		if (
+			typeof record.lastMeaningfulActivityAt !== "number" ||
+			typeof record.generation !== "string" ||
+			typeof record.createdAt !== "number"
+		) {
+			out.push({ targetId: record.targetId });
+			continue;
+		}
+		out.push({
+			targetId: record.targetId,
+			record: {
+				targetId: record.targetId,
+				name: typeof record.name === "string" ? record.name : "",
+				ownerSessionId: typeof record.ownerSessionId === "string" ? record.ownerSessionId : undefined,
+				channel: typeof record.channel === "string" ? record.channel : "unknown",
+				persist: record.persist === true,
+				createdAt: record.createdAt,
+				lastMeaningfulActivityAt: record.lastMeaningfulActivityAt,
+				generation: record.generation,
+				marker: typeof record.marker === "string" ? record.marker : undefined,
+			},
+		});
+	}
+	return out;
 }
 
 /**
@@ -181,14 +301,14 @@ export async function collectOrphanTargets(
 		if (record.pid === process.pid) continue; // our own file
 		if (isAlive(record.pid)) continue; // owner still running
 		if (nowMs - (record.updatedAt ?? 0) < graceMs) continue; // conservative grace
-		owners.push({
-			file,
-			pid: record.pid,
-			updatedAt: record.updatedAt,
-			targetIds: record.targets.filter(id => typeof id === "string"),
-		});
+		owners.push({ file, pid: record.pid, updatedAt: record.updatedAt, targets: parseTargets(record.targets) });
 	}
 	return { owners };
+}
+
+/** In-process view of the targets this process currently owns in a scope (for the owner's own reaper). */
+export function ownedSharedTargets(scope: SharedTargetScope): readonly SharedTargetRecord[] {
+	return [...(ownedByDir.get(registryDir(scope))?.values() ?? [])];
 }
 
 /**
@@ -223,50 +343,86 @@ export async function closeCdpTarget(browser: Browser, targetId: string): Promis
 }
 
 /** Atomically retain unresolved targets, or remove an ownership file once all are resolved. */
-async function updateOwnershipFile(owner: OrphanOwner, targetIds: string[]): Promise<void> {
-	if (targetIds.length === 0) {
+async function updateOwnershipFile(owner: OrphanOwner, retained: OrphanTarget[]): Promise<void> {
+	if (retained.length === 0) {
 		await fs.rm(owner.file, { force: true });
 		return;
 	}
-	const tmp = `${owner.file}.${process.pid}.tmp`;
-	try {
-		const record: OwnershipFile = { pid: owner.pid, updatedAt: owner.updatedAt, targets: targetIds };
-		await Bun.write(tmp, JSON.stringify(record));
-		await fs.rename(tmp, owner.file);
-	} catch (error) {
-		await fs.rm(tmp, { force: true }).catch(() => undefined);
-		throw error;
-	}
+	await writeAtomic(owner.file, {
+		version: 2,
+		pid: owner.pid,
+		updatedAt: owner.updatedAt,
+		targets: retained.map(target => target.record ?? target.targetId),
+	});
+}
+
+/** How a reaper decides what to do with one dead owner's target. */
+export type OrphanDecision = "close" | "retain" | "discard";
+
+/** Seams for {@link reapOrphanSharedTargets}; production uses the real clock and closes everything eligible. */
+export interface ReapOrphanOptions extends CollectOrphanOptions {
+	/** Current browser generation; records from another generation are discarded without touching any target. */
+	generation?: string;
+	/**
+	 * Per-target policy hook (default: close). Lets the supervisor apply the
+	 * same page-level protections (login page, unsaved input, download,
+	 * foreground tab) to targets inherited from a crashed owner as to its own.
+	 */
+	decide?: (target: OrphanTarget) => Promise<OrphanDecision> | OrphanDecision;
+	/** Close primitive; injectable so tests need no browser. */
+	close?: (targetId: string) => Promise<boolean>;
 }
 
 /**
- * Reap shared-browser targets whose owning omp process is gone. Each owner
- * file is removed only after every target is confirmed closed/absent; partial
- * failures atomically retain the unresolved ids for the next attach to retry.
- * Failures are logged, never thrown, so cleanup cannot block browser open.
+ * Reap targets whose owning omp process is gone — cleanup transfers to
+ * whichever live process attaches next. Each owner file is removed only after
+ * every target is resolved (closed, absent, or discarded as stale
+ * generation); partial failures atomically retain the unresolved records for
+ * the next attempt. Failures are logged, never thrown, so cleanup cannot block
+ * browser open.
  */
-export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTargetScope): Promise<number> {
+export async function reapOrphanSharedTargets(
+	browser: Browser | undefined,
+	scope: SharedTargetScope,
+	opts: ReapOrphanOptions = {},
+): Promise<number> {
 	let scan: OrphanScan;
 	try {
-		scan = await collectOrphanTargets(scope);
+		scan = await collectOrphanTargets(scope, opts);
 	} catch (err) {
 		logger.debug("Failed to scan shared-browser target registry", {
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return 0;
 	}
+	const close = opts.close ?? (browser ? (targetId: string) => closeCdpTarget(browser, targetId) : undefined);
+	if (!close) return 0;
 	let closed = 0;
 	for (const owner of scan.owners) {
-		const retained: string[] = [];
-		for (const targetId of owner.targetIds) {
-			if (await closeCdpTarget(browser, targetId)) {
+		const retained: OrphanTarget[] = [];
+		for (const target of owner.targets) {
+			if (opts.generation !== undefined && target.record && target.record.generation !== opts.generation) {
+				// Stale generation: the id can name nothing (or, worse, be
+				// recycled); drop the record without any CDP call.
+				continue;
+			}
+			const decision = opts.decide ? await opts.decide(target) : "close";
+			if (decision === "discard") continue;
+			if (decision === "retain") {
+				retained.push(target);
+				continue;
+			}
+			if (await close(target.targetId)) {
 				closed++;
 			} else {
-				retained.push(targetId);
-				logger.debug("Retaining orphaned shared-browser target for retry", { targetId, ownerPid: owner.pid });
+				retained.push(target);
+				logger.debug("Retaining orphaned shared-browser target for retry", {
+					targetId: target.targetId,
+					ownerPid: owner.pid,
+				});
 			}
 		}
-		if (retained.length === owner.targetIds.length) continue;
+		if (retained.length === owner.targets.length) continue;
 		try {
 			await updateOwnershipFile(owner, retained);
 		} catch (err) {
@@ -284,4 +440,6 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 export function resetOrphanRegistryForTest(): void {
 	ownedByDir.clear();
 	writeChains.clear();
+	for (const timer of heartbeats.values()) clearInterval(timer);
+	heartbeats.clear();
 }

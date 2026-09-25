@@ -99,6 +99,57 @@ export const cfgSkills = combine({
 /** Skill discovery options ({@link cfgSkills}); omitted fields fall back to the setting defaults. */
 export type SkillsSettings = Partial<SettingValueOf<typeof cfgSkills>>;
 
+// Skill recommendation (`recommend_skills` tool)
+export const cfgSkillsRecommendEnabled = register({
+	id: "skills.recommend.enabled",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Skill Recommendation",
+		description:
+			"Expose the `recommend_skills` tool: ranks installed skills against a task through the judgment backend, falling back to lexical overlap when none is reachable",
+	},
+});
+
+export const cfgSkillsRecommendMaxCandidatesPerRequest = register({
+	id: "skills.recommend.maxCandidatesPerRequest",
+	type: "number",
+	default: 200,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Skill Ranking Window",
+		description:
+			"Skills scored in one judgment request (capped at the 255-option Choice limit). Larger catalogs are split into windows and every window is scored",
+	},
+});
+
+export const cfgSkillsRecommendMinRelevance = register({
+	id: "skills.recommend.minRelevance",
+	type: "number",
+	default: 0.1,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Skill Relevance Floor",
+		description: "Minimum selection probability a skill needs before it is reported as a recommendation",
+	},
+});
+
+export const cfgSkillsRecommendCacheEntries = register({
+	id: "skills.recommend.cacheEntries",
+	type: "number",
+	default: 64,
+	ui: {
+		tab: "tasks",
+		group: "Commands & Skills",
+		label: "Skill Ranking Cache",
+		description: "Cached rankings kept per session, keyed by task, catalog digest, and judgment configuration",
+	},
+});
+
 // Commands
 export const cfgCommandsEnableClaudeUser = register({
 	id: "commands.enableClaudeUser",

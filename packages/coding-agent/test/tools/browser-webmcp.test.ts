@@ -9,12 +9,13 @@ import type {
 	WebMcpListResult,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/webmcp";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
 function createBrowserHost() {
-	const session: ToolSession = {
+	const session: ToolSession = grantBrowserFixtureScope({
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionFile: () => null,
@@ -25,7 +26,7 @@ function createBrowserHost() {
 			"browser.cmux": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown) => prelude.invoke(parameters, { session, toolCallId: "browser-webmcp-test" });
 }

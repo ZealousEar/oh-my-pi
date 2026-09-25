@@ -376,6 +376,11 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 // authenticated and win the provider startup fallback over `anthropic`. Run the
 // suites in a hermetic environment with all credential / cloud-config variables
 // stripped so resolution depends only on the test's own fixtures.
+//
+// A shell opened from an omp channel launcher also carries `PI_CONFIG_FILES`
+// (real config overlays), `OMP_SHARED_SECRETS_FILE` (a live, writable credential
+// overlay) and `OMP_SHARED_MCP_PROFILES`: persisted-settings tests would read the
+// user's overlays and write test credentials into the shared file.
 const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_"];
 const SCRUBBED_ENV_NAMES = new Set([
 	"GITHUB_TOKEN",
@@ -384,6 +389,9 @@ const SCRUBBED_ENV_NAMES = new Set([
 	"GOOGLE_APPLICATION_CREDENTIALS",
 	"ANTHROPIC_OAUTH_TOKEN",
 	"XAI_OAUTH_TOKEN",
+	"PI_CONFIG_FILES",
+	"OMP_SHARED_SECRETS_FILE",
+	"OMP_SHARED_MCP_PROFILES",
 ]);
 
 function isScrubbedEnvVar(key: string): boolean {

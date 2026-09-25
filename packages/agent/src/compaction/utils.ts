@@ -198,14 +198,40 @@ export function upsertFileOperations(
 
 /** Maximum characters for a tool result in serialized summaries. */
 const TOOL_RESULT_MAX_CHARS = 2000;
+/**
+ * Head/tail split of {@link TOOL_RESULT_MAX_CHARS}. Tool output puts its
+ * verdict at the END (test runners print the failing assertion and
+ * `N pass, M fail` after the passing cases; shells print the error and exit
+ * status last), so a head-only cut handed the summarizer 2 000 characters of
+ * green checkmarks and dropped the exact error the summary prompt is told to
+ * preserve. Same total budget, both edges kept.
+ */
+const TOOL_RESULT_HEAD_CHARS = 1200;
+const TOOL_RESULT_TAIL_CHARS = TOOL_RESULT_MAX_CHARS - TOOL_RESULT_HEAD_CHARS;
+
+/** Whether `text[index]` is a high surrogate starting a pair (cutting after it would orphan it). */
+function isHighSurrogateAt(text: string, index: number): boolean {
+	const unit = text.charCodeAt(index);
+	return unit >= 0xd800 && unit <= 0xdbff;
+}
 
 /**
  * Truncate tool results to the same representation used in summarization prompts.
+ * Cut points never split a UTF-16 surrogate pair. The head gives up one code
+ * unit rather than end on a high surrogate; a tail that would begin on a low
+ * surrogate spends the head's spare unit to keep the whole pair, or starts one
+ * unit later when the head kept its full share. Retained content is therefore
+ * never more than {@link TOOL_RESULT_MAX_CHARS} and never more than one unit
+ * below it.
  */
 export function truncateToolResultForSummary(text: string): string {
 	if (text.length <= TOOL_RESULT_MAX_CHARS) return text;
-	const truncatedChars = text.length - TOOL_RESULT_MAX_CHARS;
-	return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n\n[... ${truncatedChars} more characters truncated]`;
+	let headEnd = TOOL_RESULT_HEAD_CHARS;
+	if (isHighSurrogateAt(text, headEnd - 1)) headEnd--;
+	let tailStart = text.length - TOOL_RESULT_TAIL_CHARS;
+	if (isHighSurrogateAt(text, tailStart - 1)) tailStart += headEnd < TOOL_RESULT_HEAD_CHARS ? -1 : 1;
+	const truncatedChars = tailStart - headEnd;
+	return `${text.slice(0, headEnd)}\n\n[... ${truncatedChars} characters truncated from the middle ...]\n\n${text.slice(tailStart)}`;
 }
 
 const SUMMARY_BOUNDARY_TAG_RE = /<\s*\/?\s*(?:conversation|previous-summary)\s*>/gi;

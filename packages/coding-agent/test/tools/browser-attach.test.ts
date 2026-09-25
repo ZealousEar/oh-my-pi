@@ -24,13 +24,16 @@ import {
 import { acquireTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 let sharedHeadless: BrowserHandle | undefined;
 
 function makeSession(): ToolSession {
-	return {
+	// Fixture scope: these suites assert target selection and handle release;
+	// raw runs and adopted-tab navigation need the exact grant to reach the page.
+	return grantBrowserFixtureScope({
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionFile: () => null,
@@ -39,7 +42,7 @@ function makeSession(): ToolSession {
 			"browser.enabled": true,
 			"browser.headless": true,
 		}),
-	};
+	});
 }
 
 interface FakePageOptions {

@@ -203,17 +203,20 @@ import {
 import { pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
 
 import { cloneSafe, RunOutput } from "./run-output";
-import type {
-	Observation,
-	ObservationEntry,
-	ReadyInfo,
-	RunErrorPayload,
-	ScreenshotResult,
-	SessionSnapshot,
-	ToolReply,
-	Transport,
-	WorkerInbound,
-	WorkerInitPayload,
+import {
+	type Observation,
+	type ObservationEntry,
+	originOf,
+	type ReadyInfo,
+	type RunBinding,
+	type RunErrorPayload,
+	type ScreenshotResult,
+	type SessionSnapshot,
+	targetChangedDenial,
+	type ToolReply,
+	type Transport,
+	type WorkerInbound,
+	type WorkerInitPayload,
 } from "./tab-protocol";
 
 declare module "puppeteer-core" {
@@ -1232,6 +1235,10 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	/** The page is omp's to close: a headless page or a supervisor-created (`app.new_tab`) target. */
+	#ownsPage = false;
+	/** Init reported `ready`; later `ready` messages are URL refreshes, never init completion. */
+	#initialized = false;
 	#activateForScreenshot = true;
 	#dialogs?: RuntimeDialogController;
 	#network?: BrowserNetworkManager;
@@ -1345,6 +1352,7 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
+			this.#ownsPage = payload.mode === "headless" || payload.ownsTarget === true;
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
@@ -1390,6 +1398,15 @@ export class WorkerCore {
 				await this.#page.emulateFocusedPage(true);
 			}
 			this.#webmcp = await installWebMcp(this.#page);
+			// Keep the supervisor's cached URL honest between runs so the next
+			// dispatch is classified against the page the tab actually shows.
+			// The authoritative check is still `#bindLiveTarget` at run time.
+			// Only after init reported `ready`: the initial navigation's own
+			// frame events must not stand in for that completion signal.
+			this.#page.on("framenavigated", frame => {
+				if (!this.#initialized || this.#active || frame !== this.#page?.mainFrame()) return;
+				void this.#postReadyInfo();
+			});
 			await installVitalsObservers(this.#page);
 			if (payload.userAgent !== undefined) await applyUserAgentOverride(this.#page, payload.userAgent);
 			if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(this.#page);
@@ -1418,6 +1435,7 @@ export class WorkerCore {
 			}
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
+			this.#initialized = true;
 		} catch (error) {
 			// A failed headless init leaves the worker's page orphaned in the shared
 			// browser (the supervisor retries with a fresh worker), so close it before
@@ -1490,6 +1508,35 @@ export class WorkerCore {
 		this.#dialogs?.dispose();
 		this.#dialogs = new RuntimeDialogController(page, (message, details) => this.#log("debug", message, details));
 		this.#dialogs.observe();
+	}
+
+	/**
+	 * Re-prove a non-raw mutation's authorization against the LIVE document
+	 * right before the code executes: read `location.href` from the main frame
+	 * (not the cached URL the supervisor classified against) and refuse when
+	 * its origin is not the one the policy decided. An unreadable document
+	 * (execution context torn down by an in-flight navigation) fails closed.
+	 * While a JavaScript dialog blocks the renderer no script can run, so the
+	 * main frame's last committed URL stands in — that is the document the
+	 * dialog belongs to, and settling it is the only thing a run can do there.
+	 */
+	async #bindLiveTarget(binding: RunBinding): Promise<void> {
+		const page = this.#requirePage();
+		let liveUrl: string | undefined;
+		if (this.#dialogs?.state().open) {
+			liveUrl = page.mainFrame().url();
+		} else {
+			try {
+				const href: unknown = await page.mainFrame().evaluate("location.href");
+				liveUrl = typeof href === "string" ? href : undefined;
+			} catch {
+				liveUrl = undefined;
+			}
+		}
+		if (liveUrl === undefined || originOf(liveUrl) !== binding.target) {
+			await this.#postReadyInfo();
+			throw new ToolError(targetChangedDenial(binding, liveUrl));
+		}
 	}
 
 	async #currentReadyInfo(): Promise<ReadyInfo> {
@@ -1565,6 +1612,7 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
+			if (msg.binding) await this.#bindLiveTarget(msg.binding);
 			await untilAborted(signal, () => this.#emulation?.reapply() ?? Promise.resolve());
 			runPage = createRunPageScope(this.#requirePage(), () => this.#requireNetwork().restoreInterception());
 			const browser = this.#requireBrowser();
@@ -2973,7 +3021,7 @@ export class WorkerCore {
 		await this.#tracing?.dispose();
 		await this.#consoleCapture.detach();
 		this.#emulation?.dispose();
-		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
+		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });
 		this.#transport.close();

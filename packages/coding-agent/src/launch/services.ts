@@ -27,6 +27,8 @@ export interface ServiceStart {
 	pty?: boolean;
 	env?: Record<string, string>;
 	ready?: ServiceReady;
+	/** Total wall-clock lifetime in seconds across restarts; the broker stops the process tree when it elapses. */
+	lifetime?: number;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -196,6 +198,7 @@ export async function startService(
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535))
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	if (ready && !ready.log && ready.port === undefined) throw new ToolError("ready requires log or port");
+	if (params.lifetime !== undefined && !(params.lifetime > 0)) throw new ToolError("lifetime must be > 0 seconds");
 	if (ready?.log) {
 		try {
 			new RegExp(ready.log, "u");
@@ -222,6 +225,7 @@ export async function startService(
 		restart: "no",
 		persist: false,
 		detached: false,
+		...(params.lifetime === undefined ? {} : { lifetimeMs: Math.round(params.lifetime * 1_000) }),
 	};
 	const result = await request(
 		session,
@@ -267,5 +271,10 @@ export async function modeService(
 
 export function serviceStatus(daemon: DaemonSnapshot): string {
 	const age = formatDuration(Math.max(0, (daemon.exitedAt ?? Date.now()) - daemon.startedAt));
-	return `${daemon.name} [service] — ${daemon.state} — up ${age}${daemon.pid === undefined ? "" : ` — pid ${daemon.pid}`}${daemon.persist ? " — persistent" : ""}${daemon.detached ? " — detached" : ""}`;
+	const lifetime =
+		daemon.exitedAt === undefined && daemon.deadlineAt !== undefined
+			? ` — lifetime left ${formatDuration(Math.max(0, daemon.deadlineAt - Date.now()))}`
+			: "";
+	const reason = daemon.exitedAt !== undefined && daemon.exitReason ? ` — ${replaceTabs(daemon.exitReason)}` : "";
+	return `${daemon.name} [service] — ${daemon.state} — up ${age}${daemon.pid === undefined ? "" : ` — pid ${daemon.pid}`}${lifetime}${daemon.persist ? " — persistent" : ""}${daemon.detached ? " — detached" : ""}${reason}`;
 }

@@ -1,7 +1,8 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import asyncNoProgressTemplate from "../prompts/system/async-no-progress.md" with { type: "text" };
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -39,6 +40,26 @@ const RETAINED_ARTIFACTS_CLEANUP_GRACE_MS = 60_000;
  */
 const RETAINED_ARTIFACTS_CLEANUP_MAX_WAIT_MS = DEFAULT_RETENTION_MS;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
+/** Bound on the output tail quoted in a no-progress notice. */
+const NO_PROGRESS_TAIL_MAX_LINES = 5;
+const NO_PROGRESS_TAIL_MAX_CHARS = 600;
+
+/** Last few lines of a progress text, bounded for the no-progress notice. */
+function outputTail(text: string): string | undefined {
+	const trimmed = text.trimEnd();
+	if (trimmed.length === 0) return undefined;
+	let start = trimmed.length;
+	for (let lines = 0; lines < NO_PROGRESS_TAIL_MAX_LINES && start > 0; lines++) {
+		const index = trimmed.lastIndexOf("\n", start - 1);
+		if (index === -1) {
+			start = 0;
+			break;
+		}
+		start = index;
+	}
+	const tail = trimmed.slice(start).replace(/^\n/, "");
+	return tail.length > NO_PROGRESS_TAIL_MAX_CHARS ? tail.slice(-NO_PROGRESS_TAIL_MAX_CHARS) : tail;
+}
 /** Abort reason used only when the owning session shuts down the entire manager. */
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
 
@@ -95,6 +116,18 @@ export interface AsyncJob {
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: AsyncJobDetails;
 	/**
+	 * Wall-clock time of the last `reportProgress` call that carried new
+	 * output or details (initially `startTime`). Undefined only for rows
+	 * reconstructed from a delivery snapshot.
+	 */
+	lastProgressAt?: number;
+	/**
+	 * Timeout the job body enforces on itself, when the registrant knows it
+	 * (bash/eval command deadline). Informational: quoted by the no-progress
+	 * notice so the owner can tell a stuck job from one still inside budget.
+	 */
+	timeoutMs?: number;
+	/**
 	 * Registry id of the agent that registered the job (e.g. "Main",
 	 * "AuthLoader"). Used by scoped cancel/list APIs so a subagent's teardown
 	 * does not cancel its parent's jobs. Undefined for callers that don't
@@ -133,6 +166,35 @@ export interface AsyncJob {
 
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
+
+/**
+ * Owner-routed callback for a notice about a job that is still running (a
+ * no-progress warning). Unlike completion delivery there is no retry queue:
+ * a notice is advisory, fires at most once per job, and is dropped when the
+ * owner has no live sink.
+ */
+export type AsyncJobNoticeSink = (jobId: string, text: string, job: AsyncJob) => void | Promise<void>;
+
+export interface AsyncJobNoticePolicy {
+	/**
+	 * Emit one notice when a running job reports no progress for this long
+	 * (`async.noProgressWarnMs`). `0` disables the timer for the owner's jobs.
+	 */
+	noProgressWarnMs: number;
+}
+
+interface AsyncJobNoticeRoute {
+	sink: AsyncJobNoticeSink;
+	policy: AsyncJobNoticePolicy;
+}
+
+/** Per-job no-progress watchdog; present only while the owner's policy arms it. */
+interface NoProgressWatch {
+	warnMs: number;
+	timer: NodeJS.Timeout | undefined;
+	lastText: string | undefined;
+	warned: boolean;
+}
 
 export interface AsyncJobManagerOptions {
 	/**
@@ -213,6 +275,8 @@ export interface AsyncJobRegisterOptions {
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
 	onProgress?: (text: string, details?: AsyncJobDetails) => void | Promise<void>;
+	/** Timeout the job body enforces on itself; see {@link AsyncJob.timeoutMs}. */
+	timeoutMs?: number;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
 	/** Register the job as backing a foreground call; see {@link AsyncJob.foreground}. */
@@ -257,6 +321,8 @@ export class AsyncJobManager {
 	readonly #releasedForegroundJobs = new Set<string>();
 	#nextAutoId = 1;
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
+	readonly #noticeRoutes = new Map<string, AsyncJobNoticeRoute>();
+	readonly #noProgressWatches = new Map<string, NoProgressWatch>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobsOption: AsyncJobManagerOptions["maxRunningJobs"];
 	readonly #retentionMs: number;
@@ -360,14 +426,33 @@ export class AsyncJobManager {
 			label,
 			abortController,
 			promise: Promise.resolve(),
+			lastProgressAt: startTime,
+			timeoutMs: options?.timeoutMs,
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
 			...(options?.foreground ? { foreground: true } : {}),
 		};
 
+		const noProgressWarnMs =
+			options?.ownerId === undefined ? 0 : (this.#noticeRoutes.get(options.ownerId)?.policy.noProgressWarnMs ?? 0);
+		const watch: NoProgressWatch | undefined =
+			noProgressWarnMs > 0
+				? { warnMs: noProgressWarnMs, timer: undefined, lastText: undefined, warned: false }
+				: undefined;
+		if (watch) this.#noProgressWatches.set(id, watch);
+		// A queued job holds no execution slot yet and a foreground-backed job is
+		// not a background job until promoted; their silence starts at
+		// markRunning / backgroundJob (measured from the last real progress).
+		this.#armNoProgress(job);
+
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
 			if (details) job.latestDetails = details;
+			if (watch && (details !== undefined || text !== watch.lastText)) {
+				watch.lastText = text;
+				job.lastProgressAt = Date.now();
+				this.#armNoProgress(job);
+			}
 			if (!options?.onProgress) return;
 			try {
 				await options.onProgress(text, details);
@@ -385,7 +470,12 @@ export class AsyncJobManager {
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
+						const wasQueued = job.queued;
 						job.queued = false;
+						if (wasQueued) {
+							job.lastProgressAt = Date.now();
+							this.#armNoProgress(job);
+						}
 					},
 				});
 				job.endTime = Date.now();
@@ -409,6 +499,7 @@ export class AsyncJobManager {
 					this.#enqueueDelivery(id, errorText);
 				}
 			}
+			this.#clearNoProgressWatch(id);
 			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
 			else this.#scheduleEviction(id);
 		})();
@@ -428,6 +519,7 @@ export class AsyncJobManager {
 		if (filter && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
+		this.#clearNoProgressWatch(id);
 		job.abortController.abort();
 		return true;
 	}
@@ -465,6 +557,9 @@ export class AsyncJobManager {
 		if (!job.foreground) return true;
 		job.foreground = undefined;
 		this.#suppressedDeliveries.delete(jobId);
+		// Now a visible background job: its silence since the last real progress
+		// (including the foreground wait) counts toward the no-progress notice.
+		this.#armNoProgress(job);
 		if (job.status === "completed" || job.status === "failed") {
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 		}
@@ -592,6 +687,7 @@ export class AsyncJobManager {
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
 			if (job.status !== "running") continue;
 			job.status = "cancelled";
+			this.#clearNoProgressWatch(job.id);
 			job.abortController.abort(reason);
 		}
 	}
@@ -634,6 +730,22 @@ export class AsyncJobManager {
 		this.#deliverySinks.set(ownerId, sink);
 		return () => {
 			if (this.#deliverySinks.get(ownerId) === sink) this.#deliverySinks.delete(ownerId);
+		};
+	}
+
+	/**
+	 * Route running-job notices (no-progress warnings) for jobs owned by
+	 * `ownerId` to `sink`, under `policy`. Registered beside the delivery sink
+	 * at session construction; the policy is read when a job is registered,
+	 * so jobs started before registration (or by owners without a route) run
+	 * without a watchdog. Same last-wins / guarded-unregister contract as
+	 * {@link registerDeliverySink}.
+	 */
+	registerNoticeSink(ownerId: string, sink: AsyncJobNoticeSink, policy: AsyncJobNoticePolicy): () => void {
+		const route: AsyncJobNoticeRoute = { sink, policy };
+		this.#noticeRoutes.set(ownerId, route);
+		return () => {
+			if (this.#noticeRoutes.get(ownerId) === route) this.#noticeRoutes.delete(ownerId);
 		};
 	}
 
@@ -778,6 +890,7 @@ export class AsyncJobManager {
 		this.#consumedJobResults.clear();
 		this.#releasedForegroundJobs.clear();
 		this.#deliverySinks.clear();
+		this.#noticeRoutes.clear();
 		return jobsSettled && drained;
 	}
 
@@ -964,6 +1077,61 @@ export class AsyncJobManager {
 		}, delay);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
+	}
+
+	/**
+	 * (Re)arm a job's no-progress timer from its last real progress. Only a
+	 * visible running job is watched: queued and foreground-backed jobs wait
+	 * for markRunning / backgroundJob, which re-enter here.
+	 */
+	#armNoProgress(job: AsyncJob): void {
+		const watch = this.#noProgressWatches.get(job.id);
+		if (!watch || watch.warned || job.status !== "running" || job.queued || job.foreground) return;
+		clearTimeout(watch.timer);
+		const sinceProgressMs = Date.now() - (job.lastProgressAt ?? job.startTime);
+		watch.timer = setTimeout(() => this.#onNoProgress(job, watch), Math.max(0, watch.warnMs - sinceProgressMs));
+		watch.timer.unref();
+	}
+
+	#clearNoProgressWatch(jobId: string): void {
+		const watch = this.#noProgressWatches.get(jobId);
+		if (!watch) return;
+		clearTimeout(watch.timer);
+		watch.timer = undefined;
+		this.#noProgressWatches.delete(jobId);
+	}
+
+	/**
+	 * No-progress timer expiry: warn the owner exactly once while the job is
+	 * still running. The route is resolved at fire time (a revived session's
+	 * fresh registration wins); sink failures are logged, never retried.
+	 */
+	#onNoProgress(job: AsyncJob, watch: NoProgressWatch): void {
+		watch.timer = undefined;
+		if (watch.warned || job.status !== "running" || job.queued || job.foreground || this.#disposed) return;
+		watch.warned = true;
+		const route = job.ownerId === undefined ? undefined : this.#noticeRoutes.get(job.ownerId);
+		if (!route) return;
+		const now = Date.now();
+		const lastProgressAt = job.lastProgressAt ?? job.startTime;
+		const text = prompt.render(asyncNoProgressTemplate, {
+			jobId: job.id,
+			type: job.type,
+			label: job.label,
+			elapsedSec: Math.round((now - job.startTime) / 1000),
+			sinceProgressSec: Math.round((now - lastProgressAt) / 1000),
+			timeoutSec: job.timeoutMs && job.timeoutMs > 0 ? Math.round(job.timeoutMs / 1000) : undefined,
+			lastOutput: watch.lastText ? outputTail(watch.lastText) : undefined,
+		});
+		void Promise.resolve()
+			.then(() => route.sink(job.id, text, job))
+			.catch((error: unknown) => {
+				logger.warn("Async job no-progress notice sink failed", {
+					jobId: job.id,
+					ownerId: job.ownerId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 	}
 
 	#clearEvictionTimers(): void {

@@ -3,35 +3,53 @@
  *
  * Impersonates Chrome's CDP discovery endpoint so the omp browser tool (and
  * any puppeteer client) can connect with a plain `browserURL`:
- * - `GET /json/version` → 200 with `webSocketDebuggerUrl` once the extension
- *   is connected, 503 with a {@link RelayUnavailableInfo} body before that
+ * - `GET /json/version` → 200 with `webSocketDebuggerUrl` once the bound
+ *   extension is connected (plus `OMP-Relay-Protocol`, `OMP-Profile-Binding`,
+ *   `OMP-Profile-Fingerprint`, `OMP-Browser-Generation`, `OMP-Extension-Version`),
+ *   503 with a {@link RelayUnavailableInfo} body before that
  *   (`waitForRelayExtension` decides from it whether polling is worthwhile).
+ * - `GET /omp/binding` → profile-binding diagnostics for the pinning tool
+ *   (the connected install id is exposed only while unbound).
  * - `GET /json` / `/json/list` → attachable page targets (debugging aid).
  * - `WS /cdp` → downstream CDP clients (puppeteer).
  * - `WS /ext` → the Chrome extension (token-gated when configured).
  *
  * Binds loopback only: anything that can reach this port can drive the
- * user's logged-in browser.
+ * user's logged-in browser. Same-OS-user tampering with the binding file or
+ * `/omp/binding` is outside that claim.
  */
-import { RelayBridge } from "./bridge";
+import { type ProfileBindingInfo, RelayBridge, type RelayUnavailableReason } from "./bridge";
+import { RELAY_PROTOCOL_VERSION } from "./protocol";
 
 /** Options for {@link startRelayServer}. */
 export interface RelayServerOptions {
+	/** Port to listen on; 0 picks a free one (see {@link RelayServer.port}). */
 	port: number;
 	/** Shared secret the extension must present as `?token=`; unset disables the check. */
 	token?: string;
 	/** Group tabs the agent actively drives under one per-window Chrome tab group (default on); `false` disables. */
 	group?: boolean | { title: string; color: string };
+	/** Binding file naming the one extension install this relay serves; default `~/.omp/browser-relay/binding.json`. */
+	bindingPath?: string;
 	log?: (message: string, data?: Record<string, unknown>) => void;
 }
 
-/** Body of the 503 `/json/version` answer while no extension is connected. */
+/** Body of the 503 `/json/version` answer while the relay is not ready. */
 export interface RelayUnavailableInfo {
 	error: string;
 	/** An extension completed the hello handshake at least once in this server's lifetime. */
 	extensionSeen: boolean;
 	/** Milliseconds this server has been listening. */
 	uptimeMs: number;
+	/** Protocol this relay speaks; relays without the field (stock/legacy builds) are protocol 1. */
+	relayProtocol: number;
+	/** Why readiness is missing; absent when no extension has connected. */
+	reason?: RelayUnavailableReason;
+	/** Present while the connected extension is older than this relay requires. */
+	extensionIncompatible?: { version: string; required: string };
+	profileBinding: ProfileBindingInfo;
+	/** With `reason: "profile-mismatch"`: the bound install was connected earlier in this server's lifetime, so it may revive. */
+	boundSeen?: boolean;
 }
 
 /** A running relay server. */
@@ -69,7 +87,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	const log = opts.log ?? (() => {});
 	const group =
 		opts.group === false ? null : opts.group === true || opts.group === undefined ? DEFAULT_GROUP : opts.group;
-	const bridge = new RelayBridge({ log, group });
+	const bridge = new RelayBridge({ log, group, bindingPath: opts.bindingPath });
 	const sockets = new Set<RelayWebSocket>();
 	const startedAt = Date.now();
 
@@ -77,7 +95,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 		hostname: "127.0.0.1",
 		port: opts.port,
 		fetch(req, srv): Response | undefined {
-			const fallback = `127.0.0.1:${opts.port}`;
+			const fallback = `127.0.0.1:${srv.port}`;
 			const rawHost = req.headers.get("host")?.trim();
 			const host = rawHost && isWsAuthority(rawHost) ? rawHost : fallback;
 			const requestUrl =
@@ -108,15 +126,21 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 			}
 			if (req.method !== "GET") return new Response("Method not allowed", { status: 405 });
 			if (path === "/json/version") {
+				bridge.refreshBinding();
 				if (!bridge.ready) {
 					const info: RelayUnavailableInfo = {
-						error: "relay extension is not connected",
+						...bridge.unavailable(),
 						extensionSeen: bridge.extensionSeen,
 						uptimeMs: Date.now() - startedAt,
+						relayProtocol: RELAY_PROTOCOL_VERSION,
 					};
 					return Response.json(info, { status: 503 });
 				}
 				return Response.json(bridge.versionInfo(`ws://${host}/cdp`));
+			}
+			if (path === "/omp/binding") {
+				bridge.refreshBinding();
+				return Response.json(bridge.bindingInfo());
 			}
 			if (path === "/json" || path === "/json/list") {
 				return Response.json(bridge.listTargets());
@@ -162,10 +186,11 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 	}, WS_KEEPALIVE_MS);
 	keepalive.unref();
 
-	log("relay listening", { port: opts.port });
+	const port = server.port ?? opts.port;
+	log("relay listening", { port });
 	return {
 		bridge,
-		port: opts.port,
+		port,
 		stop() {
 			clearInterval(keepalive);
 			server.stop(true);

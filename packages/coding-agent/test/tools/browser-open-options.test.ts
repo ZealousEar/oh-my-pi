@@ -10,13 +10,14 @@ import { buildHeadlessLaunchArgs } from "@oh-my-pi/pi-coding-agent/tools/browser
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { Page } from "puppeteer-core";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const tempDirs: string[] = [];
 
 function browserHost(cwd: string = process.cwd()) {
-	const session: ToolSession = {
+	const session: ToolSession = grantBrowserFixtureScope({
 		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
@@ -27,7 +28,7 @@ function browserHost(cwd: string = process.cwd()) {
 			"browser.cmux": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown) =>
 		prelude.invoke(parameters, { session, toolCallId: `browser-open-options-${crypto.randomUUID()}` });

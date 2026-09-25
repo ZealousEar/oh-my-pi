@@ -85,6 +85,24 @@ type ClickOptions = DeliveryOptions & { button?: string; count?: number; modifie
 type DragOptions = DeliveryOptions & { modifiers?: string[] };
 type ScrollOptions = DeliveryOptions & { dx?: number; dy?: number };
 type AxOptions = Pick<AxSnapshotOptions, "all" | "maxDepth">;
+type ObserveOptions = { maxNodes?: number };
+
+/** Structured accessibility observation of one window: live geometry plus queried nodes. */
+interface WindowObservation {
+	/** Null once the window is gone from the live roster. */
+	window: {
+		id: string;
+		app: string;
+		title: string;
+		pid?: number;
+		bounds: { x: number; y: number; width: number; height: number };
+		focused: boolean;
+	} | null;
+	nodes: AxNode[];
+	nodeCount: number;
+	/** The query hit `maxNodes`, so the node list is partial. */
+	truncated: boolean;
+}
 
 type PendingTool = { resolve(value: unknown): void; reject(reason?: unknown): void };
 interface ActiveRun {
@@ -400,6 +418,37 @@ class Win {
 	async ax(options?: AxOptions): Promise<string> {
 		const { signal } = this.#getContext();
 		return (await nativeCall(signal, () => this.#session.axSnapshot(this.id, options))).text;
+	}
+
+	/**
+	 * One structured observation of this window: refreshed geometry from the live
+	 * window roster plus every accessibility node the query returns, with value,
+	 * frame, and action names intact. Unlike `ax()` this returns data instead of
+	 * a text tree, and unlike `find()` it reports how many nodes were seen and
+	 * whether the node cap truncated them. Reads only; refs stay valid because a
+	 * query does not begin a new snapshot generation.
+	 */
+	async observe(options?: ObserveOptions): Promise<WindowObservation> {
+		const { signal } = this.#getContext();
+		const limit = Math.max(1, Math.min(1_000, Math.trunc(options?.maxNodes ?? 400)));
+		const live = (await nativeCall(signal, () => this.#session.listWindows())).find(
+			candidate => candidate.id === this.id,
+		);
+		if (!live) return { window: null, nodes: [], nodeCount: 0, truncated: false };
+		const nodes = await nativeCall(signal, () => this.#session.axQuery(this.id, { limit }));
+		return {
+			window: {
+				id: live.id,
+				app: live.app,
+				title: live.title,
+				pid: live.pid,
+				bounds: { x: live.x, y: live.y, width: live.width, height: live.height },
+				focused: live.focused,
+			},
+			nodes,
+			nodeCount: nodes.length,
+			truncated: nodes.length >= limit,
+		};
 	}
 
 	async find(query: AxQuery): Promise<El[]> {

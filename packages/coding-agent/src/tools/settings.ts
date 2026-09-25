@@ -9,6 +9,22 @@ import { cfgTaskMaxRecursionDepth } from "../task/settings";
 
 const EMPTY_STRING_ARRAY: string[] = [];
 
+/** Pre-authorized automation capability (`browser.permissions.grants`, `computer.permissions.grants`); loaded only from user-owned settings. */
+export interface AutomationPermissionGrantSetting {
+	targets: string[];
+	actions: string[];
+	consequential?: boolean;
+	ttlMinutes?: number;
+	task?: string;
+	valueFingerprints?: string[];
+	rawAccess?: "broad";
+	codeFingerprints?: string[];
+	browserAppAccess?: "broad";
+	desktopAccess?: "broad";
+}
+
+export const EMPTY_AUTOMATION_PERMISSION_GRANTS: AutomationPermissionGrantSetting[] = [];
+
 export const cfgToolsArtifactSpillThreshold = register({
 	id: "tools.artifactSpillThreshold",
 	type: "number",
@@ -286,7 +302,7 @@ export const cfgToolsApproval = register({
 // Default tool approval mode (interaction tab, but governs the tool wrapper).
 //   "always-ask" — auto-approves read-tier tools only; prompts for write/exec.
 //   "write"      — auto-approves read and write-tier tools; prompts for exec.
-//   "yolo"       — auto-approves every tier.
+//   "yolo"       — auto-approves every tier except browser/computer mutations, which always require a scope.
 export const cfgToolsApprovalMode = register({
 	id: "tools.approvalMode",
 	type: "enum",
@@ -297,7 +313,7 @@ export const cfgToolsApprovalMode = register({
 		group: "Approvals",
 		label: "Tool Approval",
 		description:
-			"Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves all tiers; user policy may still prompt or block.",
+			"Default approval behavior for tool calls. 'Always ask' auto-approves read-only tools only. 'Write' auto-approves read and workspace-write tools. 'Yolo' auto-approves other exec tiers, but browser/computer mutations still require an explicit user-granted automation capability.",
 		options: [
 			{
 				value: "always-ask",
@@ -314,7 +330,7 @@ export const cfgToolsApprovalMode = register({
 				value: "yolo",
 				label: "Yolo",
 				description:
-					"Auto-approve read, write, and exec tools. User policy can still require confirmation or block calls.",
+					"Auto-approve read, write, and other exec tools. Browser/computer mutations still require an explicit user-granted capability.",
 			},
 		],
 	},
@@ -519,6 +535,67 @@ export const cfgFindEnabled = register({
 	},
 });
 
+// Semantic find (bounded-file mode)
+export const cfgSemanticFindMaxFiles = register({
+	id: "semanticFind.maxFiles",
+	type: "number",
+	default: 24,
+	ui: {
+		tab: "tools",
+		group: "Semantic Find",
+		label: "Max Files",
+		description: "Maximum number of files or resources `find` (bounded `paths` mode) may read in one call",
+	},
+});
+
+export const cfgSemanticFindMaxBytesPerFile = register({
+	id: "semanticFind.maxBytesPerFile",
+	type: "number",
+	default: 262144,
+	ui: {
+		tab: "tools",
+		group: "Semantic Find",
+		label: "Max Bytes Per File",
+		description: "Files larger than this are skipped by `find` (bounded `paths` mode) rather than partially read",
+	},
+});
+
+export const cfgSemanticFindMaxPassages = register({
+	id: "semanticFind.maxPassages",
+	type: "number",
+	default: 2000,
+	ui: {
+		tab: "tools",
+		group: "Semantic Find",
+		label: "Max Passages",
+		description: "Total passage budget across all selected files; exceeding it is an error asking to narrow",
+	},
+});
+
+export const cfgSemanticFindPassagesPerRequest = register({
+	id: "semanticFind.passagesPerRequest",
+	type: "number",
+	default: 200,
+	ui: {
+		tab: "tools",
+		group: "Semantic Find",
+		label: "Passages Per Request",
+		description: "Passages scored in one judgment window; capped at the 255-option choice limit",
+	},
+});
+
+export const cfgSemanticFindContextLines = register({
+	id: "semanticFind.contextLines",
+	type: "number",
+	default: 2,
+	ui: {
+		tab: "tools",
+		group: "Semantic Find",
+		label: "Context Lines",
+		description: "Lines of surrounding context rendered around each `find` (bounded `paths` mode) hit",
+	},
+});
+
 // Optional tools
 
 export const cfgDebugEnabled = register({
@@ -615,6 +692,119 @@ export const cfgComputerMaxHeight = register({
 		group: "Computer",
 		label: "Computer Screenshot Height",
 		description: "Maximum composite screenshot height in pixels",
+	},
+});
+
+export const cfgComputerPermissionsGrants = register({
+	id: "computer.permissions.grants",
+	type: "array",
+	default: EMPTY_AUTOMATION_PERMISSION_GRANTS,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Computer Permission Grants",
+		description:
+			'Pre-authorized exact desktop app/action capabilities. Targets cannot contain wildcards; consequential actions require consequential:true. Raw computer.run requires rawAccess:"broad" or an exact codeFingerprints entry. Browser apps (Chrome, Chromium, Safari, Firefox, Edge, Brave, Arc, Opera, Vivaldi) require browserAppAccess:"broad" because desktop control is app-wide, not site-confined. Root mouse/keyboard methods target "desktop" and require desktopAccess:"broad". Optional ttlMinutes expires a grant within this session.',
+	},
+});
+
+// computer.task (bounded desktop goal loop)
+export const cfgComputerTaskMaxActions = register({
+	id: "computer.task.maxActions",
+	type: "number",
+	default: 20,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Desktop Task Max Actions",
+		description: "Maximum desktop actions one computer.task goal loop may dispatch",
+	},
+});
+
+export const cfgComputerTaskMaxCalls = register({
+	id: "computer.task.maxCalls",
+	type: "number",
+	default: 50,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Desktop Task Max Judgment Calls",
+		description: "Maximum judgment calls one computer.task goal loop may make, failed calls included",
+	},
+});
+
+export const cfgComputerTaskDeadlineSec = register({
+	id: "computer.task.deadlineSec",
+	type: "number",
+	default: 120,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Desktop Task Deadline",
+		description: "Wall-clock budget for one computer.task goal loop, in seconds",
+	},
+});
+
+export const cfgComputerTaskAllowConsequential = register({
+	id: "computer.task.allowConsequential",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Desktop Task Consequential Actions",
+		description:
+			"Offer send/delete/purchase-class desktop actions to the goal loop by default; withheld unless a call passes allowConsequential",
+	},
+});
+
+export const cfgComputerDriverBin = register({
+	id: "computer.driverBin",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Cua Driver Executable",
+		description:
+			"Explicit path to the Cua Driver executable, overriding $CUA_DRIVER_BIN, the /Applications bundle, and PATH lookup. The daemon is never started by omp",
+	},
+});
+
+export const cfgComputerTaskBackend = register({
+	id: "computer.task.backend",
+	type: "enum",
+	values: ["auto", "native", "cua"] as const,
+	default: "auto",
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Desktop Task Backend",
+		description:
+			"Which backend computer.task drives. 'auto' uses the Cua Driver when it is installed, at least the required version, its daemon is running, and both macOS grants are present, otherwise the native accessibility backend. 'native' never touches the driver. 'cua' requires the driver and fails closed with the exact missing prerequisites.",
+		options: [
+			{ value: "auto", label: "Auto (Cua Driver when usable)", description: "Default" },
+			{ value: "native", label: "Native accessibility" },
+			{ value: "cua", label: "Cua Driver (required)" },
+		],
+	},
+});
+
+export const cfgComputerCuaTelemetry = register({
+	id: "computer.cua.telemetry",
+	type: "enum",
+	values: ["off", "driver"] as const,
+	default: "off",
+	ui: {
+		tab: "tools",
+		group: "Computer",
+		label: "Cua Driver Telemetry",
+		description:
+			"Telemetry policy for the cua-driver processes omp spawns. 'off' sets CUA_DRIVER_RS_TELEMETRY_ENABLED=false on each spawned process (the driver's documented per-process override; no global preference is changed). 'driver' leaves the driver's own persisted telemetry preference in force.",
+		options: [
+			{ value: "off", label: "Off for spawned processes", description: "Default" },
+			{ value: "driver", label: "Driver's own preference" },
+		],
 	},
 });
 
@@ -841,6 +1031,15 @@ export const cfgToolsMaxTimeout = register({
 	},
 });
 
+// Bounded runs: absolute wall-clock cap for one eval or bash call, including time an eval
+// cell spends paused on agent()/completion() waits and bash calls with `timeout: 0`.
+// Unlike the per-tool `timeout`, it is never paused or disabled per call. 0 disables.
+export const cfgToolsWallCapMs = register({
+	id: "tools.wallCapMs",
+	type: "number",
+	default: 3_600_000,
+});
+
 // Async jobs. RPC hosts start from the neutral background-job defaults (`protocolDefault`), as do the
 // bash/eval auto-background settings.
 export const cfgAsyncEnabled = register({
@@ -861,6 +1060,14 @@ export const cfgAsyncMaxJobs = register({
 	protocolDefault: ["rpc"],
 	type: "number",
 	default: 100,
+});
+
+// Bounded runs: one owner-visible warning when a running async job (bash, eval, task)
+// produces no progress for this long. 0 disables. Warns once per job.
+export const cfgAsyncNoProgressWarnMs = register({
+	id: "async.noProgressWarnMs",
+	type: "number",
+	default: 60_000,
 });
 
 export const cfgToolsXdev = register({

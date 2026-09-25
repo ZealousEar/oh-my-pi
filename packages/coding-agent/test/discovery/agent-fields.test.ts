@@ -209,4 +209,14 @@ describe("parseAgentFields", () => {
 		expect(parseAgentFields({ name: "worker", description: "desc", advisor: "  " })?.advisor).toBeUndefined();
 		expect(parseAgentFields({ name: "worker", description: "desc" })?.advisor).toBeUndefined();
 	});
+
+	test("distinguishes skills none/all/allowlist", () => {
+		const skillsOf = (skills: unknown) => parseAgentFields({ name: "worker", description: "desc", skills })?.skills;
+		expect(skillsOf("none")).toEqual([]);
+		expect(skillsOf([])).toEqual([]);
+		expect(skillsOf("all")).toBeUndefined();
+		expect(skillsOf(undefined)).toBeUndefined();
+		expect(skillsOf("converge, decision-writing")).toEqual(["converge", "decision-writing"]);
+		expect(skillsOf(["none", "converge"])).toEqual(["none", "converge"]);
+	});
 });

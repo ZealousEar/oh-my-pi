@@ -15,6 +15,8 @@ Both are persisted as session entries and converted back into user-context messa
 - `packages/agent/src/compaction/pruning.ts`
 - `packages/agent/src/compaction/compaction-v2-streaming.ts` (provider-native streaming compaction)
 - `packages/agent/src/compaction/shake.ts` (mechanical content elision)
+- `packages/coding-agent/src/reduction/semantic-shake.ts` (semantic shake: judged selection of tool results still needed by the goal)
+- `packages/coding-agent/src/reduction/contract.ts` (shared reduction receipt, egress policy, judge admission)
 - `packages/agent/src/compaction/utils.ts`
 - `packages/agent/src/compaction/openai.ts`
 - `packages/coding-agent/src/session/session-manager.ts`
@@ -192,6 +194,41 @@ store.[^experimental-context-history]
 Including `shake` in `compaction.methodOrder` performs an inline, local reduction instead of calling a summarization model. It replaces eligible tool results and large fenced/XML blocks with recoverable `artifact://` references, using a protected recent-token window and minimum-savings threshold. Automatic shake emits the normal auto-compaction events with `action: "shake"`.
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
+
+### Semantic shake
+
+Semantic shake is a fast, recoverable pre-summary reduction that removes nothing on its own authority. Behind the auto-shake protect window, every eligible tool result is a candidate; a candidate is elided to the same recoverable `artifact://` placeholder mechanical `shake` uses **only when an answered judgment, given the person's task, says the task no longer needs it**. Everything a judgment did not clear stays exactly as it was: protected evidence, uncertain answers, duplicates of kept results, and every result the judge could not be asked about. Large fenced/XML blocks are never touched in this mode — `/shake elide` remains the explicit mechanical choice for those. A recoverable archive is recovery, not permission.
+
+It runs in two ways:
+
+- `/shake semantic` — an explicit operation; the summary line reports the selection (`[semantic: kept X of Y (…), elided N, C calls, T ms, …]`).
+- `compaction.methodOrder` containing `semantic-shake` (opt-in; not in the default order) — a threshold/overflow/incomplete/idle maintenance method. It emits the auto-compaction events with `action: "semantic-shake"`. When the pass leaves context above the recovery band it advances to the next configured method, and says so clearly: the end event's message reads like `Auto-semantic-shake: kept 7 of 9 (2 protected, 5 unjudged), elided 2, 0 calls, 3 ms, egress-disabled; still over threshold — falling back to shake.` — what was kept and why, what was elided, why no judgment ran (when none did), and the method that runs next (or that none is configured). On success the same measurement is emitted as a notice.
+
+**What is kept, and why.** Each candidate ends with one basis, counted in the selection receipt:
+
+- `protected` — decided in code, never sent: the tool result has `isError: true`, or any line of its text is a diagnostic or a verification receipt (`src/reduction/protection.ts`: `error`/`fail`/`panic`/`Traceback`, `TypeError:`-style class names, `[WARN]`/`ERROR:` tags, `12 pass`/`1 fail`, `exit code`, TAP markers). Kept verbatim (`keptProtected`).
+- `judge` with keep ≥ 0.5 — the judge said the task still needs it (`keptByJudge`).
+- `uncertain` — the judge answered in the band 0.35 ≤ keep < 0.5; keeping is the safe direction, and the region is asked again on the next pass (`keptUncertain`).
+- `duplicate` — identical contents to a judged result; it shares that decision, so a twin cleared by the judge is elided too (`keptDuplicate` when kept).
+- `cache` — decided by a judgment in an earlier pass of this session for the same task context and judge (counted with `keptByJudge`).
+- `unjudged` — no answer could be obtained, so it stays (`keptUnjudged`): egress off, no judge available, budget spent, pass aborted, text longer than 12 000 characters (the judge must see the complete text or nothing), no answer for the question, or no user request on the branch to judge against.
+- `elided` — only a `judge`/`cache`/`duplicate` decision with keep < 0.35 (`elided`).
+
+When no judgment ran at all, `selection.skipped` names why: `egress-disabled`, `judge-unavailable`, `budget-exhausted`, `aborted`, `context-unavailable`, or `archive-failed`.
+
+**Goal: the bounded task context.** The judge is asked whether finishing the person's task still needs each result, against four fields read locally from the branch after the latest compaction boundary (`src/reduction/task-context.ts`): `original_request` (head of the first user turn), `latest_request` (head of the latest user turn), `latest_reply` (tail of the latest assistant reply after it), and `standing_requirements` (sentences from any user turn that state a retention, counting, or standing constraint — `keep every…`, `how many…`, `never…`). Each request/reply field and the requirements as a whole are capped at `reduction.taskContextChars`. Earlier user turns that state no requirement are never sent; with no user turn on the branch at all (`coverage: none`) the pass makes no call and keeps everything (`context-unavailable`).
+
+**What an enabled profile sends.** Nothing leaves the machine unless `reduction.egress` is `selected`. With it enabled, each judgment request carries exactly: the askable candidates' complete text (after secret-placeholder obfuscation and heuristic credential redaction), the tool name and its call (`name(args)`, bounded to 300 characters), the token count, and the four goal fields above after the same egress preparation. Never the whole transcript, the system prompt, environment, session files, protected results, skill results, `skill://` or `artifact://` recovery reads, the plan file, or anything inside the protect window.
+
+**Policy lives in code.** The thresholds (keep ≥ 0.5, uncertain ≥ 0.35) and every protection rule are code; the judge never authorises anything beyond answering `keep_<i>`. Batches hold at most `compaction.semanticShake.maxRegionsPerCall` results, largest first, and the pass stops at `reduction.maxCallsPerPass` calls or `reduction.maxLatencyMs` wall clock; decisions already answered are applied and the remainder is kept `unjudged`.
+
+**Stable adopted view.** Decisive judgments (keep ≥ 0.5 or < 0.35) are cached per session, keyed by result content, the four goal fields, judge, and protect window. A result judged "keep" is asked again only when the task context changes — a new request, new progress, or a newly stated standing requirement; elided results carry `prunedAt` and are never re-offered. Identical results share one decision without a second question.
+
+**Settings.** `compaction.semanticShake.protectTokens` (default `16000`; the recent window never touched), `compaction.semanticShake.maxRegionsPerCall` (`12`); shared `reduction.egress` (`off`), `reduction.maxCallsPerPass` (`3`), `reduction.maxLatencyMs` (`4000`), `reduction.taskContextChars` (`2000`; bound of each goal field).
+
+**Recovery.** Cleared originals are archived to one session artifact before any placeholder is written; each placeholder embeds `artifact://<id> (region N)`, and the archive holds only the elided results. Semantic mode never proceeds without that archive: when the artifact cannot be written the pass leaves every result untouched and reports `archive-failed`.
+
+**Receipts.** Every candidate gets a `ReductionReceipt` (`src/reduction/contract.ts`): the tool call id, a content hash of the original text, the judgment attempts behind the decision with their usage, the wall clock of the pass, and the recovery locator. A kept receipt records `skipped: { reason: "no-useful-reduction", detail: "kept by <basis>" }` — or, for an unjudged result, the skip that prevented the question (`egress-disabled`, `budget-exhausted`, `facts-exceed-capacity`, …); a protected receipt lists the whole result under `protectedSpans`. An elided receipt records the whole result under `omittedSpans` with `reason: "judge"` and the judge's probability. `ShakeResult.receipts` returns them for every candidate; an elided tool result also persists its receipt as `details.shake` beside the placeholder, so a restarted session can still explain why the text is gone and where it lives.
 
 ### Snapcompact method
 
@@ -489,6 +526,7 @@ Defined in `packages/coding-agent/src/session/context-settings.ts`:
 - `compaction.enabled` = `true`
 - `compaction.experimentalContextManagement` = `false`. Opt-in persistent notes, branch-bound raw-history retrieval, and local context-window rollover; toggling it adds or removes `context_notes`/`new_context` in the running session.
 - `compaction.methodOrder` = `["remote", "snapcompact", "handoff", "shake", "soft"]`. `remote` uses provider-native server compaction (OpenAI Responses compact, Anthropic compaction beta) when available; unavailable or failed methods advance to the next preference.
+- `semantic-shake` is a selectable method that is not in the default order (see [Semantic shake](#semantic-shake)); `compaction.semanticShake.protectTokens` = `16000`, `compaction.semanticShake.maxRegionsPerCall` = `12`, and the shared `reduction.egress` = `"off"`, `reduction.maxCallsPerPass` = `3`, `reduction.maxLatencyMs` = `4000`, `reduction.taskContextChars` = `2000` bound it.
 - `compaction.asyncEnabled` = `true`. Async (speculative) compaction: when context enters the pre-threshold band `[threshold − lead, threshold)` (lead = `clamp(threshold × 0.125, 8192, 32000)`), maintenance starts a background summarization for the first configured LLM-backed method (`remote`, `handoff`, or `soft`) off a branch snapshot, isolated from the live turn by a side session id. The armed result is committed instantly when the threshold is actually crossed, hiding summarization latency; post-snapshot turns are appended after the summary unchanged. Armed results are discarded when the branch prefix changes (new compaction, reset boundary, `/tree` navigation), when a provider-native replay payload is no longer readable by the active model, or when context grows past `keepRecentTokens` since compute (a fresh speculation replaces it). Speculation is skipped while an extension registers `session_before_compact`. The status line pulses the auto-compact icon while a speculation runs and holds it in accent when a result is armed.
 - `compaction.reserveTokens` is unset by default. The compaction layer normally applies a `16384`-token floor and at least 15% of the context window; on small windows where that default would be impractical, budget checks use the 15% proportional reserve. An explicit configured reserve is honored.
 - `compaction.keepRecentTokens` = `20000`

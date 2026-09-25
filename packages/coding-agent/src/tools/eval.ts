@@ -16,11 +16,12 @@ import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
 import { type EvalPreludeDefinition, getEnabledEvalPreludes } from "../eval/preludes";
-import { prepareEvalSource } from "../eval/input";
+import { type PreparedEvalSource, prepareEvalSource } from "../eval/input";
 import type { BackendProbeOptions } from "../eval/probe";
 import { defaultEvalSessionId } from "../eval/session-id";
 import { EvalShadowCellSession } from "../eval/speculation/cell-session";
 import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
+import { WallCapTimeoutError } from "../eval/wall-cap";
 import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalAgentsTopic from "../prompts/tools/eval-agents.md" with { type: "text" };
@@ -59,7 +60,7 @@ import {
 	cfgEvalToolsEnabled,
 } from "../eval/settings";
 import { cfgTaskMaxRecursionDepth } from "../task/settings";
-import { cfgToolsMaxTimeout } from "./settings";
+import { cfgToolsMaxTimeout, cfgToolsWallCapMs } from "./settings";
 
 /** Language tokens the eval tool accepts, in stable display order. */
 export type EvalLanguageToken = "py" | "js";
@@ -103,7 +104,9 @@ function enabledEvalLanguages(backends: EvalBackendsAllowance): EvalLanguageToke
 const evalCellCommonFields = {
 	code: type("string").describe("Code or standalone % command; top-level await works."),
 	"title?": type("string").describe("Short transcript label."),
-	"timeout?": type("number").describe("Cell deadline in seconds; 0 disables it."),
+	"timeout?": type("number").describe(
+		"Cell deadline in seconds; 0 disables it (the session wall-clock cap still applies).",
+	),
 	"reset?": type("boolean").describe("Wipe only this kernel."),
 };
 
@@ -312,6 +315,49 @@ function detailsNotice(cells: ResolvedEvalCell[]): string | undefined {
 	return notices.length > 0 ? notices.join(" ") : undefined;
 }
 
+/**
+ * Non-pausable absolute deadline for one eval call (`tools.wallCapMs`).
+ *
+ * Unlike {@link IdleTimeout}, this keeps counting while the cell is parked on
+ * `agent()`/`judge()` bridge waits and is not lifted by `timeout: 0`. It is
+ * armed before backend discovery and lives until the cell settles, so it
+ * bounds the whole call even after it converts into a background job.
+ */
+class EvalWallCap {
+	readonly #controller = new AbortController();
+	readonly #timer: NodeJS.Timeout;
+	readonly capMs: number;
+
+	constructor(capMs: number) {
+		this.capMs = capMs;
+		this.#timer = setTimeout(
+			() => this.#controller.abort(new WallCapTimeoutError(capMs)),
+			// setTimeout wraps delays beyond int32 to 1ms; a cap that large is
+			// effectively "never", so pin it at the ceiling instead.
+			Math.min(capMs, 2_147_483_647),
+		);
+		this.#timer.unref?.();
+	}
+
+	/** Aborts with a `TimeoutError` reason once the cap elapses. */
+	get signal(): AbortSignal {
+		return this.#controller.signal;
+	}
+
+	get fired(): boolean {
+		return this.#controller.signal.aborted;
+	}
+
+	dispose(): void {
+		clearTimeout(this.#timer);
+	}
+}
+
+function formatEvalWallCapNotice(capMs: number): string {
+	const secs = Math.max(1, Math.round(capMs / 1000));
+	return `Wall-clock cap hit: tools.wallCapMs=${capMs} (${secs}s) elapsed since this eval call started. The cap keeps counting during agent()/judge() waits and is not lifted by timeout: 0; the cell was cancelled and any output above is partial.`;
+}
+
 async function resolveBackend(
 	session: ToolSession,
 	language: EvalLanguage,
@@ -518,8 +564,21 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			params.timeout === 0
 				? 0
 				: clampTimeout("eval", params.timeout, cfgToolsMaxTimeout.get(session.settings)) * 1000;
-		const resolved = await resolveBackend(session, cellLanguage, { signal, timeoutMs: cellTimeoutMs });
-		const source = await prepareEvalSource(params, session, signal);
+		// The wall cap is armed here, before backend discovery, so a `timeout: 0`
+		// call (which leaves the probe unbounded) is still finite; it is disposed
+		// once the cell settles, which for a backgrounded cell is inside the job.
+		const wallCapMs = cfgToolsWallCapMs.get(session.settings);
+		const wallCap = Number.isFinite(wallCapMs) && wallCapMs > 0 ? new EvalWallCap(Math.floor(wallCapMs)) : undefined;
+		const setupSignal = wallCap ? (signal ? AbortSignal.any([signal, wallCap.signal]) : wallCap.signal) : signal;
+		let resolved: ResolvedBackend;
+		let source: PreparedEvalSource;
+		try {
+			resolved = await resolveBackend(session, cellLanguage, { signal: setupSignal, timeoutMs: cellTimeoutMs });
+			source = await prepareEvalSource(params, session, setupSignal);
+		} catch (error) {
+			wallCap?.dispose();
+			throw error;
+		}
 		if (shadowCell && (source.filename || source.packages?.length || source.environment)) {
 			await shadowCell.discard("file-backed or environment-changing eval requires authoritative execution");
 		}
@@ -576,8 +635,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					excludeWebP,
 					signal: runSignal,
 					sessionAbortController,
+					wallCap,
 					emitUpdate,
-				}),
+				}).finally(() => wallCap?.dispose()),
 			);
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
 		};
@@ -650,7 +710,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					throw error;
 				}
 			},
-			{ ownerId: session.getAgentId?.() ?? undefined, foreground: !startBackgrounded },
+			{
+				ownerId: session.getAgentId?.() ?? undefined,
+				foreground: !startBackgrounded,
+				timeoutMs: clampedCellTimeoutMs ?? wallCap?.capMs,
+			},
 		);
 
 		if (startBackgrounded) {
@@ -744,9 +808,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		excludeWebP: boolean | undefined;
 		signal: AbortSignal | undefined;
 		sessionAbortController: AbortController;
+		/** Per-call absolute deadline; never paused, unlike the per-cell idle watchdog. */
+		wallCap: EvalWallCap | undefined;
 		emitUpdate?: (text: string, details: EvalToolDetails) => void;
 	}): Promise<AgentToolResult<EvalToolDetails | undefined>> {
-		const { session, cells, languages, notice, excludeWebP, signal, sessionAbortController, emitUpdate } = options;
+		const { session, cells, languages, notice, excludeWebP, signal, sessionAbortController, wallCap, emitUpdate } =
+			options;
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
@@ -882,14 +949,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						? undefined
 						: clampTimeout("eval", cell.timeoutMs / 1000, cfgToolsMaxTimeout.get(session.settings)) * 1000;
 				const idle = idleTimeoutMs === undefined ? undefined : new IdleTimeout(idleTimeoutMs);
-				const combinedSignal =
-					signal && idle
-						? AbortSignal.any([signal, idle.signal, sessionAbortController.signal])
-						: signal
-							? AbortSignal.any([signal, sessionAbortController.signal])
-							: idle
-								? AbortSignal.any([idle.signal, sessionAbortController.signal])
-								: sessionAbortController.signal;
+				// Bridge pause/resume events touch only `idle`; the wall cap keeps
+				// counting so a cell parked on agent()/judge() stays finite.
+				const signals: AbortSignal[] = [sessionAbortController.signal];
+				if (signal) signals.push(signal);
+				if (idle) signals.push(idle.signal);
+				if (wallCap) signals.push(wallCap.signal);
+				const combinedSignal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 
 				const cellResult = cellResults[i];
 				cellResult.status = "running";
@@ -1029,7 +1095,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					pushUpdate();
 					const errorMsg = result.output || "Command aborted";
 					const combinedOutput = cellOutputs.join("\n\n");
-					const outputText = combinedOutput || errorMsg;
+					// Backends already annotate the timeout in their own terms (kernel
+					// interrupted, worker reset); state which limit fired on top so the
+					// model does not read it as the per-cell timeout.
+					const outputText = wallCap?.fired
+						? `${combinedOutput ? `${combinedOutput}\n\n` : ""}[${formatEvalWallCapNotice(wallCap.capMs)}]`
+						: combinedOutput || errorMsg;
 
 					const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 					commitDisplaySpills(summaryForMeta);

@@ -72,7 +72,8 @@ function parseShakeMode(args: string): ShakeMode | { error: string } {
 	if (verb === "" || verb === "elide") return "elide";
 	if (verb === "images") return "images";
 	if (verb === "thinking") return "thinking";
-	return { error: `Unknown /shake mode "${verb}". Use elide, images, or thinking.` };
+	if (verb === "semantic") return "semantic";
+	return { error: `Unknown /shake mode "${verb}". Use elide, images, thinking, or semantic.` };
 }
 
 /** Format the session's workspace directories (cwd + additional) for display. */
@@ -315,8 +316,13 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			{ name: "elide", description: "Strip tool results + large blocks (default)" },
 			{ name: "images", description: "Strip image blocks" },
 			{ name: "thinking", description: "Drop all thinking blocks" },
+			{
+				name: "semantic",
+				description:
+					"Elide only the tool results a bounded judgment, given the task, says are no longer needed; everything else stays",
+			},
 		],
-		acpInputHint: "[elide|images|thinking]",
+		acpInputHint: "[elide|images|thinking|semantic]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const mode = parseShakeMode(command.args);

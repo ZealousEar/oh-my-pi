@@ -7,6 +7,7 @@ import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -37,18 +38,21 @@ const crossHostUrl = `http://localhost:${server.port}`;
 const harPath = path.join(os.tmpdir(), `omp-browser-network-${process.pid}-${Date.now()}.har`);
 
 function createHost() {
-	const session: ToolSession = {
-		cwd: process.cwd(),
-		hasUI: false,
-		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
-		settings: Settings.isolated({
-			"browser.enabled": true,
-			"browser.headless": true,
-			"browser.cmux": false,
-			"tools.maxTimeout": 0,
-		}),
-	};
+	const session: ToolSession = grantBrowserFixtureScope(
+		{
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({
+				"browser.enabled": true,
+				"browser.headless": true,
+				"browser.cmux": false,
+				"tools.maxTimeout": 0,
+			}),
+		},
+		loopbackOrigins(server.port),
+	);
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown) => prelude.invoke(parameters, { session, toolCallId: "browser-network-test" });
 }

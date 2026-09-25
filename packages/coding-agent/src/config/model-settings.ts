@@ -4,6 +4,8 @@
  */
 import { register } from "./registry";
 import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
+import type { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import type { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 /** Display metadata for one model tag. */
 export interface ModelTagDef {
@@ -16,10 +18,39 @@ export interface ModelTagDef {
 /** Model tags keyed by tag id (`modelTags`). */
 export type ModelTagsSettings = Record<string, ModelTagDef>;
 
+/**
+ * Value of the `defaultThinkingLevel` setting — a concrete thinking effort or the `auto`
+ * sentinel. Matches the setting's enum values (`[...THINKING_EFFORTS, AUTO_THINKING]`); notably
+ * narrower than `ConfiguredThinkingLevel`, which also admits `inherit` and `off`.
+ */
+export type DefaultThinkingLevel = (typeof THINKING_EFFORTS)[number] | typeof AUTO_THINKING;
+
+/**
+ * A saved, switchable permutation of model-role settings. Applied session-scoped from the
+ * /models Presets view (a runtime routing override; never persisted to the global or project
+ * layer). Definitions are stored under the `modelPresets` setting keyed by preset name.
+ */
+export interface ModelPresetV1 {
+	/** Schema version, for forward migration of stored presets. */
+	version: 1;
+	/** Role -> model selector, mirroring `modelRoles`. */
+	roles: Record<string, string>;
+	/** `retry.fallbackChains` snapshot; an empty record means "no chains". */
+	fallbackChains: Record<string, string[]>;
+	/** Quick-switch `cycleOrder` snapshot; an empty array means "no cycle". */
+	cycleOrder: string[];
+	/**
+	 * `defaultThinkingLevel` at capture; resolves roles without an explicit thinking suffix.
+	 * Restricted to the setting's enum — a concrete thinking effort or `auto`, never `inherit`/`off`.
+	 */
+	defaultThinkingLevel: DefaultThinkingLevel;
+}
+
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
+const EMPTY_MODEL_PRESETS: Record<string, ModelPresetV1> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
 
 // Auth broker — credentials proxied through a remote `omp auth-broker serve`
@@ -97,6 +128,9 @@ export const cfgModelRoleStorage = register({
 export const cfgModelRoles = register({ id: "modelRoles", type: "record", default: EMPTY_STRING_RECORD });
 
 export const cfgModelTags = register({ id: "modelTags", type: "record", default: EMPTY_MODEL_TAGS_RECORD });
+
+/** Named routing snapshots ({@link ModelPresetV1}); values stay opaque until `parseModelPreset` validates a load. */
+export const cfgModelPresets = register({ id: "modelPresets", type: "record", default: EMPTY_MODEL_PRESETS });
 
 export const cfgModelProviderOrder = register({ id: "modelProviderOrder", type: "array", default: EMPTY_STRING_ARRAY });
 

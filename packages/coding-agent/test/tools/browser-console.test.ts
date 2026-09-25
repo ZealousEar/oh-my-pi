@@ -8,11 +8,12 @@ import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-console-"));
-const session: ToolSession = {
+const session: ToolSession = grantBrowserFixtureScope({
 	cwd: root,
 	hasUI: false,
 	getSessionFile: () => null,
@@ -23,7 +24,7 @@ const session: ToolSession = {
 		"browser.cmux": false,
 		"tools.maxTimeout": 0,
 	}),
-};
+});
 const prelude = createBrowserPrelude(session);
 const context = { session, toolCallId: "browser-console-test" };
 

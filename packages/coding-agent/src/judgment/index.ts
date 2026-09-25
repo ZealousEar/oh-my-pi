@@ -28,9 +28,15 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
+import {
+	formatModelString,
+	formatModelStringWithRouting,
+	resolveRoleChain,
+	type RoleChainCandidate,
+} from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
+import { cfgRetryFallbackChains } from "../session/settings";
 import type { SessionManager } from "../session/session-manager";
 import { getTinyLocalModelSpec } from "../tiny/models";
 import localPromptTemplate from "../prompts/system/judgment-local.md" with { type: "text" };
@@ -116,20 +122,69 @@ export type JudgeKind = "native" | "local" | "online";
 export function kindOf(candidate: RoleChainCandidate): JudgeKind;
 export function kindOf(model: Model): JudgeKind;
 export function kindOf(value: RoleChainCandidate | Model): JudgeKind {
-	const model = "model" in value ? value.model : value;
-	if (isJudgmentApi(model.api)) return "native";
-	if (model.api === "local-inference") return "local";
+	return kindOfApi(("model" in value ? value.model : value).api);
+}
+
+/** Classify an answering transport by API: the backend a result or attempt actually came from. */
+export function kindOfApi(api: string): JudgeKind {
+	if (isJudgmentApi(api as Model["api"])) return "native";
+	if (api === "local-inference") return "local";
 	return "online";
+}
+
+/**
+ * One underlying transport attempt behind a judgment: a native request (with
+ * `error` when it failed), a chat completion the text judge made (a billed
+ * completion whose answer was rejected carries no `error`; the caller marks
+ * it), or a candidate that failed before its transport reported anything.
+ * Failed attempts carry zero usage unless the transport reported some.
+ */
+export interface JudgmentAttempt {
+	api: string;
+	provider: string;
+	model: string;
+	usage: Usage;
+	durationMs: number;
+	error?: string;
+}
+
+export interface ChainJudgeOptions extends JudgeOptions {
+	/** Receives one event per transport attempt, in order; the final result is unaffected. */
+	onAttempt?: (attempt: JudgmentAttempt) => void;
+}
+
+/**
+ * The judge role's exact pin: `modelRoles.judge` names one literal
+ * `provider/id` and `retry.fallbackChains.judge` is an explicit empty list.
+ * A pinned judge admits no substitute — not a fuzzy catalog match, not the
+ * default role fallbacks, not the session model — so a pin whose model is
+ * undiscovered, uncredentialed, or failing fails closed. Supersedes the fork's
+ * `providers.typesafeModel` / `providers.judgmentFallback: none`.
+ */
+export function judgePin(settings: Settings): string | undefined {
+	const chain = cfgRetryFallbackChains.get(settings).judge;
+	if (!Array.isArray(chain) || chain.length !== 0) return undefined;
+	const configured = settings.getModelRole("judge")?.trim();
+	if (!configured || configured.startsWith("@") || !configured.includes("/") || /[*?]/.test(configured)) {
+		return undefined;
+	}
+	return configured;
 }
 
 /**
  * The `judge` role's candidates in attempt order, drawn from credentialed
  * judge-capable models. From the first native candidate on, only native
  * candidates remain: a prompted model never stands in for a failed native
- * judgment, whose calibrated probabilities it cannot reproduce.
+ * judgment, whose calibrated probabilities it cannot reproduce. Under an exact
+ * {@link judgePin} only the candidate whose identity equals the pin remains.
  */
 function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
 	const chain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry));
+	const pin = judgePin(settings);
+	if (pin !== undefined) {
+		const exact = chain.find(candidate => formatModelString(candidate.model) === pin);
+		return exact ? [exact] : [];
+	}
 	const firstNative = chain.findIndex(candidate => kindOf(candidate) === "native");
 	if (firstNative < 0) return chain;
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
@@ -165,14 +220,22 @@ export class ChainJudge implements Judge {
 		this.#deps = deps;
 	}
 
+	/** Exact `provider/id` the configuration pins the judge to; see {@link judgePin}. */
+	get pinnedModel(): string | undefined {
+		return judgePin(this.#deps.settings);
+	}
+
 	async judge<Q extends Questions>(
 		request: JudgmentRequest<Q>,
-		options: JudgeOptions = {},
+		options: ChainJudgeOptions = {},
 	): Promise<JudgmentResult<Q>> {
 		return this.withCandidate(candidate => candidate.judge(request, options), options);
 	}
 
-	async withCandidate<T>(run: (judge: Judge, kind: JudgeKind) => Promise<T>, options: JudgeOptions = {}): Promise<T> {
+	async withCandidate<T>(
+		run: (judge: Judge, kind: JudgeKind) => Promise<T>,
+		options: ChainJudgeOptions = {},
+	): Promise<T> {
 		const signal = options.signal;
 		let lastFailure: string | undefined;
 		let lastUnavailable: string | undefined;
@@ -191,21 +254,42 @@ export class ChainJudge implements Judge {
 				}
 				rejections.delete(identity);
 			}
+			const startedAt = Date.now();
+			let reported = 0;
+			const onAttempt = options.onAttempt
+				? (attempt: JudgmentAttempt): void => {
+						reported++;
+						options.onAttempt?.(attempt);
+					}
+				: undefined;
 			try {
-				const judge = await this.#createJudge(candidate, signal);
+				const judge = await this.#createJudge(candidate, signal, onAttempt);
 				if (!judge) {
 					lastUnavailable = `no API key for ${candidate.model.provider}/${candidate.model.id}`;
 					continue;
 				}
 				return await run(judge, kindOf(candidate));
 			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				// A candidate that failed before its transport reported anything
+				// (key resolution, backend construction) is still one tried candidate.
+				if (onAttempt && reported === 0) {
+					onAttempt({
+						api: candidate.model.api,
+						provider: candidate.model.provider,
+						model: candidate.model.id,
+						usage: tokenUsage(0, 0),
+						durationMs: Date.now() - startedAt,
+						error: message,
+					});
+				}
 				if (signal?.aborted) {
 					throw signal.reason instanceof Error ? signal.reason : new AIError.AbortError("judgment aborted");
 				}
 				if (isAbortOrTimeout(error)) throw error;
 				const rejected = isAccountRejection(error);
 				if (rejected) rejections.set(identity, Date.now() + CANDIDATE_REJECTION_COOLDOWN_MS);
-				lastFailure = error instanceof Error ? error.message : String(error);
+				lastFailure = message;
 				logger.warn("judgment candidate failed", {
 					candidate: identity,
 					status: AIError.status(error),
@@ -214,8 +298,35 @@ export class ChainJudge implements Judge {
 				});
 			}
 		}
-		if (candidates.length === 0) throw new Error("judgment: no judge model available");
+		if (candidates.length === 0) {
+			const pin = this.pinnedModel;
+			if (pin !== undefined) {
+				throw new Error(
+					`judgment: pinned judge ${pin} is unavailable (${this.#describePinGap(pin)}); ` +
+						"the exact pin with an empty retry.fallbackChains.judge admits no substitute",
+				);
+			}
+			throw new Error("judgment: no judge model available");
+		}
 		throw new Error(`judgment: every judge candidate failed: ${lastFailure ?? lastUnavailable ?? "unknown error"}`);
+	}
+
+	/** Why an exact pin resolved to nothing: not in the catalog, or catalogued but not admitted to the judge pool. */
+	#describePinGap(pin: string): string {
+		const { registry, settings } = this.#deps;
+		const [provider] = pin.split("/", 1);
+		const catalogued = registry.getAvailable("all").some(model => formatModelString(model) === pin);
+		if (catalogued) return "the model is catalogued but the judge role does not accept it";
+		const providerModels = registry.getAvailable("all").filter(model => model.provider === provider);
+		if (providerModels.length === 0) {
+			return `provider ${provider} lists no available models — check its credential, disabled-provider policy, and model discovery`;
+		}
+		const nearest = providerModels
+			.map(model => formatModelString(model))
+			.filter(identity => identity.startsWith(pin.slice(0, pin.lastIndexOf("-") + 1)))
+			.slice(0, 3);
+		const pool = roleCandidatePool("judge", settings, registry).length;
+		return `${provider} lists ${providerModels.length} model(s) but not this id${nearest.length > 0 ? `; nearest: ${nearest.join(", ")}` : ""}; judge pool size ${pool}`;
 	}
 
 	#rejections(): Map<string, number> {
@@ -234,7 +345,9 @@ export class ChainJudge implements Judge {
 	#buildCandidates(): RoleChainCandidate[] {
 		const { settings, registry, sessionModel } = this.#deps;
 		const candidates = judgeRoleChain(settings, registry);
-		if (!sessionModel || candidates.some(candidate => kindOf(candidate) === "native")) return candidates;
+		// An exact pin never gains the session model as a last resort.
+		if (!sessionModel || judgePin(settings) !== undefined) return candidates;
+		if (candidates.some(candidate => kindOf(candidate) === "native")) return candidates;
 		const sessionIdentity = formatModelStringWithRouting(sessionModel);
 		if (candidates.some(candidate => formatModelStringWithRouting(candidate.model) === sessionIdentity)) {
 			return candidates;
@@ -242,9 +355,13 @@ export class ChainJudge implements Judge {
 		return [...candidates, { model: sessionModel, explicit: false }];
 	}
 
-	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
+	async #createJudge(
+		candidate: RoleChainCandidate,
+		signal: AbortSignal | undefined,
+		onAttempt: ChainJudgeOptions["onAttempt"],
+	): Promise<Judge | undefined> {
 		const model = candidate.model;
-		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
+		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id, onAttempt));
 		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
 		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
 		if (isJudgmentApi(model.api)) {
@@ -257,15 +374,19 @@ export class ChainJudge implements Judge {
 				baseUrl: model.baseUrl,
 				headers,
 			});
-			return usageReportingTypeSafeJudge(judge, model, this.#deps.onUsage);
+			return usageReportingTypeSafeJudge(judge, model, this.#deps.onUsage, onAttempt);
 		}
 		// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
 		const metadata = this.#deps.metadataResolver?.(model.provider);
+		// Attempts are sequential within a candidate, so each one's duration is
+		// the gap since the previous attempt ended (or since the candidate began).
+		let attemptStartedAt = Date.now();
 		const backend = chatTextBackend(model, {
 			apiKey,
 			sessionId: this.#deps.sessionId,
 			metadata,
-			onAttempt: attempt =>
+			onAttempt: attempt => {
+				const now = Date.now();
 				this.#deps.onUsage?.({
 					role: "judge",
 					api: attempt.api,
@@ -274,7 +395,20 @@ export class ChainJudge implements Judge {
 					usage: attempt.usage,
 					stopReason: attempt.stopReason,
 					errorMessage: attempt.errorMessage,
-				}),
+				});
+				onAttempt?.({
+					api: attempt.api,
+					provider: attempt.provider,
+					model: attempt.model,
+					usage: attempt.usage,
+					durationMs: now - attemptStartedAt,
+					error:
+						attempt.stopReason === "error" || attempt.stopReason === "aborted"
+							? (attempt.errorMessage ?? attempt.stopReason)
+							: undefined,
+				});
+				attemptStartedAt = now;
+			},
 		});
 		return new TextJudge(backend);
 	}
@@ -287,25 +421,39 @@ class LocalTextBackend implements TextBackend {
 	readonly guardState = false;
 	readonly model: string;
 	readonly #reasoning: boolean;
+	readonly #onAttempt: ChainJudgeOptions["onAttempt"];
 
-	constructor(modelId: string) {
+	constructor(modelId: string, onAttempt?: ChainJudgeOptions["onAttempt"]) {
 		this.model = modelId;
 		this.#reasoning = getTinyLocalModelSpec(modelId)?.reasoning === true;
+		this.#onAttempt = onAttempt;
 	}
 
 	async complete(judgment: TextPrompt, options: JudgeOptions): Promise<TextCompletion> {
-		// Sub-2B models answer a bare user message as a question (or echo the
-		// system prompt); one merged turn ending in `Answer:` keeps them classifying.
-		const text = await tinyModelClient.complete(
-			this.model,
-			prompt.render(localPromptTemplate, { system: judgment.system, state: judgment.user }),
-			{
-				maxTokens: this.#reasoning ? LOCAL_REASONING_MAX_TOKENS : LOCAL_ANSWER_MAX_TOKENS,
-				signal: options.signal,
-			},
-		);
-		if (!text) throw new Error(`judgment: local model ${this.model} returned no output`);
-		return { text };
+		const startedAt = Date.now();
+		const attempt = { api: this.api, provider: this.provider, model: this.model, usage: tokenUsage(0, 0) };
+		try {
+			// Sub-2B models answer a bare user message as a question (or echo the
+			// system prompt); one merged turn ending in `Answer:` keeps them classifying.
+			const text = await tinyModelClient.complete(
+				this.model,
+				prompt.render(localPromptTemplate, { system: judgment.system, state: judgment.user }),
+				{
+					maxTokens: this.#reasoning ? LOCAL_REASONING_MAX_TOKENS : LOCAL_ANSWER_MAX_TOKENS,
+					signal: options.signal,
+				},
+			);
+			if (!text) throw new Error(`judgment: local model ${this.model} returned no output`);
+			this.#onAttempt?.({ ...attempt, durationMs: Date.now() - startedAt });
+			return { text };
+		} catch (error) {
+			this.#onAttempt?.({
+				...attempt,
+				durationMs: Date.now() - startedAt,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
+		}
 	}
 }
 
@@ -315,17 +463,24 @@ class LocalTextBackend implements TextBackend {
  * only, so a response without a billed amount is priced from the catalog
  * model; a route that bills (OpenRouter) keeps its reported cost.
  */
-function usageReportingTypeSafeJudge(judge: TypeSafeJudge, model: Model, onUsage: JudgeDeps["onUsage"]): Judge {
+function usageReportingTypeSafeJudge(
+	judge: TypeSafeJudge,
+	model: Model,
+	onUsage: JudgeDeps["onUsage"],
+	onAttempt: ChainJudgeOptions["onAttempt"],
+): Judge {
 	return {
 		label: judge.label,
 		async judge<Q extends Questions>(
 			request: JudgmentRequest<Q>,
 			options?: JudgeOptions,
 		): Promise<JudgmentResult<Q>> {
+			const startedAt = Date.now();
 			let result: JudgmentResult<Q>;
 			try {
 				result = await judge.judge(request, options);
 			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error);
 				onUsage?.({
 					role: TYPESAFE_PROVIDER,
 					api: judge.api,
@@ -333,7 +488,15 @@ function usageReportingTypeSafeJudge(judge: TypeSafeJudge, model: Model, onUsage
 					model: judge.model,
 					usage: tokenUsage(0, 0),
 					stopReason: isAbortOrTimeout(error) ? "aborted" : "error",
-					errorMessage: error instanceof Error ? error.message : String(error),
+					errorMessage,
+				});
+				onAttempt?.({
+					api: judge.api,
+					provider: judge.provider,
+					model: judge.model,
+					usage: tokenUsage(0, 0),
+					durationMs: Date.now() - startedAt,
+					error: errorMessage,
 				});
 				throw error;
 			}
@@ -345,6 +508,13 @@ function usageReportingTypeSafeJudge(judge: TypeSafeJudge, model: Model, onUsage
 				model: judge.model,
 				usage: result.usage,
 				stopReason: "stop",
+			});
+			onAttempt?.({
+				api: result.api,
+				provider: result.provider,
+				model: judge.model,
+				usage: result.usage,
+				durationMs: Date.now() - startedAt,
 			});
 			return result;
 		},

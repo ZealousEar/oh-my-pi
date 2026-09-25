@@ -501,6 +501,45 @@ disabledProviders:
 
 String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels`, `providers` for `disabledProviders`, or `values` for either.
 
+## Model presets
+
+A **model preset** is a saved, named permutation of your model-role setup. It captures the routing knobs you tune together — which model fills each role, the per-role fallback chains, the quick-switch cycle order, and the default thinking level — so you can flip between whole configurations (for example a "cheap/fast" set and a "max-quality" set) in one action.
+
+Manage presets from the `/models` hub under the **Presets** sidebar scope:
+
+- **Save current** — `s` snapshots the current effective configuration into a new named preset.
+- **Load** — `Enter` applies the selected preset (see semantics below).
+- **Delete** — `x` is an armed confirm: the first `x` (or backspace) arms the row ("press x again to delete") and a second `x` deletes it; navigating away disarms.
+
+### What a preset captures
+
+A preset stores exactly four things:
+
+- `modelRoles` — the effective role -> model-selector map
+- `retry.fallbackChains` — per-role fallback chains
+- `cycleOrder` — the quick-switch cycle
+- `defaultThinkingLevel` — the default reasoning effort
+
+It does **not** capture enabled models, provider order or provider config, model tags, or credentials. Those remain whatever your persisted layers resolve to; a preset only re-points roles and their routing.
+
+### Loading semantics
+
+Loading a preset applies it **session-scoped as a runtime routing override** — the highest-precedence, never-persisted layer (see [Settings precedence](./settings.md#precedence)). This means:
+
+- It takes effect **immediately** for the current session and beats every persisted or overlay layer (global, project, `--config`), so nothing lower can shadow it.
+- It is **never written to disk**. Restarting the session (or not re-applying the preset) reverts to your persisted configuration.
+- Roles omitted from the preset resolve to **auto-selection**. The role map is an exact replacement, not a merge: omitted roles stay absent even if discovered later by settings reload, project change, or a cwd-scoped settings clone. Editing one role does not resurrect unrelated lower-layer roles.
+- Fallback chains and the cycle order are **replaced exactly**: a preset with no chains clears every chain for the session instead of merging with chains from lower layers. The `retry.modelFallback` policy is unchanged, including an explicit `false`.
+- Application is **transactional and validated**: a malformed or unsupported-version preset is rejected outright, and before anything changes every captured role must resolve to an available, authenticated model (role aliases like `@slow` resolve against the preset's own role map). If validation fails, **nothing changes**; if the live model switch afterwards is rejected or throws, the runtime routing settings are **rolled back**. Restoring the prior live model and thinking level is then attempted on a best-effort basis; that restore can itself fail, and provider or session side effects from the attempted switch are not generally reversible.
+- While a preset's live switch is pending, the hub ignores keyboard and mouse input, including Escape, so edits cannot race a rollback. Input resumes when the transaction settles.
+- Later explicit role, fallback-chain, cycle, and thinking edits retain their normal persistence behavior and update the active routing plan immediately. Loading itself does not persist routing. An explicit runtime `override` or `clearOverride` of a routing setting releases preset linkage for that path.
+
+### The "matches current" badge
+
+A preset row shows a **matches current** badge when its captured configuration equals your current effective configuration (roles, chains, cycle order, and default thinking level). It marks equality, not an "active" state — presets are never persisted as active.
+
+Preset **definitions** live in the `modelPresets` setting (`ModelPresetV1`, `version: 1`): the `/models` view saves and deletes them per key in the **global** layer (other presets are never rewritten), while definitions from project or overlay layers are also listed and remain visible after a global delete. A queued save or delete does not overwrite a newer external edit to the same definition.
+
 ## `/model` and `omp models`
 
 Both surfaces keep provider-prefixed concrete models visible and selectable.

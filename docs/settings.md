@@ -736,6 +736,10 @@ task:
 - Agents without an entry — including agents spawned by an overridden agent — use the main session's `compaction.*` thresholds. The main session and Vibe workers are unaffected.
 - The resolved trigger is stored with the subagent session and reused when it is revived.
 
+- Recoverable context reduction (shared gate): `reduction.egress` (`off` default; `selected` lets semantic stages send the candidate spans or results, the command or tool call, and the bounded task context to the judgment backend after secret obfuscation and credential redaction — nothing leaves the machine otherwise), `reduction.maxCallsPerPass` (3), `reduction.maxLatencyMs` (4000), `reduction.taskContextChars` (2000; bound of each task-context field — original request, latest request, latest reply, standing requirement sentences — read locally from the session). See [bash](tools/bash.md#output-pruning) and [compaction](compaction.md#semantic-shake).
+- Bash output pruning: `bash.outputPruning.mode` (`off` default; `deterministic` removes recognised noise runs and repeated lines by rule when the task context allows it; `semantic` adds a bounded judgment over the remaining routine spans when `reduction.egress` is `selected`), `bash.outputPruning.minTokens` (1500; smaller outputs are never touched), `bash.outputPruning.maxSegments` (40 per judgment request). A stated retention or counting requirement keeps the whole output; without task context only content-free collapses run. The exact original is archived before anything is replaced and named once in the result footer.
+- Semantic shake: `compaction.semanticShake.protectTokens` (16000; the recent window never offered), `compaction.semanticShake.maxRegionsPerCall` (12); the goal fields the judge sees are bounded by the shared `reduction.taskContextChars`. Run it with `/shake semantic` or by listing `semantic-shake` in `compaction.methodOrder` (not in the default order); with `reduction.egress` off it keeps everything and the auto path falls back to the next method. `/shake elide` remains the explicit mechanical reduction.
+
 ### Appearance and terminal
 
 ```yaml
@@ -876,6 +880,7 @@ Every schema path not individually tabulated in this catalog is explicitly defer
 - Execution and content: `commit.*`, `completion.*`, `edit.*`, `error.*`, `extensionHandlers.*`, `generate_image.*`, `git.*`, `images.*`, `live.*`, `paste.*`, `power.*`, `read.*`, `shellMinimizer.*`, `speech.*`, `terminal.*`, and `title.*`.
 - Interface and startup: `display.*`, `statusLine.*`, `startup.*`, `stt.*`, `tui.*`, and `ttsr.*`.
 - Ungrouped keys: `setupVersion`, `proseOnlyThinking`, `omitThinking`, `externalThinking`, `includeWorkspaceTree`, `autocompleteMaxVisible`, `emojiAutocomplete`, `disabledExtensions`, `inlineToolDescriptors`, and `treeFilterMode`.
+- Skill recommendation (`recommend_skills`): `skills.recommend.enabled` (true), `skills.recommend.maxCandidatesPerRequest` (200, clamped to `3..254`: windows are balanced so none holds a single skill, and one slot of the 255-option judgment cap is reserved for the `none` choice), `skills.recommend.minRelevance` (0.1), `skills.recommend.cacheEntries` (64). The judge is the `judge` model role; see [recommend_skills](tools/recommend_skills.md).
 
 These settings follow the same schema-defined type and default rules shown above.
 

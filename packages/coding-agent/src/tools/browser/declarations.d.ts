@@ -13,6 +13,8 @@ interface BrowserAppOptions {
 	args?: string[];
 	/** URL/title substring used to select an attached tab. */
 	target?: string;
+	/** Relay/CDP only: create a fresh omp-owned tab (closed by `browser.close`) instead of adopting the user's visible tab. Mutually exclusive with `target`. */
+	new_tab?: boolean;
 }
 
 /** Requested browser page viewport. */
@@ -1582,6 +1584,145 @@ interface BrowserRunScope {
 	readonly assert: BrowserAssert;
 }
 
+/** Caller postconditions for `tab.task`; every supplied check must hold, and at least one is required for `done`. */
+interface BrowserTaskExpect {
+	/** The final URL must contain this substring. */
+	urlIncludes?: string;
+	/** The final visible page text must contain this substring. */
+	textIncludes?: string;
+	/** This selector must match a visible element at the end. */
+	selector?: string;
+}
+
+/** Options for one bounded goal-directed task. */
+interface BrowserTaskOptions {
+	/** What to accomplish on this tab. */
+	goal: string;
+	/**
+	 * Field values the caller authorizes, keyed by the field's label, placeholder,
+	 * or form name. A key is used only when it equals one of those exactly
+	 * (case, whitespace, and Unicode compatibility folded); unmatched keys are
+	 * reported in `unusedValues` and never typed.
+	 */
+	values?: Record<string, string>;
+	/** Checks that must pass before the result reports `done`; without any, the best status is `unverified`. */
+	expect?: BrowserTaskExpect;
+	/** Action bound; tightens `browser.task.maxActions`, never exceeds it. */
+	maxActions?: number;
+	/** Bound on metered calls (judgments plus text-helper completions); tightens `browser.task.maxCalls`, never exceeds it. */
+	maxCalls?: number;
+	/** Whole-task deadline in seconds; defaults to `browser.task.deadlineSec`. */
+	timeout?: number;
+	/**
+	 * Permit controls classified consequential (submit, pay, delete, confirm, share, publish, sign out, ...,
+	 * from the accessible name, visible text, aria-label, title, or select option; mixed-script names fail closed).
+	 */
+	allowConsequential?: boolean;
+}
+
+/** Which judge answered a step and how trustworthy its probabilities are. */
+interface BrowserTaskProvenance {
+	/** `native`, `local`, or `online`. */
+	backend: string;
+	label: string;
+	model: string;
+	/** `native` probabilities, or `synthetic` one-hot from a chat keyword. */
+	distribution: "native" | "synthetic";
+	fallback?: string;
+	costUsd: number | "unknown";
+	durationMs: number;
+	/** Confidence of the operation choice. */
+	confidence: number;
+	/** Probability the chosen target carried. */
+	probability: number;
+}
+
+/** One executed (or refused) step of a task. */
+interface BrowserTaskStep {
+	n: number;
+	operation: "CLICK" | "TYPE_TEXT" | "SELECT" | "SCROLL" | "WAIT" | "DONE" | "BLOCKED" | "ABSTAIN";
+	/** Candidate id inside the operation's target head. */
+	target?: string;
+	label: string;
+	/** `applied`, `rejected`, `stale`, or `unknown`. */
+	outcome: string;
+	/** For a refused consequential control: the keyword and which name carried it, or `unreadable label`. */
+	reason?: string;
+	/** `null` when the step performed no action. */
+	pageChanged: boolean | null;
+	ms: number;
+	text?: string;
+	textSource?: "values" | "model";
+	/** Set when this step's `unknown` outcome withheld the action from later decisions. */
+	quarantined?: true;
+	provenance: BrowserTaskProvenance;
+}
+
+/** Evidence gathered independently of the model's own DONE claim. */
+interface BrowserTaskVerification {
+	/** `true` only when a caller `expect` check held; `"unknown"` when none was supplied. */
+	verified: boolean | "unknown";
+	method: string;
+	detail?: string;
+}
+
+/** One remote attempt the task made: a judgment, a failed transport behind it, or a text-helper completion. */
+interface BrowserTaskAttempt {
+	backend: string;
+	label: string;
+	api: string;
+	provider: string;
+	model: string;
+	distribution: "native" | "synthetic";
+	fallback?: { from: string; reason?: string };
+	usage: { input: number; output: number; cost: { total: number } };
+	costUsd: number | "unknown";
+	durationMs: number;
+	/** 1-based logical call number; nested transport attempts share it. */
+	attempt: number;
+	/** Set when the attempt produced no answer. */
+	error?: string;
+	/** Set on a failed transport attempt behind a logical call. */
+	nested?: true;
+	/** Set on text-helper completions. */
+	helper?: string;
+}
+
+/** An action withheld after an `unknown` outcome. */
+interface BrowserTaskQuarantine {
+	operation: string;
+	label: string;
+	documentKey: string;
+	step: number;
+}
+
+/** Result of one `tab.task` run. */
+interface BrowserTaskResult {
+	status: "done" | "unverified" | "blocked" | "abstain" | "exhausted" | "error";
+	reason?: string;
+	goal: string;
+	tab: string;
+	steps: BrowserTaskStep[];
+	verification: BrowserTaskVerification;
+	/** How many atomic observations the loop took. */
+	observationRevisions: number;
+	budget: { calls: number; actions: number; elapsedMs: number; maxCalls: number; maxActions: number };
+	/** `calls` are logical metered calls; `attempts` counts transport attempts behind them. */
+	usage: { calls: number; attempts: number; input: number; output: number; costUsd: number | "unknown" };
+	/** Every remote attempt, failed and nested ones included. */
+	attempts: BrowserTaskAttempt[];
+	backend: { kind: string; label: string; model?: string; distribution?: string; fallback?: string };
+	/** `false` only when every derived candidate was offered to the judge. */
+	candidatesTruncated: boolean;
+	candidateFallback?: string;
+	/** Widget families present but not drivable (canvas, file upload, frames, shadow roots). */
+	unsupported?: string[];
+	/** `values` keys that matched no field exactly and were never typed; present when `values` was given. */
+	unusedValues?: string[];
+	/** Actions withheld after an `unknown` outcome. */
+	quarantined?: BrowserTaskQuarantine[];
+}
+
 /** A named browser tab handle returned by `browser.open` or `browser.tab`. */
 interface BrowserTab extends BrowserTabHelpers {
 	/** Immutable managed-tab name. */
@@ -1598,7 +1739,15 @@ interface BrowserTab extends BrowserTabHelpers {
 	ref(id: string): BrowserElement;
 	/** Return a child-frame proxy resolved by selector, name, or exact URL. */
 	frame(selectorOrNameOrUrl: string): BrowserFrame;
-	/** Run a serialized function in the tab runtime. */
+	/**
+	 * Run one bounded goal-directed task on this tab: atomic observation, one
+	 * typed judgment per step, guarded execution, independently verified
+	 * completion. Every mutation is authorized immediately before dispatch
+	 * against the current origin and exact action. Releases the tab when it
+	 * finishes unless it was opened with `persist: true`.
+	 */
+	task(options: BrowserTaskOptions): Promise<BrowserTaskResult>;
+	/** Run a serialized function in the tab runtime. Raw execution requires a whole-browser or exact-code capability. */
 	run<R, TArgs extends unknown[]>(
 		fn: (scope: BrowserRunScope, ...args: TArgs) => R | Promise<R>,
 		options?: BrowserRunOptions<TArgs>,

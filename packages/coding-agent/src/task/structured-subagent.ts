@@ -7,14 +7,22 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
+import { $env, getAgentDir, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { bucketRules } from "../capability/rule-buckets";
+import {
+	normalizeModelPatternList,
+	resolveAgentModelSelection,
+	resolveConfiguredModelPatterns,
+} from "../config/model-resolver";
 import {
 	type CompactionThresholdPair,
 	validateAgentCompactionThresholdOverrides,
 } from "../config/compaction-threshold";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
+import { TtsrManager } from "../export/ttsr";
+import { cfgTtsr } from "../export/ttsr-settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import type { Skill } from "../extensibility/skills";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -23,7 +31,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { resolveTaskEffortLevel, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -64,8 +72,18 @@ import {
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskIsolationMerge,
+	cfgTaskMaxEffort,
 	cfgTaskMaxRecursionDepth,
 } from "./settings";
+import { runPaneSubagent } from "./pane/herdr-backend";
+import {
+	PANE_PREREQUISITE_HINT,
+	type PaneCapabilityProbe,
+	preflightPaneBackend,
+	readPaneBackendConfig,
+	requestPaneBackend,
+} from "./pane/preflight";
+import { resolveSubagentToolPolicy } from "./subagent-tool-policy";
 
 /** Final structured completion metadata returned for a schema-bearing run. */
 export type StructuredSubagentSchemaResult = StructuredSubagentOutput;
@@ -143,6 +161,12 @@ export interface StructuredSubagentRequest {
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	signal?: AbortSignal;
+	/**
+	 * Per-spawn request for a visible pane-hosted child (see
+	 * `task.paneBackend`). Presence of `true` makes the pane backend mandatory:
+	 * a failed preflight is an error, not a silent native fallback.
+	 */
+	visible?: boolean;
 	onProgress?: (progress: AgentProgress) => void;
 }
 
@@ -454,11 +478,27 @@ async function leaseArtifacts(
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
-	const skills = [...(session.skills ?? [])];
+	const skills = listAgentSkills(session.skills ?? [], agent);
 	const autoloadSkills = agent.autoloadSkills?.length
 		? agent.autoloadSkills.map(name => skills.find(skill => skill.name === name)).filter(skill => skill !== undefined)
 		: [];
 	return { skills, autoloadSkills };
+}
+
+/**
+ * Applies the agent's `skills` allowlist to the rendered catalog. Unlisted skills are
+ * hidden on copies (the parent's objects are shared) and stay loadable via `skill://`.
+ */
+function listAgentSkills(parentSkills: readonly Skill[], agent: AgentDefinition): Skill[] {
+	const allowlist = agent.skills;
+	if (allowlist === undefined) return [...parentSkills];
+	const allowed = new Set(allowlist);
+	for (const name of allowed) {
+		if (!parentSkills.some(skill => skill.name === name)) {
+			logger.warn("Agent skills allowlist names an unavailable skill", { agent: agent.name, skill: name });
+		}
+	}
+	return parentSkills.map(skill => (allowed.has(skill.name) || skill.hide ? skill : { ...skill, hide: true }));
 }
 
 function buildExecutorOptions(
@@ -674,6 +714,144 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
 }
 
 /**
+ * Run this subagent in a visible HerdR pane when the spawn asks for one, or
+ * return undefined to keep the native in-process backend.
+ *
+ * The pane child is a separate interactive omp process, so every parent-side
+ * capability it cannot honour is rejected here rather than quietly lost. An
+ * explicit request (`visible: true`, `task.paneBackend=herdr`) that fails
+ * preflight is an error; only `auto` falls back to native.
+ */
+async function runPaneBackendIfRequested(args: {
+	request: StructuredSubagentRequest;
+	policy: EffectiveSubagentPolicy;
+	options: ExecutorOptions;
+	id: string;
+}): Promise<SingleResult | undefined> {
+	const { request, policy, options, id } = args;
+	const config = readPaneBackendConfig(request.session.settings);
+	const wanted = requestPaneBackend({
+		config,
+		...(request.visible !== undefined ? { visible: request.visible } : {}),
+	});
+	if (!wanted.use) return undefined;
+
+	const { effectiveAgent } = policy;
+	const capabilities: PaneCapabilityProbe = {
+		outputSchema: policy.schema.source !== "none",
+		isolated: policy.isIsolated,
+		customTools: (request.customTools?.length ?? 0) > 0,
+		// A declared spawn allowlist (and the matching self-recursion block) is
+		// enforced by the parent's own tool wiring. A fresh omp session in a pane
+		// has neither, so only the permissive bundled `*` policy survives; its
+		// depth budget is forwarded below as a settings overlay.
+		nestedSpawn:
+			Array.isArray(effectiveAgent.spawns) &&
+			canSpawnAtDepth(cfgTaskMaxRecursionDepth.get(request.session.settings), request.session.taskDepth ?? 0),
+		mcpProxies: options.enableMCP === true && (options.mcpManager?.getAllServerNames().length ?? 0) > 0,
+		advisor: Boolean(effectiveAgent.advisor),
+		prewalk: Boolean(effectiveAgent.prewalk),
+		restrictedSession: options.restrictToolNames === true,
+	};
+
+	// The child runs with exactly this process's agent dir, so preflight checks
+	// the integration there rather than wherever HerdR's own environment points.
+	const agentDir = getAgentDir();
+	const preflight = await preflightPaneBackend({
+		config,
+		cwd: options.cwd,
+		capabilities,
+		agentDir,
+		...(request.signal ? { signal: request.signal } : {}),
+	});
+	if (!preflight.ok) {
+		if (!wanted.strict) return undefined;
+		throw new StructuredSubagentError(
+			"preflight",
+			`${preflight.reason}. To run this subagent in a visible pane, ${PANE_PREREQUISITE_HINT}.`,
+		);
+	}
+
+	// The same tool and spawn contract the native executor computes: `task`
+	// added/removed by depth, `exec` expanded. Restricted parents were rejected
+	// by preflight above, so the child is an ordinary session; an explicit
+	// empty allowlist still reaches it as `[]`.
+	const toolPolicy = resolveSubagentToolPolicy({
+		agent: effectiveAgent,
+		settings: request.session.settings,
+		parentDepth: request.session.taskDepth ?? 0,
+	});
+	// A pane child starts at depth 0 in its own process, so its
+	// `task.maxRecursionDepth` is lowered to the budget the native child would
+	// have had at its real depth; a disabled spawn policy leaves it none.
+	const childMaxRecursionDepth =
+		toolPolicy.spawns === ""
+			? 0
+			: toolPolicy.maxRecursionDepth < 0
+				? undefined
+				: toolPolicy.maxRecursionDepth - toolPolicy.childDepth;
+	const patterns = normalizeModelPatternList(policy.modelOverride ?? effectiveAgent.model);
+	// Precedence mirrors the native executor: caller `effort` beats the agent's
+	// static selector. Without a resolved model the coarse effort maps over the
+	// canonical range; the child clamps it to what its model supports.
+	const thinkingLevel =
+		request.effort !== undefined
+			? resolveTaskEffortLevel(undefined, request.effort, cfgTaskMaxEffort.get(request.session.settings))
+			: effectiveAgent.thinkingLevel;
+	// A pane child is a fresh top-level omp process: it re-discovers unscoped
+	// rules from disk itself, but as `main`, so the parent's rules scoped to
+	// this agent never reach it. Bucket the parent's discovery result exactly
+	// as an in-process child would (same disable/builtin/TTSR precedence) and
+	// ship only the agent-scoped always-apply bodies, so nothing is duplicated.
+	const ttsrSettings = cfgTtsr.get(request.session.settings);
+	const { alwaysApplyRules } = bucketRules(options.rules ?? [], new TtsrManager(ttsrSettings), {
+		builtinRules: ttsrSettings.builtinRules,
+		disabledRules: ttsrSettings.disabledRules,
+		agentName: policy.agent.name.trim().toLowerCase(),
+	});
+	const scopedRules = alwaysApplyRules.filter(rule => rule.agents !== undefined && rule.agents.length > 0);
+	const outcome = await runPaneSubagent({
+		cli: preflight.cli,
+		target: preflight.target,
+		...(preflight.socketPath ? { socketPath: preflight.socketPath } : {}),
+		id,
+		index: request.index ?? 0,
+		agentName: policy.agent.name,
+		agentSource: policy.agent.source,
+		systemPrompt: effectiveAgent.systemPrompt,
+		...(scopedRules.length > 0 ? { rules: scopedRules.map(rule => rule.content) } : {}),
+		task: options.task,
+		assignment: options.assignment ?? request.assignment.trim(),
+		...(options.description ? { description: options.description } : {}),
+		cwd: options.cwd,
+		artifactsDir: options.artifactsDir ?? "",
+		...(patterns.length > 0
+			? { modelPatterns: patterns }
+			: policy.modelRole
+				? { modelPatterns: [`@${policy.modelRole}`] }
+				: {}),
+		...(policy.modelOverride ? { modelOverride: policy.modelOverride } : {}),
+		...(policy.modelRole ? { modelRole: policy.modelRole } : {}),
+		...(toolPolicy.toolNames !== undefined ? { toolNames: toolPolicy.toolNames } : {}),
+		...(thinkingLevel ? { thinkingLevel } : {}),
+		...(childMaxRecursionDepth !== undefined ? { childMaxRecursionDepth } : {}),
+		readyTimeoutMs: config.readyTimeoutMs,
+		promptTimeoutMs: config.promptTimeoutMs,
+		keepPane: config.keepPane,
+		// HerdR's server may have been started from a different environment, so
+		// the child pane inherits this process's toolchain path and agent dir.
+		paneEnv: {
+			...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+			PI_CODING_AGENT_DIR: agentDir,
+		},
+		...(request.signal ? { signal: request.signal } : {}),
+		...(request.onProgress ? { onProgress: request.onProgress } : {}),
+		env: process.env,
+	});
+	return outcome.result;
+}
+
+/**
  * Execute a validated subagent. Preflight errors occur before any artifact
  * lease or child dispatch; callers keep responsibility for their result text.
  */
@@ -700,8 +878,12 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			deferredCleanup = completion;
 		};
 		baseOptions.planReference = await loadPlanReference(request, policy);
+		// Execution backend selection. The pane backend is an alternative to the
+		// native in-process session, chosen only after policy, artifacts, and the
+		// id are resolved, so both backends see exactly the same decisions.
+		const paneResult = await runPaneBackendIfRequested({ request, policy, options: baseOptions, id });
 		let isolationContext: IsolationContext | null = null;
-		if (policy.isIsolated) {
+		if (!paneResult && policy.isIsolated) {
 			try {
 				isolationContext = await prepareIsolationContext(request.session.cwd);
 			} catch (error) {
@@ -714,7 +896,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			}
 		}
 		let result: SingleResult;
-		if (!isolationContext) {
+		if (paneResult) {
+			result = paneResult;
+			onSubprocessResult?.(result);
+		} else if (!isolationContext) {
 			result = await runSubprocess(baseOptions);
 			onSubprocessResult?.(result);
 		} else {

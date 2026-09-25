@@ -453,15 +453,23 @@ export interface LaunchHeadlessOptions extends HeadlessLaunchFeatures {
 	args?: readonly string[];
 	/** Additional exact Puppeteer default arguments to suppress. */
 	ignoreDefaultArgs?: readonly string[];
+	/**
+	 * Stable, caller-owned profile directory (created 0700 when missing). When
+	 * set, no throwaway `mkdtemp` profile is made and nothing is deleted on
+	 * dispose — the cookie store persists across launches. Omitted: the
+	 * labeled test/SDK throwaway path.
+	 */
+	profileDir?: string;
 }
 
 /** Result of a headless Chromium launch. */
 export interface LaunchHeadlessResult {
 	browser: Browser;
 	/**
-	 * OMP-owned temporary Chromium profile directory to remove after the browser
-	 * process tree exits, or `undefined` when the caller supplied its own
-	 * `--user-data-dir` (which OMP must not delete).
+	 * OMP-owned TEMPORARY Chromium profile directory to remove after the
+	 * browser process tree exits, or `undefined` when the profile is durable
+	 * (`profileDir`) or the caller supplied its own `--user-data-dir` (which
+	 * OMP must not delete).
 	 */
 	userDataDir?: string;
 }
@@ -525,9 +533,13 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	// treat the profile as non-temporary, so `ChromeLauncher.cleanUserDataDir`
 	// becomes a no-op and can no longer reject its eager process-exit hook with an
 	// unhandled EBUSY when Chromium still holds the profile lock on Windows
-	// (issue #7058). `removeUserDataDir` cleans it up on our terms instead.
+	// (issue #7058). `removeUserDataDir` cleans a TEMP profile up on our terms;
+	// a durable `profileDir` is never removed.
 	let userDataDir: string | undefined;
-	if (!launchArgs.some(arg => arg.startsWith("--user-data-dir"))) {
+	if (opts.profileDir) {
+		await fs.promises.mkdir(opts.profileDir, { recursive: true, mode: 0o700 });
+		launchArgs.push(`--user-data-dir=${opts.profileDir}`);
+	} else if (!launchArgs.some(arg => arg.startsWith("--user-data-dir"))) {
 		userDataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-chrome-profile-"));
 		launchArgs.push(`--user-data-dir=${userDataDir}`);
 	}

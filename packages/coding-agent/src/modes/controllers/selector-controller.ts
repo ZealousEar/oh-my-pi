@@ -61,6 +61,7 @@ import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-sel
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
 import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
 import { loadDailyActivity } from "../../stats/activity-client";
+import { applyModelPresetTransaction, captureModelPreset } from "../../config/model-presets";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -963,6 +964,106 @@ export class SelectorController {
 						this.ctx.showStatus(
 							order.length > 0 ? `Quick-switch cycle: ${order.join(" → ")}` : "Quick-switch cycle cleared",
 						);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onApplyPreset: async (name, rawPreset) => {
+					const releaseDefaultMutation = await this.#acquireDefaultRoleMutation();
+					try {
+						const scopedModels = this.ctx.session.scopedModels.map(scoped => scoped.model);
+						const availableModels =
+							scopedModels.length > 0 ? scopedModels : this.ctx.session.getAvailableModels();
+						const result = await applyModelPresetTransaction(rawPreset, {
+							settings: this.ctx.settings,
+							registry: this.ctx.session.modelRegistry,
+							availableModels,
+							switchModel: async (model, { effectiveIsAuto, concreteThinking }) => {
+								const { switched } = await this.ctx.session.setModel(model, "default", {
+									persist: false,
+									thinkingLevel: effectiveIsAuto
+										? ThinkingLevel.Inherit
+										: (concreteThinking ?? ThinkingLevel.Inherit),
+								});
+								if (switched) {
+									if (effectiveIsAuto) {
+										this.ctx.session.setThinkingLevel(AUTO_THINKING);
+									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(concreteThinking);
+									}
+									this.ctx.statusLine.invalidate();
+									this.ctx.updateEditorBorderColor();
+								}
+								return { switched };
+							},
+							applyThinking: level => {
+								this.ctx.session.setThinkingLevel(
+									level === AUTO_THINKING ? AUTO_THINKING : concreteThinkingLevel(level),
+								);
+								this.ctx.statusLine.invalidate();
+							},
+							getSessionState: () => ({
+								model: this.ctx.session.model,
+								thinkingLevel: this.ctx.session.configuredThinkingLevel(),
+							}),
+							restoreSessionState: async state => {
+								try {
+									if (state.model) {
+										await this.ctx.session.setModel(state.model, "default", {
+											persist: false,
+											thinkingLevel:
+												state.thinkingLevel === AUTO_THINKING
+													? ThinkingLevel.Inherit
+													: (state.thinkingLevel ?? ThinkingLevel.Inherit),
+										});
+									}
+									if (state.thinkingLevel === AUTO_THINKING) {
+										this.ctx.session.setThinkingLevel(AUTO_THINKING);
+									} else if (state.thinkingLevel === undefined) {
+										this.ctx.session.setThinkingLevel(undefined);
+									} else if (state.thinkingLevel !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(state.thinkingLevel);
+									}
+									this.ctx.statusLine.invalidate();
+									this.ctx.updateEditorBorderColor();
+								} catch {
+									// Runtime settings are already restored; live-session restore is best-effort.
+								}
+							},
+						});
+						if (result.applied) {
+							this.ctx.showStatus(`Preset "${name}" applied`);
+						} else {
+							this.ctx.showError(result.error ?? `Preset "${name}" could not be applied`);
+						}
+						return result;
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						this.ctx.showError(message);
+						return { applied: false, error: message };
+					} finally {
+						releaseDefaultMutation();
+					}
+				},
+				onSavePreset: name => {
+					try {
+						this.ctx.settings.setModelPreset(name, captureModelPreset(this.ctx.settings));
+						this.ctx.showStatus(`Preset "${name}" saved`);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				onDeletePreset: name => {
+					try {
+						if (this.ctx.settings.getModelPresets()[name] === undefined) return;
+						this.ctx.settings.deleteModelPreset(name);
+						if (this.ctx.settings.getModelPresets()[name] !== undefined) {
+							this.ctx.showStatus(
+								`Preset "${name}" removed from global settings; a project/overlay definition still applies`,
+							);
+						} else {
+							this.ctx.showStatus(`Preset "${name}" deleted`);
+						}
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}

@@ -53,15 +53,17 @@ function makeKind(socketSuffix: string): CmuxKind {
 	};
 }
 
+import { grantBrowserFixtureScope } from "./browser-scope";
+
 function makeSession(cwd: string, screenshotDir?: string): ToolSession {
 	// Minimal shape: `runInTab` reads `cwd`, the `browser.screenshotDir` setting,
 	// and `getActiveModel?.()`. Everything else is untouched by this flow.
-	return {
+	return grantBrowserFixtureScope({
 		cwd,
 		hasUI: false,
 		settings: Settings.isolated({ "browser.screenshotDir": screenshotDir }),
 		getSessionFile: () => null,
-	} as unknown as ToolSession;
+	} as unknown as ToolSession);
 }
 
 async function drainAllTabs(): Promise<void> {

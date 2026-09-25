@@ -1,32 +1,45 @@
 /**
  * `find`: semantic grep over the workspace, driven by the session's judge
- * role. The exploration (lexical prior, filename ranking, sketch routing,
- * passage verification) lives in {@link runCascade}; this file is the tool
- * contract and the model-facing report.
+ * role. A cascade search (`path`) explores a directory or file — lexical
+ * prior, filename ranking, sketch routing, passage verification — in
+ * {@link runCascade}. A bounded search (`paths`) ranks excerpts of exactly the
+ * named files, globs, and internal URLs and reports the independent
+ * `answerPresent` probability beside the ranking, in {@link runBounded}. This
+ * file is the tool contract and the model-facing report.
  */
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { FindToolDetails } from "@oh-my-pi/pi-tui/tools/find";
+import type { FindCascadeDetails, FindToolDetails } from "@oh-my-pi/pi-tui/tools/find";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { formatBytes, formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
+import { formatBytes, formatDuration, formatNumber, prompt } from "@oh-my-pi/pi-utils";
 import { sessionResolveContext } from "../../internal-urls/context";
 import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
-import { hasNativeJudge, journalJudgmentUsage, resolveJudge } from "../../judgment";
+import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge } from "../../judgment";
 import findDescription from "../../prompts/tools/find.md" with { type: "text" };
 import type { ToolSession } from "..";
 import { formatPathRelativeToCwd, normalizePathLikeInput, resolveSearchResultPath } from "../path-utils";
 import { toolResult } from "../tool-result";
+import { runBounded } from "./bounded";
 import { runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
-import { cfgFindEnabled } from "../settings";
+import {
+	cfgFindEnabled,
+	cfgSemanticFindMaxBytesPerFile,
+	cfgSemanticFindMaxFiles,
+	cfgSemanticFindMaxPassages,
+} from "../settings";
 
 const findSchema = type({
 	query: "string",
 	grep_keywords: "string[]",
 	"path?": "string",
+	"paths?": "string[]",
+	"unit?": '"line" | "paragraph" | "auto"',
+	"limit?": "number",
+	"context?": "number",
 });
 
 export type FindToolInput = typeof findSchema.infer;
@@ -53,11 +66,33 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 	readonly loadMode = "essential";
 	readonly label = "Find";
 	readonly summary = "Semantic grep: find files and line ranges by describing what they do";
-	readonly description = findDescription;
 	readonly parameters = findSchema;
 	readonly strict = true;
 
 	constructor(private readonly session: ToolSession) {}
+
+	get description(): string {
+		const settings = this.session.settings;
+		return prompt.render(findDescription, {
+			maxFiles: cfgSemanticFindMaxFiles.get(settings),
+			maxBytesPerFile: cfgSemanticFindMaxBytesPerFile.get(settings),
+			maxPassages: cfgSemanticFindMaxPassages.get(settings),
+		});
+	}
+
+	/** The session's judge-role chain; its usage journals under `find` when a ledger is reachable. */
+	#judge(): { judge: ChainJudge; usageRecorded: boolean } {
+		const registry = this.session.modelRegistry;
+		if (!registry) throw new ToolError("find has no model registry to resolve a judge from");
+		const onUsage = journalJudgmentUsage(this.session.sessionManager, "find");
+		const judge = resolveJudge({
+			settings: this.session.settings,
+			registry,
+			sessionId: this.session.getSessionId?.() ?? undefined,
+			onUsage,
+		});
+		return { judge, usageRecorded: onUsage !== undefined };
+	}
 
 	async execute(
 		_toolCallId: string,
@@ -68,26 +103,43 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		const query = params.query.trim();
 		if (query.length === 0) throw new ToolError("`query` must be a non-empty description");
 		const cwd = this.session.cwd;
-		const rawScopeInput = params.path === undefined ? "" : normalizePathLikeInput(params.path);
 		// Host paths stay native; internal URLs (`local://`, `omp://`, …) are
 		// listed, scanned, and read in place through the URL filesystem.
 		const filesystem = new InternalUrlFilesystem({
 			context: sessionResolveContext(this.session, { signal }),
 			tier: this.approval,
 		});
+		if (params.paths !== undefined) {
+			if (params.path !== undefined) {
+				throw new ToolError("`path` scopes a cascade search and `paths` names a bounded set; pass one, not both");
+			}
+			const { judge, usageRecorded } = this.#judge();
+			return runBounded({
+				query,
+				paths: params.paths,
+				unit: params.unit,
+				limit: params.limit,
+				context: params.context,
+				cwd,
+				settings: this.session.settings,
+				filesystem,
+				judge,
+				usageRecorded,
+				signal,
+			});
+		}
+		if (params.unit !== undefined || params.limit !== undefined || params.context !== undefined) {
+			throw new ToolError(
+				"`unit`, `limit`, and `context` apply only to a bounded search; name its sources in `paths`",
+			);
+		}
+		const rawScopeInput = params.path === undefined ? "" : normalizePathLikeInput(params.path);
 		const root = await resolveSearchRoot(filesystem, rawScopeInput, cwd);
 		const scopePath =
 			root.path === path.resolve(cwd)
 				? undefined
 				: formatPathRelativeToCwd(root.path, cwd, { trailingSlash: root.type === "directory" });
-		const registry = this.session.modelRegistry;
-		if (!registry) throw new ToolError("find has no model registry to resolve a judge from");
-		const judge = resolveJudge({
-			settings: this.session.settings,
-			registry,
-			sessionId: this.session.getSessionId?.() ?? undefined,
-			onUsage: journalJudgmentUsage(this.session.sessionManager, "find"),
-		});
+		const { judge } = this.#judge();
 		const started = performance.now();
 		const result = await runCascade({
 			root,
@@ -108,7 +160,17 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			...hit,
 			rel: formatPathRelativeToCwd(resolveSearchResultPath(root.path, hit.rel), cwd),
 		}));
-		const details: FindToolDetails = { query, keywords, threshold, hits, stats, elapsedMs, cwd, scopePath };
+		const details: FindCascadeDetails = {
+			mode: "cascade",
+			query,
+			keywords,
+			threshold,
+			hits,
+			stats,
+			elapsedMs,
+			cwd,
+			scopePath,
+		};
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
 		if (hits.length === 0) {

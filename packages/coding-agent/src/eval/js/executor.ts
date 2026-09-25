@@ -3,6 +3,7 @@ import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent, withBridgeTimeoutPause } from "../bridge-timeout";
 import { DisplayOutputCollector } from "../executor-base";
+import { firedTimeoutMs } from "../wall-cap";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
 import { installJsPackages } from "./package-installer";
 import type { JsPackageEnvironmentMode } from "./package-installer";
@@ -202,7 +203,9 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				: isTimeoutReason(packageSignal?.reason);
 			if (timedOut) {
 				const annotation = runtimeEntered
-					? formatJsTimeoutAnnotation(runtimeTimeoutMs ?? options.idleTimeoutMs)
+					? formatJsTimeoutAnnotation(
+							firedTimeoutMs(options.signal?.reason, runtimeTimeoutMs ?? options.idleTimeoutMs),
+						)
 					: packageWorkComplete
 						? "Command timed out before JavaScript execution began. Any existing retained JS worker remains available."
 						: formatPackageInstallTimeoutAnnotation(packageTimeoutSignal?.aborted === true);

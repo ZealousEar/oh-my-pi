@@ -7,6 +7,7 @@ import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -47,7 +48,7 @@ function valueFrom<T>(result: { details?: unknown }): T {
 }
 
 function makeSession(): ToolSession {
-	return {
+	return grantBrowserFixtureScope({
 		cwd: tempDir,
 		hasUI: false,
 		getSessionFile: () => null,
@@ -58,7 +59,7 @@ function makeSession(): ToolSession {
 			"browser.cmux": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 }
 
 beforeAll(async () => {
