@@ -309,7 +309,7 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(90_001, 100_000, settings)).toBe(true);
 	});
 
-	it("applies threshold percent only at or above thresholdMinContextWindow", () => {
+	it("uses only the 15% reserve below thresholdMinContextWindow", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
 			thresholdPercent: 45,
@@ -319,11 +319,13 @@ describe("shouldCompact", () => {
 
 		expect(resolveThresholdTokens(1_000_000, settings)).toBe(450_000);
 		expect(resolveThresholdTokens(512_000, settings)).toBe(230_400);
-		// Below the gate: reserve-based default, window - max(15%, 16384).
-		expect(resolveThresholdTokens(511_999, settings)).toBe(435_200);
-		expect(resolveThresholdTokens(200_000, settings)).toBe(170_000);
+		// 32k window: 32_768 - floor(15%) = 27_853, not the 16_384 the absolute reserve would give.
+		expect(shouldCompact(27_853, 32_768, settings)).toBe(false);
+		expect(shouldCompact(27_854, 32_768, settings)).toBe(true);
+		// An explicit absolute reserve is ignored below the gate too.
+		expect(resolveThresholdTokens(200_000, { ...settings, reserveTokens: 50_000 })).toBe(170_000);
 		// A fixed token threshold is not gated.
-		expect(resolveThresholdTokens(200_000, { ...settings, thresholdTokens: 100_000 })).toBe(100_000);
+		expect(resolveThresholdTokens(32_768, { ...settings, thresholdTokens: 16_000 })).toBe(16_000);
 	});
 
 	it("should use legacy reserve behavior when threshold is set to default sentinel", () => {
