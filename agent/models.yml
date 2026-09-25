@@ -43,8 +43,12 @@ providers:
     models:
       - id: heretic-org/Qwen3.8-27B-heretic-ara
         name: Qwen3.8 27B heretic-ara (Featherless)
-        reasoning: false
+        # Thinks by default; Featherless returns the trace in `reasoning` (checked 2026-09-25).
+        # reasoning_effort support is untested there, so omp does not send it.
+        reasoning: true
         input: [text]
         contextWindow: 32768
         maxTokens: 8192
         tokenizer: qwen3
+        compat:
+          supportsReasoningEffort: false
