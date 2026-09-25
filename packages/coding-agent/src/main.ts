@@ -246,8 +246,17 @@ function applyAcpDefaultSettingOverrides(targetSettings: Settings = settings): v
 	applyDefaultSettingOverrides(HOST_DEFAULTED_SETTING_PATHS, targetSettings);
 }
 
-/** Reads a non-TTY stdin stream as prompt text. */
-export async function readPipedInput(): Promise<string | undefined> {
+/** First-byte window for piped stdin under `-p <prompt>`; a silent pipe past it is ignored. */
+const PRINT_STDIN_FIRST_BYTE_GRACE_MS = 5000;
+
+/**
+ * Reads a non-TTY stdin stream as prompt text.
+ *
+ * `firstByteGraceMs`: stop waiting when the pipe yields no data within the window and
+ * treat stdin as absent. Once the first chunk arrives, the stream is read to EOF with no
+ * deadline, so slow producers that have started writing are never truncated.
+ */
+export async function readPipedInput(options?: { firstByteGraceMs?: number }): Promise<string | undefined> {
 	if (process.stdin.isTTY === true) return undefined;
 	// stdin is a pipe: a producer that never writes nor closes would block
 	// startup forever with zero output. Say what we're blocked on after 1s.
@@ -260,14 +269,42 @@ export async function readPipedInput(): Promise<string | undefined> {
 			}, 1000);
 	notice?.unref?.();
 	try {
-		const text = await Bun.stdin.text();
-		if (text.trim().length === 0) return undefined;
+		const text =
+			options?.firstByteGraceMs === undefined
+				? await Bun.stdin.text()
+				: await readStdinWithFirstByteGrace(options.firstByteGraceMs);
+		if (text === undefined || text.trim().length === 0) return undefined;
 		return text;
 	} catch {
 		return undefined;
 	} finally {
 		clearTimeout(notice);
 	}
+}
+
+async function readStdinWithFirstByteGrace(graceMs: number): Promise<string | undefined> {
+	const reader = (Bun.stdin.stream() as ReadableStream<Uint8Array>).getReader();
+	const { promise: expired, resolve: expire } = Promise.withResolvers<"expired">();
+	const timer = setTimeout(() => expire("expired"), graceMs);
+	timer.unref?.();
+	const first = await Promise.race([reader.read(), expired]);
+	clearTimeout(timer);
+	if (first === "expired") {
+		process.stderr.write(
+			`${chalk.dim(`No piped stdin within ${graceMs / 1000}s; continuing with the prompt argument only.`)}\n`,
+		);
+		reader.cancel().catch(() => {});
+		return undefined;
+	}
+	if (first.done) return undefined;
+	const decoder = new TextDecoder();
+	let text = decoder.decode(first.value, { stream: true });
+	for (;;) {
+		const next = await reader.read();
+		if (next.done) break;
+		text += decoder.decode(next.value, { stream: true });
+	}
+	return text + decoder.decode();
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,7 +1752,14 @@ export async function runRootCommand(
 		// See getDbBusyTimeoutMs().
 		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
 		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+		// `-p` with a prompt argument must not hang on an open-but-silent pipe (e.g. a parent
+		// process that never closes the child's stdin): give the pipe a short first-byte window.
+		const pipedInput = isProtocolMode
+			? undefined
+			: await logger.time("readPipedInput", readPipedInput, {
+					firstByteGraceMs:
+						parsedArgs.print && parsedArgs.messages.length > 0 ? PRINT_STDIN_FIRST_BYTE_GRACE_MS : undefined,
+				});
 		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 		// Only the interactive host renders a focusable Agent Hub / subagent session

@@ -57,6 +57,49 @@ describe("readPipedInput", () => {
 			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
 		}
 	});
+
+	it("stops waiting on an open pipe that never writes once the first-byte grace expires", async () => {
+		const originalIsTTY = process.stdin.isTTY;
+		// Never enqueues and never closes: the parent-kept-stdin-open hang.
+		vi.spyOn(Bun.stdin, "stream").mockReturnValue(new ReadableStream<Uint8Array>() as never);
+		vi.spyOn(Bun.stdin, "text").mockReturnValue(Promise.withResolvers<string>().promise);
+		Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+		vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		vi.useFakeTimers();
+
+		try {
+			const pending = readPipedInput({ firstByteGraceMs: 5000 });
+			vi.advanceTimersByTime(5000);
+			expect(await pending).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
+		}
+	});
+
+	it("reads a slow producer to EOF once its first chunk arrived inside the grace", async () => {
+		const originalIsTTY = process.stdin.isTTY;
+		const encoder = new TextEncoder();
+		const { promise: opened, resolve: open } = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+		const stream = new ReadableStream<Uint8Array>({ start: controller => open(controller) });
+		vi.spyOn(Bun.stdin, "stream").mockReturnValue(stream as never);
+		Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+		vi.useFakeTimers();
+
+		try {
+			const pending = readPipedInput({ firstByteGraceMs: 5000 });
+			const controller = await opened;
+			controller.enqueue(encoder.encode("first "));
+			await Promise.resolve();
+			vi.advanceTimersByTime(60_000); // far past the grace: no deadline after the first byte
+			controller.enqueue(encoder.encode("second"));
+			controller.close();
+			expect(await pending).toBe("first second");
+		} finally {
+			vi.useRealTimers();
+			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
+		}
+	});
 });
 
 describe("applyResolvedSystemPromptInputs", () => {
