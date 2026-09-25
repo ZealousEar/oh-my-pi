@@ -189,6 +189,12 @@ export interface CompactionSettings {
 	enabled: boolean;
 	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent?: number;
+	/**
+	 * Smallest context window on which {@link thresholdPercent} applies. Smaller
+	 * windows ignore the percentage and use the reserve-based threshold. `<= 0`
+	 * (the default) applies the percentage on every window.
+	 */
+	thresholdMinContextWindow?: number;
 	thresholdTokens?: number;
 	midTurnEnabled?: boolean;
 	/**
@@ -400,8 +406,16 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 	// configured reserves still define the usable prompt budget. Cap at
 	// contextWindow - 1 (matching the fixed-token clamp above) so the threshold
 	// never reaches the whole window even when the reserve resolves to 0.
+	// Windows below `thresholdMinContextWindow` skip the percentage and use the
+	// same reserve-based threshold.
 	const thresholdPercent = settings.thresholdPercent;
-	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
+	const minContextWindow = settings.thresholdMinContextWindow ?? 0;
+	if (
+		typeof thresholdPercent !== "number" ||
+		!Number.isFinite(thresholdPercent) ||
+		thresholdPercent <= 0 ||
+		contextWindow < minContextWindow
+	) {
 		return Math.max(
 			0,
 			Math.min(contextWindow - 1, contextWindow - resolveBudgetReserveTokens(contextWindow, settings)),
