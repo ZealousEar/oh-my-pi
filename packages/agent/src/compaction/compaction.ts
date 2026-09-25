@@ -190,9 +190,10 @@ export interface CompactionSettings {
 	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent?: number;
 	/**
-	 * Smallest context window on which {@link thresholdPercent} applies. Smaller
-	 * windows ignore the percentage and use the reserve-based threshold. `<= 0`
-	 * (the default) applies the percentage on every window.
+	 * Smallest context window on which {@link thresholdPercent} and the absolute
+	 * reserve apply. Smaller windows (without a fixed {@link thresholdTokens})
+	 * compact at the window minus the 15% proportional reserve. `<= 0` (the
+	 * default) applies the configured threshold on every window.
 	 */
 	thresholdMinContextWindow?: number;
 	thresholdTokens?: number;
@@ -398,6 +399,12 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 		// Clamp to [1, contextWindow - 1] so there's always room
 		return Math.min(contextWindow - 1, Math.max(1, thresholdTokens));
 	}
+	// Below the minimum window neither the percentage nor the absolute reserve
+	// applies: compact at the window minus the 15% proportional reserve (>= 1).
+	const minContextWindow = settings.thresholdMinContextWindow ?? 0;
+	if (minContextWindow > 0 && contextWindow < minContextWindow) {
+		return Math.max(0, contextWindow - Math.max(1, Math.floor(contextWindow * 0.15)));
+	}
 
 	// Percentage-based threshold. The default absolute reserve can exceed bundled
 	// small-context windows, or nearly consume a 16k-class window; in those
@@ -406,16 +413,8 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 	// configured reserves still define the usable prompt budget. Cap at
 	// contextWindow - 1 (matching the fixed-token clamp above) so the threshold
 	// never reaches the whole window even when the reserve resolves to 0.
-	// Windows below `thresholdMinContextWindow` skip the percentage and use the
-	// same reserve-based threshold.
 	const thresholdPercent = settings.thresholdPercent;
-	const minContextWindow = settings.thresholdMinContextWindow ?? 0;
-	if (
-		typeof thresholdPercent !== "number" ||
-		!Number.isFinite(thresholdPercent) ||
-		thresholdPercent <= 0 ||
-		contextWindow < minContextWindow
-	) {
+	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
 		return Math.max(
 			0,
 			Math.min(contextWindow - 1, contextWindow - resolveBudgetReserveTokens(contextWindow, settings)),
