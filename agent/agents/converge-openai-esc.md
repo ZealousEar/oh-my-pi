@@ -2,6 +2,7 @@
 name: converge-openai-esc
 description: converge debater, OpenAI side at escalated effort (Astra high); spawned only by the converge skill after a non-progress round
 model: "@converge-openai-esc"
+skills: none
 tools: [read, grep, glob, web_search, hub]
 output:
   type: object

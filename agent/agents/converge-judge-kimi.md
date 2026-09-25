@@ -2,6 +2,7 @@
 name: converge-judge-kimi
 description: converge L3 panel judge (Kimi K3 at max reasoning via OpenRouter); scores an anonymised dossier, then confers with the other judge; spawned only by the converge skill
 model: "@converge-judge-kimi"
+skills: none
 tools: [read, grep, hub]
 output:
   type: object

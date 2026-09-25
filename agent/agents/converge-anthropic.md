@@ -2,6 +2,7 @@
 name: converge-anthropic
 description: converge debater, Anthropic side at default effort (Fable high); spawned only by the converge skill
 model: "@converge-anthropic"
+skills: none
 tools: [read, grep, glob, web_search, hub]
 output:
   type: object

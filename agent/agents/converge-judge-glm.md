@@ -2,6 +2,7 @@
 name: converge-judge-glm
 description: converge L3 panel judge (GLM-5.3 at max reasoning via OpenRouter); scores an anonymised dossier, then confers with the other judge; spawned only by the converge skill
 model: "@converge-judge-glm"
+skills: none
 tools: [read, grep, hub]
 output:
   type: object

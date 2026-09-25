@@ -2,6 +2,7 @@
 name: converge-openai
 description: converge debater, OpenAI side at default effort (Astra medium); spawned only by the converge skill
 model: "@converge-openai"
+skills: none
 tools: [read, grep, glob, web_search, hub]
 output:
   type: object
