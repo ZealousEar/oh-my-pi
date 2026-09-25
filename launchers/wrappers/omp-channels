@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""omp-channels: show and verify the omp/ompd/ompdev channel map (read-only)."""
+import hashlib, json, os, re, sqlite3, stat, subprocess, sys
+
+MAP = os.path.expanduser("~/.omp-channels/channels.json")
+LAYER = os.path.expanduser("~/.omp/profile-layer")
+LAYER_BRANCH = "profile/daily-fork"
+LAYER_STATUS = os.path.expanduser("~/.omp/profile-layer-sync/status.json")
+LAYER_JOB = "ai.omp.profile-layer-sync"
+LAYER_KINDS = ("skills", "agents", "rules", "extensions")
+
+def check_layer(m):
+    """Synced profile layer: checkout, per-entry links in the fork profiles, models.yml links, daily sync job."""
+    problems, info = [], {}
+    if not os.path.isdir(os.path.join(LAYER, ".git")):
+        return {"path": LAYER, "problems": [f"checkout missing: {LAYER} (git clone -b {LAYER_BRANCH} --single-branch https://github.com/ZealousEar/oh-my-pi.git {LAYER})"], "info": info}
+    branch, _ = run(["git", "-C", LAYER, "branch", "--show-current"])
+    if branch != LAYER_BRANCH: problems.append(f"checkout is on {branch!r}, expected {LAYER_BRANCH}")
+    if not os.access(os.path.join(LAYER, "config", "fork-overlay.yml"), os.R_OK): problems.append("config/fork-overlay.yml missing (ompd/ompdev refuse to start)")
+    fork_profiles = [ch["stateRoot"] for ch in m["channels"].values() if ch["profile"] in ("daily-fork", "dev-fork")]
+    for root in fork_profiles:
+        for kind in LAYER_KINDS:
+            src_dir = os.path.join(LAYER, "agent", kind)
+            for name in sorted(os.listdir(src_dir)) if os.path.isdir(src_dir) else []:
+                link = os.path.join(root, "agent", kind, name)
+                want = os.path.join(src_dir, name)
+                if not os.path.islink(link): problems.append(f"not linked to the layer: {link}")
+                elif os.path.realpath(link) != os.path.realpath(want): problems.append(f"link points elsewhere: {link} -> {os.readlink(link)}")
+    for ch in m["channels"].values():
+        link = os.path.join(ch["stateRoot"], "agent", "models.yml")
+        if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(os.path.join(LAYER, "agent", "models.yml"))):
+            problems.append(f"models.yml not linked to the layer: {link}")
+    dirty, _ = run(["git", "-C", LAYER, "status", "--porcelain"])
+    info["uncommitted"] = len([l for l in dirty.splitlines() if l.strip()])
+    ahead, code = run(["git", "-C", LAYER, "rev-list", "--count", f"origin/{LAYER_BRANCH}..HEAD"])
+    info["unpushed"] = int(ahead) if code == 0 and ahead.isdigit() else None
+    out, code = run(["launchctl", "print", f"gui/{os.getuid()}/{LAYER_JOB}"])
+    info["job"] = "loaded" if code == 0 else "not loaded"
+    if code != 0: problems.append(f"daily sync job {LAYER_JOB} not loaded (re-run install.sh)")
+    try:
+        st = json.load(open(LAYER_STATUS))
+        info["lastSync"] = f"{st.get('at')} {st.get('result')}: {st.get('message', '')}".strip()
+        if st.get("result") in ("blocked", "failed"): problems.append(f"last sync {st['result']}: {st.get('message')} (log: {os.path.dirname(LAYER_STATUS)}/sync.log)")
+    except FileNotFoundError:
+        info["lastSync"] = "never"
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"sync status unreadable: {e}")
+    return {"path": LAYER, "problems": problems, "info": info}
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def run(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return (out.stdout + out.stderr).strip(), out.returncode
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}", 1
+
+def main():
+    verify = "--verify" in sys.argv
+    as_json = "--json" in sys.argv
+    m = json.load(open(MAP))
+    report = {"ok": True, "channels": {}}
+    installed = m.get("wrapperSha256", {})
+    for name, ch in m["channels"].items():
+        row = {"profile": ch["profile"], "stateRoot": ch["stateRoot"], "problems": [], "warnings": []}
+        wrapper = os.path.join(m["wrapperDir"], name)
+        row["wrapper"] = wrapper
+        if not os.access(wrapper, os.X_OK):
+            row["problems"].append(f"wrapper missing/not executable: {wrapper}")
+        else:
+            head = open(wrapper, "rb").read(4096).decode("utf-8", "replace")
+            if "omp channel launcher:" not in head:
+                row["problems"].append("wrapper clobbered: channel marker missing (a real binary or foreign script sits at the wrapper path)")
+            else:
+                body = open(wrapper, encoding="utf-8", errors="replace").read()
+                if f"PROFILE={ch['profile']}\n" not in body:
+                    row["problems"].append(f"wrapper does not pin PROFILE={ch['profile']}")
+                if ch["kind"] == "compiled":
+                    target_ok = f"TARGET={ch['executable']}\n" in body
+                    if name == "omp":
+                        target_ok = target_ok or ("TARGET=$STOCK\n" in body and "channels.json" in body)
+                    if not target_ok:
+                        row["problems"].append("wrapper TARGET differs from channels.json executable")
+                if ch["kind"] == "source" and (f"BUN={ch['bun']}\n" not in body or f"CHECKOUT={ch['checkout']}\n" not in body):
+                    row["problems"].append("wrapper BUN/CHECKOUT differ from channels.json")
+                if verify:
+                    if installed.get(name) and sha256(wrapper) != installed[name]:
+                        row["problems"].append("wrapper sha256 differs from the digest recorded at install")
+                    if not (os.stat(wrapper).st_flags & getattr(stat, "UF_IMMUTABLE", 0x2)):
+                        row["problems"].append("wrapper is not immutable (chflags uchg missing)")
+        if ch["kind"] == "compiled":
+            exe = ch["executable"]
+            row["executable"] = exe
+            if not os.access(exe, os.X_OK):
+                row["problems"].append(f"executable missing/not executable: {exe}")
+            else:
+                for p in (exe, os.path.dirname(exe), os.path.dirname(os.path.dirname(exe))):
+                    if not (os.stat(p).st_flags & getattr(stat, "UF_IMMUTABLE", 0x2)):
+                        row["problems"].append(f"not immutable (chflags uchg missing): {p}")
+                if verify:
+                    actual = sha256(exe)
+                    row["sha256"] = actual
+                    if actual != ch["sha256"]:
+                        row["problems"].append("executable sha256 drifted from channels.json")
+        else:
+            bun = ch["bun"]
+            row["bun"] = bun
+            row["entrypoint"] = ch["entrypoint"]
+            if not os.access(bun, os.X_OK):
+                row["problems"].append(f"bun missing/not executable: {bun}")
+            else:
+                ver, _ = run([bun, "--version"])
+                row["bunVersion"] = ver
+                if ver != ch["bunVersion"]:
+                    row["problems"].append(f"bun version {ver} != pinned {ch['bunVersion']}")
+            if not os.path.isfile(ch["entrypoint"]):
+                row["problems"].append("checkout entrypoint missing")
+            lm = ch["launcherMirror"]
+            for key, path in (("sha256", lm["file"]), ("preloadSha256", lm["preload"])):
+                if not os.path.isfile(path):
+                    row["problems"].append(f"dev launcher file missing: {path}")
+                elif sha256(path) != lm[key]:
+                    row["problems"].append(f"upstream dev launcher changed ({os.path.basename(path)}); re-sync the ompdev wrapper mirror")
+        if verify and not row["problems"]:
+            out, code = run([wrapper, "--version"])
+            row["version"] = out
+            if code != 0:
+                row["problems"].append(f"--version failed ({code}): {out}")
+        row["stateRootExists"] = os.path.isdir(ch["stateRoot"])
+        private_db = os.path.join(ch["stateRoot"], "agent", "agent.db")
+        private_rows = 0
+        if os.path.isfile(private_db):
+            try:
+                con = sqlite3.connect(f"file:{private_db}?mode=ro", uri=True, timeout=5)
+                try:
+                    private_rows = con.execute("select count(*) from auth_credentials where coalesce(disabled_cause,'')=''").fetchone()[0]
+                finally:
+                    con.close()
+            except Exception as e:
+                private_rows = None
+                row["warnings"].append(f"private credential row count unavailable: {e}")
+        row["privateCredentialRows"] = private_rows
+        if private_rows:
+            row["warnings"].append("private credential rows present (bypass of the authority: legacy-scope extension or local verb) — see FAILURE-MAP F43")
+        if row["problems"]:
+            report["ok"] = False
+        report["channels"][name] = row
+    overlays = m.get("policyOverlays", [])
+    report["policyOverlays"] = []
+    if not overlays:
+        report["ok"] = False
+        report["policyOverlays"].append({"path": None, "problems": ["policy overlay manifest missing"]})
+    for pol in overlays:
+        problems = []
+        if not os.path.isfile(pol["path"]): problems.append("policy overlay missing")
+        else:
+            if not (os.stat(pol["path"]).st_flags & getattr(stat, "UF_IMMUTABLE", 0x2)): problems.append("policy overlay not immutable")
+            if verify and sha256(pol["path"]) != pol["sha256"]: problems.append("policy overlay sha256 drifted")
+        report["policyOverlays"].append({"path": pol["path"], "problems": problems})
+        if problems: report["ok"] = False
+    sa = m.get("sharedAuth")
+    if sa:
+        problems = []
+        stock = m["channels"]["omp"]["executable"]
+        mode_path = os.path.expanduser("~/.omp-channels/policy/auth-mode")
+        try:
+            auth_mode = open(mode_path, encoding="utf-8").read().strip()
+        except Exception as e:
+            auth_mode = None
+            problems.append(f"auth mode unreadable at {mode_path}: {e}")
+        if auth_mode not in ("authority", "local"):
+            problems.append(f"auth mode must be 'authority' or 'local', got {auth_mode!r}")
+        tok = sa["authorityTokenFile"]
+        authority_token = {"path": tok, "present": os.path.isfile(tok)}
+        if authority_token["present"]:
+            authority_token["mode"] = oct(stat.S_IMODE(os.stat(tok).st_mode))
+            if auth_mode == "authority" and stat.S_IMODE(os.stat(tok).st_mode) != 0o600:
+                problems.append("authority token file mode is not 0600")
+        elif auth_mode == "authority":
+            problems.append(f"authority token file missing: {tok}")
+        plist = sa["launchdPlist"]
+        service = {"plistPresent": os.path.isfile(plist)}
+        out, code = run(["launchctl", "print", f"gui/{os.getuid()}/{sa['launchdLabel']}"])
+        state = next((l.strip() for l in out.splitlines() if l.strip().startswith("state =")), "state = not loaded")
+        service["state"] = state
+        if auth_mode == "authority":
+            if not service["plistPresent"]: problems.append(f"launchd plist missing: {plist}")
+            if code != 0 or "running" not in state: problems.append(f"authority service {sa['launchdLabel']}: {state}")
+            health, hcode = run(["curl", "-s", "-m", "3", sa["url"] + "/v1/healthz"])
+            service["health"] = health[:120]
+            if hcode != 0 or '"ok":true' not in health: problems.append(f"authority healthz failed at {sa['url']}: {health[:120]}")
+        profiles = {}
+        for name, ch in m["channels"].items():
+            root = ch["stateRoot"]
+            ptok = os.path.join(root, "auth-broker.token")
+            token_present = os.path.isfile(ptok)
+            token_matches = token_present and authority_token["present"] and sha256(ptok) == sha256(tok)
+            token_mode = oct(stat.S_IMODE(os.stat(ptok).st_mode)) if token_present else None
+            oracle_out, oracle_code = run([stock, f"--profile={ch['profile']}", "auth-broker", "status", "--json"])
+            try:
+                oracle = json.loads(oracle_out.splitlines()[-1])
+            except Exception:
+                oracle = {"raw": oracle_out[:160]}
+            oracle_ok = oracle.get("url") == sa["url"]
+            profiles[name] = {
+                "profile": ch["profile"], "oracle": oracle, "oracleExit": oracle_code,
+                "tokenPresent": token_present, "tokenMatchesAuthority": token_matches, "tokenMode": token_mode,
+            }
+            if auth_mode == "authority":
+                if not oracle_ok: problems.append(f"{name}: broker config oracle did not resolve {sa['url']}: {oracle_out[:120]}")
+                if not token_present: problems.append(f"{name}: profile token missing ({ptok})")
+                elif not token_matches: problems.append(f"{name}: profile token differs from the authority token (re-run install.sh)")
+                elif stat.S_IMODE(os.stat(ptok).st_mode) != 0o600: problems.append(f"{name}: profile token mode is not 0600")
+            if verify and auth_mode == "authority":
+                channel_out, channel_code = run([os.path.join(m["wrapperDir"], name), "auth-broker", "status", "--json"])
+                if channel_code != 0 or '"ok":true' not in channel_out:
+                    problems.append(f"{name}: auth-broker status via channel failed: {channel_out[:120]}")
+        mcp_out, mcp_code = run([os.path.join(m["wrapperDir"], "omp-mcp-share"), "status", "--profile", "stock"])
+        try:
+            mcp_summary = json.loads(mcp_out)
+        except Exception:
+            mcp_summary = {"error": mcp_out[:160]}
+        if auth_mode == "authority" and mcp_code != 0:
+            problems.append(f"stock omp-mcp-share status failed: {mcp_out[:120]}")
+        shared = sa["credentialSettingsOverlay"]
+        if not os.path.isfile(shared): problems.append(f"shared credential-settings overlay missing: {shared}")
+        elif stat.S_IMODE(os.stat(shared).st_mode) != 0o600: problems.append("shared credential-settings overlay mode is not 0600")
+        keys_file = sa.get("credentialKeysFile")
+        if keys_file and os.path.isfile(keys_file):
+            keys = [l.strip() for l in open(keys_file) if l.strip()]
+            for name, ch in m["channels"].items():
+                cfg = os.path.join(ch["stateRoot"], "agent", "config.yml")
+                if not os.path.isfile(cfg): continue
+                text = open(cfg, encoding="utf-8", errors="replace").read()
+                for key in keys:
+                    top, _, rest = key.partition(".")
+                    if re.search(rf"^{re.escape(top)}:\s*$", text, re.M) and re.search(rf"^\s+{re.escape(rest.split('.')[0])}:\s*\S", text, re.M):
+                        problems.append(f"{name}: credential-marked setting {key} is profile-local in {cfg} (run `omp secret sync`)")
+        report["sharedAuth"] = {
+            "url": sa["url"], "service": sa["launchdLabel"], "authMode": auth_mode,
+            "authModeFile": mode_path, "authorityToken": authority_token, "serviceState": service,
+            "profiles": profiles, "stockMcpShare": mcp_summary, "problems": problems,
+        }
+        if problems: report["ok"] = False
+    report["profileLayer"] = check_layer(m)
+    if report["profileLayer"]["problems"]: report["ok"] = False
+    report["legacy"] = m["legacy"]
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        for name, row in report["channels"].items():
+            status = "OK" if not row["problems"] else "PROBLEM"
+            target = row.get("executable") or f"{row.get('bun')} {row.get('entrypoint')}"
+            print(f"{name:7} {status:8} profile={row['profile']:11} root={row['stateRoot']}")
+            print(f"        -> {target}")
+            for extra in ("version", "bunVersion", "sha256"):
+                if extra in row:
+                    print(f"        {extra}: {row[extra]}")
+            print(f"        private credentials: active={row['privateCredentialRows'] if row['privateCredentialRows'] is not None else 'unknown'}")
+            for p in row["problems"]:
+                print(f"        !! {p}")
+            for warning in row["warnings"]:
+                print(f"        WARN: {warning}")
+        for po in report.get("policyOverlays", []):
+            print(f"policy  {'OK' if not po['problems'] else 'PROBLEM'}       {po['path']}" + "".join(f"\n        !! {p}" for p in po["problems"]))
+        if report.get("sharedAuth"):
+            s = report["sharedAuth"]
+            print(f"auth    {'OK' if not s['problems'] else 'PROBLEM'}       mode={s['authMode']} {s['url']} ({s['service']})")
+            for name, p in s["profiles"].items():
+                print(f"        {name}: oracle={p['oracle'].get('url', p['oracle'].get('reason', 'invalid'))} token={'present' if p['tokenPresent'] else 'missing'}")
+            mcp = s["stockMcpShare"]
+            print(f"        stock mcp-share: url-keyed={mcp.get('urlKeyedRows', '?')} scoped={mcp.get('ownScopedRows', '?')} files={len(mcp.get('files', []))}")
+            for p in s["problems"]:
+                print(f"        !! {p}")
+        pl = report["profileLayer"]
+        i = pl["info"]
+        print(f"layer   {'OK' if not pl['problems'] else 'PROBLEM'}       {pl['path']} ({LAYER_BRANCH})")
+        if i: print(f"        uncommitted={i.get('uncommitted')} unpushed={i.get('unpushed')} job={i.get('job')} last sync: {i.get('lastSync')}")
+        for p in pl["problems"]:
+            print(f"        !! {p}")
+        print(f"legacy  untouched: {report['legacy']['symlink']} ({report['legacy']['version']})")
+    sys.exit(0 if report["ok"] else 1)
+
+if __name__ == "__main__":
+    main()

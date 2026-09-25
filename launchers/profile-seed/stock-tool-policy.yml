@@ -1,0 +1,19 @@
+# Stock-channel tool policy (persistent-agent-browser 2026-09-19). The pinned stock build
+# (v18.2.6) predates the read-only-by-default automation policy: it has no
+# `browser.permissions.grants` / `computer.permissions.grants`, no read/navigate/mutate tiers
+# and no user-level-only filtering; its only controls are the whole-prelude approval policy
+# (`tools.approval.<prelude>`: allow | prompt | deny, honoured in every approval mode -
+# eval/preludes.ts approvePreludeInvocation) and `computer.enabled`. Staged owner decision:
+#   - browser: PROMPT on every browser prelude call (reads included - stock cannot tell them
+#     apart); without an interactive UI the call errors instead of running.
+#   - computer: OFF (`computer.enabled: false`) and DENY as a second lock; the desktop driver
+#     runs with the agent's own TCC identity and stock has no read tier for it.
+# Alternatives (owner switch: chflags nouchg this file, edit, chflags uchg): `browser: allow`
+# restores the stock yolo behaviour (unprotected); `browser: deny` removes the tool.
+# The relay identity pin (browser-identity.yml) applies to stock as well.
+tools:
+  approval:
+    browser: prompt
+    computer: deny
+computer:
+  enabled: false

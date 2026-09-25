@@ -1,0 +1,42 @@
+# Fork-channel config overlay (ompd = daily-fork, ompdev = dev-fork).
+# Loaded by the ompd/ompdev wrappers as the FIRST PI_CONFIG_FILES entry: it deep-merges over the
+# profile's config.yml, and the launcher policy overlays plus the shared credential overlay load
+# after it and still win. Maps merge key by key; lists replace.
+# Owns only what the synced profile layer needs; everything else stays in each profile's config.yml.
+
+# converge: one role per debater/judge family. Model + effort are chosen HERE only;
+# converge freezes them into manifest.expected at new_run and identity-checks every spawn.
+modelRoles:
+  converge-openai: openai-codex/gpt-6-astra:medium
+  converge-openai-esc: openai-codex/gpt-6-astra:high
+  converge-anthropic: anthropic/claude-fable-5-1:high
+  converge-anthropic-esc: anthropic/claude-fable-5-1:xhigh
+  converge-judge-kimi: openrouter/moonshotai/kimi-k3:max
+  converge-judge-glm: openrouter/z-ai/glm-5.3:max
+
+# converge never substitutes a model: a failed role fails the spawn instead of falling back.
+retry:
+  fallbackChains:
+    converge-openai: []
+    converge-openai-esc: []
+    converge-anthropic: []
+    converge-anthropic-esc: []
+    converge-judge-kimi: []
+    converge-judge-glm: []
+
+# jev bookkeeping for converge: native TypeSafe judge() backend, no silent fallback.
+providers:
+  judgmentProvider: typesafe
+  typesafeModel: jev-1.13.0
+  judgmentFallback: none
+
+# Skill sources: the profile's own skills/ (this layer) plus the shared ~/.omp/agent/skills.
+# Claude/Codex/Agents skill folders stay off so their skills never leak into omp.
+skills:
+  enableClaudeUser: false
+  enableClaudeProject: false
+  enableCodexUser: false
+  enableAgentsUser: false
+  enableAgentsProject: false
+  customDirectories:
+    - ~/.omp/agent/skills

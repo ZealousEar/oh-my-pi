@@ -1,0 +1,10 @@
+# Browser identity policy (persistent-agent-browser 2026-09-19). The daily default in EVERY
+# channel is the owner's own logged-in Chrome through the local relay (`omp browser-relay` +
+# extension): one cookie jar, no per-project/per-channel profiles. The managed agent profile
+# (~/.omp/browser/agent-profile, a DISTINCT cookie jar) is only reachable through an explicit
+# per-call choice (`browser.open({ app: { relay: false } })` / `app.path` / `app.cdp_url`);
+# a relay that is disabled (PI_BROWSER_RELAY=0) or unreachable is an error in the fork
+# builds, never a silent switch to another profile. Loaded through PI_CONFIG_FILES after the
+# project layers, so a cloned repository cannot re-point the browser.
+browser:
+  relay: true

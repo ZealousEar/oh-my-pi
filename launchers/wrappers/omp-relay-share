@@ -1,0 +1,716 @@
+#!/usr/bin/python3
+"""Pin the machine-global OMP browser relay and canonical Chrome extension."""
+from __future__ import annotations
+import argparse, datetime as dt, errno, glob, hashlib, html, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+from pathlib import Path
+from typing import Any, Iterable
+import urllib.error, urllib.request
+
+OK, DEGRADED, BROKEN, USAGE, REFUSED, CONFIG = 0, 1, 2, 64, 73, 78
+PROTOCOL_REQUIRED, EXTENSION_REQUIRED = 2, "0.2.0"
+LABEL, DEFAULT_PORT = "ai.omp.browser-relay", 9224
+L = Path(os.environ.get("OMP_RELAY_LAUNCHER_ROOT", "/Users/farhad/.omp/implementation-2026-09-18/launchers"))
+HOME = Path.home()
+CHANNELS_ROOT = Path(os.environ.get("OMP_CHANNELS_DIR", str(HOME / ".omp-channels")))
+MAP = Path(os.environ.get("OMP_RELAY_CHANNELS_JSON", str(CHANNELS_ROOT / "channels.json")))
+STATE = CHANNELS_ROOT / "browser-relay"
+MODE_FILE = CHANNELS_ROOT / "policy" / "relay-mode"
+CANONICAL = HOME / ".omp" / "browser-relay" / "extension"
+PLIST_SOURCE = L / "browser" / "relay" / f"{LABEL}.plist"
+PLIST_INSTALLED = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+EVIDENCE = L / "browser" / "relay" / "evidence"
+BACKUPS = L / "browser" / "relay" / "backup"
+BASELINE = L / "browser" / "relay" / "evidence" / "live-baseline-20260920.json"
+PORT = int(os.environ.get("OMP_RELAY_PORT", str(DEFAULT_PORT)))
+LAUNCHCTL = os.environ.get("OMP_RELAY_LAUNCHCTL", "/bin/launchctl")
+
+class ConfigError(RuntimeError): pass
+class UsageError(RuntimeError): pass
+
+class RelayParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise UsageError(message)
+
+
+def run(argv: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""): h.update(block)
+    return h.hexdigest()
+
+def channels() -> dict[str, Any]:
+    try:
+        data = json.loads(MAP.read_text()); p = data["channels"]["ompd"]; s = data["channels"]["omp"]
+        assert all(isinstance(x, str) and x for x in (p["executable"], p["sha256"], s["executable"]))
+        return data
+    except (OSError, ValueError, KeyError, TypeError, AssertionError) as e:
+        raise ConfigError(f"cannot read browser relay pins from {MAP}: {e}") from e
+
+def pins(data: dict[str, Any] | None = None) -> tuple[Path, str, Path]:
+    data = data or channels(); return Path(data["channels"]["ompd"]["executable"]), data["channels"]["ompd"]["sha256"], Path(data["channels"]["omp"]["executable"])
+
+def verify_pin(data: dict[str, Any] | None = None) -> tuple[Path, str, Path]:
+    exe, expected, stock = pins(data)
+    if not exe.is_file() or not os.access(exe, os.X_OK): raise ConfigError(f"pinned browser relay executable missing or not executable: {exe}")
+    actual = sha(exe)
+    if actual != expected: raise ConfigError(f"pinned browser relay sha256 mismatch for {exe}: found {actual}, expected {expected}")
+    return exe, expected, stock
+
+def read_mode() -> str:
+    try: mode = MODE_FILE.read_text().strip()
+    except OSError as e: raise ConfigError(f"relay mode policy missing or unreadable: {MODE_FILE} (run launchers/install.sh)") from e
+    if mode not in ("legacy", "pinned"): raise ConfigError(f"invalid relay mode {mode!r} in {MODE_FILE}; expected 'legacy' or 'pinned'")
+    return mode
+def require_state_root() -> None:
+    if not STATE.is_dir():
+        raise ConfigError(f"browser relay state directory missing: {STATE}; run {L}/install.sh (creates {STATE})")
+
+
+def flags(flag: str, paths: Iterable[Path], recursive: bool = False) -> None:
+    existing = [str(p) for p in paths if p.exists() or p.is_symlink()]
+    if not existing: return
+    r = run(["/usr/bin/chflags", *(["-R"] if recursive else []), flag, *existing])
+    if r.returncode: raise ConfigError(f"chflags {flag} failed: {(r.stderr or r.stdout).strip()}")
+
+def write_mode(mode: str) -> None:
+    if mode not in ("legacy", "pinned"): raise ValueError(mode)
+    MODE_FILE.parent.mkdir(parents=True, exist_ok=True); flags("nouchg", (MODE_FILE.parent, MODE_FILE))
+    tmp = MODE_FILE.with_name(f"{MODE_FILE.name}.tmp.{os.getpid()}"); tmp.write_text(mode + "\n"); tmp.chmod(0o644); os.replace(tmp, MODE_FILE)
+    flags("uchg", (MODE_FILE, MODE_FILE.parent))
+
+def version(value: str | None) -> tuple[int, ...]:
+    out = []
+    for part in (value or "").split("."):
+        m = re.match(r"\d+", part)
+        if not m: break
+        out.append(int(m.group()))
+    return tuple(out)
+
+def parse_probe(status: int | None, payload: Any, error: str | None = None) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    raw = payload.get("OMP-Relay-Protocol") if status == 200 else payload.get("relayProtocol")
+    try: protocol = int(raw) if raw is not None else 1
+    except (ValueError, TypeError): protocol = 1
+    binding = payload.get("profileBinding") if status == 503 else None
+    answer = {"reachable": status in (200, 503), "httpStatus": status, "protocol": protocol, "ready": status == 200,
+              "extensionVersion": payload.get("OMP-Extension-Version") if status == 200 else None,
+              "generation": payload.get("OMP-Browser-Generation") if status == 200 else None,
+              "profileBinding": payload.get("OMP-Profile-Binding") if status == 200 else (binding.get("state") if isinstance(binding, dict) else None),
+              "profileFingerprint": payload.get("OMP-Profile-Fingerprint") if status == 200 else None,
+              "browserVersion": payload.get("Browser"),
+              "userAgent": payload.get("User-Agent"),
+              "extensionSeen": payload.get("extensionSeen") if status == 503 else status == 200,
+              "extensionIncompatible": payload.get("extensionIncompatible")}
+    if error: answer["probeError"] = error
+    if status == 503 and isinstance(payload.get("error"), str): answer["relayError"] = payload["error"]
+    return answer
+
+def probe(port: int = PORT, timeout: float = 1.5) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response: status, raw = response.status, response.read()
+    except urllib.error.HTTPError as e: status, raw = e.code, e.read()
+    except (OSError, urllib.error.URLError) as e: return {"url": url, **parse_probe(None, {}, str(e))}
+    try: payload = json.loads(raw)
+    except (ValueError, TypeError) as e: return {"url": url, **parse_probe(status, {}, f"invalid JSON: {e}")}
+    return {"url": url, **parse_probe(status, payload)}
+
+def executable_paths(pid: int) -> list[str]:
+    found: list[str] = []
+    p = run(["/bin/ps", "-p", str(pid), "-o", "comm="], 3)
+    if p.returncode == 0 and p.stdout.strip(): found.append(os.path.realpath(p.stdout.strip()))
+    argv = run(["/bin/ps", "-p", str(pid), "-o", "command="], 3)
+    if argv.returncode == 0:
+        found += [os.path.realpath(x) for x in argv.stdout.strip().split() if x.startswith("/") and os.path.exists(x)]
+    p = run(["/usr/sbin/lsof", "-nP", "-p", str(pid), "-a", "-d", "txt", "-Fn"], 3)
+    if p.returncode == 0: found += [os.path.realpath(x[1:]) for x in p.stdout.splitlines() if x.startswith("n/") and " (deleted)" not in x]
+    return list(dict.fromkeys(found))
+
+def classify(paths: Iterable[str], pinned: Path, stock: Path) -> str:
+    values = {os.path.realpath(x) for x in paths if x}
+    if os.path.realpath(pinned) in values: return "pinned"
+    if os.path.realpath(stock) in values: return "stock"
+    if any("omp-18.1.10" in x or x.startswith("/opt/homebrew/") for x in values): return "legacy"
+    return "foreign"
+
+def owner(port: int, pinned: Path, stock: Path) -> dict[str, Any]:
+    p = run(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"], 4)
+    pid = next((int(x[1:]) for x in p.stdout.splitlines() if x.startswith("p") and x[1:].isdigit()), None)
+    command = next((x[1:] for x in p.stdout.splitlines() if x.startswith("c")), None)
+    if pid is None: return {"listening": False, "pid": None, "command": None, "executables": [], "classification": "none"}
+    paths = executable_paths(pid)
+    return {"listening": True, "pid": pid, "command": command, "executables": paths, "classification": classify(paths, pinned, stock)}
+
+def hashes(root: Path) -> dict[str, str]:
+    return {str(p.relative_to(root)): sha(p) for p in sorted(root.rglob("*")) if p.is_file()} if root.is_dir() else {}
+
+def manifest(root: Path) -> str | None:
+    try:
+        value = json.loads((root / "manifest.json").read_text()).get("version"); return value if isinstance(value, str) else None
+    except (OSError, ValueError, TypeError): return None
+
+def immutable(path: Path) -> dict[str, Any]:
+    if not path.exists(): return {"immutable": False, "listing": None}
+    paths = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
+    listings: list[str] = []
+    all_immutable = True
+    for item in paths:
+        p = run(["/bin/ls", "-ldO", str(item)], 3); text = p.stdout.strip(); listings.append(text)
+        all_immutable = all_immutable and p.returncode == 0 and "uchg" in text.split()
+    return {"immutable": all_immutable, "listing": "\n".join(listings)}
+
+def assets(exe: Path, pin_sha: str) -> tuple[Path, dict[str, str], str]:
+    require_state_root()
+    bundle = STATE / "staged" / pin_sha[:12] / "extension"
+    receipt_path = STATE / "STAGED.json"
+    try:
+        receipt = json.loads(receipt_path.read_text())
+        actual = hashes(bundle)
+        if (receipt.get("pinnedExecutable") == str(exe) and receipt.get("sha256") == pin_sha
+                and receipt.get("path") == str(bundle) and actual == receipt.get("fileHashes")
+                and manifest(bundle) == receipt.get("manifestVersion")):
+            return bundle, actual, receipt["manifestVersion"]
+    except (OSError, ValueError, KeyError, TypeError): pass
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="extension.tmp-", dir=bundle.parent))
+    try:
+        p = run([str(exe), "--profile=relay-service", "browser-relay", "install", "--dir", str(tmp)], 60)
+        if p.returncode: raise ConfigError(f"pinned browser-relay install failed while staging assets: {(p.stderr or p.stdout).strip()}")
+        actual, mv = hashes(tmp), manifest(tmp)
+        if not mv or version(mv) < version(EXTENSION_REQUIRED):
+            raise ConfigError(f"pinned browser-relay stage wrote invalid/old manifest {mv!r}")
+        if bundle.exists(): shutil.rmtree(bundle)
+        os.replace(tmp, bundle)
+        receipt = {"pinnedExecutable": str(exe), "sha256": pin_sha, "path": str(bundle),
+                   "manifestVersion": mv, "fileHashes": actual, "stagedAt": dt.datetime.now(dt.timezone.utc).isoformat()}
+        receipt_tmp = receipt_path.with_name(f"{receipt_path.name}.tmp.{os.getpid()}")
+        receipt_tmp.write_text(json.dumps(receipt, indent=2) + "\n"); os.replace(receipt_tmp, receipt_path)
+        return bundle, actual, mv
+    finally:
+        if tmp.exists(): shutil.rmtree(tmp)
+
+def stage_command() -> int:
+    exe, pin_sha, _ = verify_pin(); bundle, actual, mv = assets(exe, pin_sha)
+    print(f"staged pinned browser extension {mv} ({len(actual)} files) at {bundle}")
+    return OK
+
+def binding_probe(port: int = PORT, timeout: float = 1.5) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/omp/binding"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r: status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e: status, raw = e.code, e.read()
+    except (OSError, urllib.error.URLError) as e: return {"state": "unreachable", "error": str(e), "url": url}
+    try: payload = json.loads(raw)
+    except (ValueError, TypeError) as e: return {"state": "invalid", "error": f"invalid JSON: {e}", "httpStatus": status, "url": url}
+    return {**payload, "httpStatus": status, "url": url} if isinstance(payload, dict) else {"state": "invalid", "error": "response is not an object", "httpStatus": status, "url": url}
+
+def extension_status(exe: Path, pin_sha: str) -> dict[str, Any]:
+    _cache, expected, expected_version = assets(exe, pin_sha); actual = hashes(CANONICAL)
+    return {"path": str(CANONICAL), "exists": CANONICAL.is_dir(), "manifestVersion": manifest(CANONICAL),
+            "expectedManifestVersion": expected_version, "fileHashes": actual, "expectedFileHashes": expected,
+            "hashesMatch": actual == expected, **immutable(CANONICAL)}
+
+def public_binding(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key not in ("installId", "connectedInstallId", "lastRejectedInstallId")}
+
+def normalized_start(value: str) -> dt.datetime | None:
+    words = value.split()
+    candidate = " ".join(words[:5])
+    for pattern in ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y"):
+        try: return dt.datetime.strptime(candidate, pattern)
+        except ValueError: pass
+    return None
+
+def live_preservation() -> dict[str, Any]:
+    try: baseline = json.loads(BASELINE.read_text())
+    except (OSError, ValueError, TypeError) as e: raise ConfigError(f"live relay baseline missing or invalid: {BASELINE}: {e}") from e
+    live_root = Path(baseline["liveExtensionDir"])
+    file_hashes = hashes(live_root)
+    mtimes = {str(p.relative_to(live_root)): dt.datetime.fromtimestamp(p.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+              for p in sorted(live_root.rglob("*")) if p.is_file()}
+    expected_pid = int(baseline["legacyRelay"]["pid"])
+    process = run(["/bin/ps", "-p", str(expected_pid), "-o", "lstart=", "-o", "command="], 5)
+    process_text = process.stdout.strip()
+    lsof = run(["/usr/sbin/lsof", "-nP", f"-iTCP:{baseline['legacyRelay']['port']}", "-sTCP:LISTEN", "-Fp"], 5)
+    listening_pids = [int(line[1:]) for line in lsof.stdout.splitlines() if line.startswith("p") and line[1:].isdigit()]
+    job = run([LAUNCHCTL, "print", f"gui/{os.getuid()}/{LABEL}"], 5)
+    binding_exists = binding_file().exists()
+    expected_mtime = baseline["mtime"]
+    matches = (file_hashes == baseline["sha256"] and bool(mtimes)
+               and all(value == expected_mtime for value in mtimes.values())
+               and normalized_start(baseline["legacyRelay"]["started"]) == normalized_start(process_text)
+               and baseline["legacyRelay"]["executableContains"] in process_text
+               and listening_pids == [expected_pid] and not binding_exists and job.returncode != 0)
+    return {"baseline": str(BASELINE), "matchesBaseline": matches, "fileHashes": file_hashes,
+            "fileMtimes": mtimes, "legacyPid": expected_pid, "process": process_text,
+            "listeningPids": listening_pids, "bindingExists": binding_exists, "launchdLoaded": job.returncode == 0}
+
+def fsync_tree(root: Path) -> None:
+
+    for item in sorted(root.rglob("*")):
+        if item.is_file():
+            descriptor = os.open(item, os.O_RDONLY)
+            try: os.fsync(descriptor)
+            finally: os.close(descriptor)
+    for item in [*sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True), root]:
+        descriptor = os.open(item, os.O_RDONLY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+def record_baseline() -> int:
+    if read_mode() != "legacy":
+        print("omp-relay-share: baseline recording is available only in legacy mode", file=sys.stderr); return REFUSED
+    exe, _, stock = verify_pin(); own = owner(PORT, exe, stock); relay = probe(PORT)
+    if own["classification"] not in ("stock", "legacy") or relay["protocol"] != 1:
+        raise ConfigError(f"refusing baseline: expected a stock/legacy protocol-1 relay on port {PORT}, found {own['classification']} protocol {relay['protocol']}")
+    if binding_file().exists(): raise ConfigError(f"refusing baseline while binding exists: {binding_file()}")
+    job = run([LAUNCHCTL, "print", f"gui/{os.getuid()}/{LABEL}"], 5)
+    if job.returncode == 0: raise ConfigError(f"refusing baseline while {LABEL} is loaded")
+    if not CANONICAL.is_dir(): raise ConfigError(f"canonical extension directory is missing: {CANONICAL}")
+    file_mtimes = {dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+                   for path in CANONICAL.rglob("*") if path.is_file()}
+    if len(file_mtimes) != 1: raise ConfigError("refusing baseline: canonical extension files do not share one mtime")
+    started = run(["/bin/ps", "-p", str(own["pid"]), "-o", "lstart="], 5)
+    if started.returncode: raise ConfigError(f"could not read relay process start time: {started.stderr.strip()}")
+    executable_hint = next((Path(path).name for path in own["executables"] if "omp-" in Path(path).name), Path(own["executables"][0]).name)
+    payload = {
+        "capturedAt": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="minutes"),
+        "liveExtensionDir": str(CANONICAL), "manifestVersion": manifest(CANONICAL),
+        "mtime": next(iter(file_mtimes)), "sha256": hashes(CANONICAL),
+        "legacyRelay": {"pid": own["pid"], "started": started.stdout.strip(), "executableContains": executable_hint,
+                        "port": PORT, "lsofOwner": f"pid {own['pid']}"},
+        "bindingFile": "absent", "launchdJob": f"{LABEL} not loaded",
+        "stagedDir": f"{STATE / 'staged'} (not part of the live baseline)",
+    }
+    BASELINE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = BASELINE.with_name(f"{BASELINE.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n"); os.replace(temporary, BASELINE)
+    print(f"recorded one-maintenance-window live baseline at {BASELINE}"); return OK
+
+def copy_verified(source: Path, destination: Path) -> None:
+    shutil.copytree(source, destination, copy_function=shutil.copy2)
+    if hashes(source) != hashes(destination): raise ConfigError(f"copy verification failed: {source} -> {destination}")
+    fsync_tree(destination)
+
+def move_verified(source: Path, destination: Path) -> None:
+    try:
+        os.replace(source, destination)
+        descriptor = os.open(destination.parent, os.O_RDONLY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+    except OSError as e:
+        if e.errno != errno.EXDEV: raise
+        copy_verified(source, destination)
+        flags("nouchg", (source,), True); shutil.rmtree(source)
+
+def available_backup(stem: str) -> Path:
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    base = BACKUPS / f"{stem}-{os.getpid()}"
+    candidate, counter = base, 1
+    while candidate.exists():
+        candidate = BACKUPS / f"{base.name}-{counter}"
+        counter += 1
+    return candidate
+
+def swap_staged(bundle: Path, expected: dict[str, str], mv: str, ts: str, require_minimum: bool = True) -> tuple[Path | None, dict[str, str]]:
+    CANONICAL.parent.mkdir(parents=True, exist_ok=True)
+    fresh = CANONICAL.parent / f".extension.swap.{os.getpid()}"
+    if fresh.exists(): shutil.rmtree(fresh)
+    copy_verified(bundle, fresh)
+    if hashes(fresh) != expected or manifest(fresh) != mv: raise ConfigError("fresh staged extension copy failed verification")
+    had_original = CANONICAL.exists()
+    was_immutable = had_original and immutable(CANONICAL)["immutable"]
+    saved = available_backup(f"extension-{ts}") if had_original else None
+    try:
+        flags("nouchg", (CANONICAL,), True)
+        if saved is not None: move_verified(CANONICAL, saved)
+        os.replace(fresh, CANONICAL)
+        descriptor = os.open(CANONICAL.parent, os.O_RDONLY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+        actual = verify_canonical(expected, mv, require_minimum)
+        flags("uchg", (*sorted(CANONICAL.rglob("*"), reverse=True), CANONICAL))
+        return saved, actual
+    except Exception:
+        if saved is not None and saved.exists():
+            if CANONICAL.exists():
+                flags("nouchg", (CANONICAL,), True)
+                shutil.rmtree(CANONICAL)
+            try:
+                move_verified(saved, CANONICAL)
+            finally:
+                if CANONICAL.exists() and was_immutable:
+                    flags("uchg", (*sorted(CANONICAL.rglob("*"), reverse=True), CANONICAL))
+        elif had_original:
+            if CANONICAL.exists() and was_immutable:
+                flags("uchg", (*sorted(CANONICAL.rglob("*"), reverse=True), CANONICAL))
+        elif CANONICAL.exists():
+            flags("nouchg", (CANONICAL,), True)
+            shutil.rmtree(CANONICAL)
+        raise
+    finally:
+        if fresh.exists(): shutil.rmtree(fresh)
+
+def facts() -> dict[str, Any]:
+    exe, pin_sha, stock = verify_pin(); mode = read_mode(); own = owner(PORT, exe, stock); relay = probe(PORT); ext = extension_status(exe, pin_sha)
+    binding = ({"state": "unavailable", "reason": "no-binding-endpoint"}
+               if relay["reachable"] and relay["protocol"] < PROTOCOL_REQUIRED else public_binding(binding_probe(PORT)))
+    runtime_ok = not relay["ready"] or version(relay.get("extensionVersion")) >= version(EXTENSION_REQUIRED)
+    binding_ok = binding.get("state") == "bound" and relay.get("profileBinding") == "bound"
+    preservation = live_preservation() if mode == "legacy" else None
+    ok = (mode == "pinned" and own["classification"] == "pinned" and relay["protocol"] >= PROTOCOL_REQUIRED
+          and relay.get("extensionIncompatible") is None and runtime_ok and ext["hashesMatch"] and ext["immutable"] and binding_ok)
+    return {"mode": mode, "port": PORT, "label": LABEL, "pinnedExecutable": str(exe), "pinnedSha256": pin_sha,
+            "owner": own, "probe": relay, "binding": binding, "extension": ext, "livePreservation": preservation, "ok": ok}
+
+def print_facts(value: dict[str, Any], as_json: bool = False) -> None:
+    if as_json: print(json.dumps(value, indent=2, sort_keys=True)); return
+    o, p, b, e = value["owner"], value["probe"], value["binding"], value["extension"]
+    binding_text = ("state=unavailable (protocol-1 relay has no binding endpoint)"
+                    if b.get("state") == "unavailable"
+                    else f"state={b.get('state')} bound={b.get('boundFingerprint')} connected={b.get('connectedFingerprint')} rejected={b.get('lastRejected')}")
+    rows = (("mode", value["mode"]), ("service", f"{value['label']} port={value['port']}"),
+            ("pinned executable", f"{value['pinnedExecutable']} sha256={value['pinnedSha256']}"),
+            ("port owner", f"{o['classification']} pid={o['pid']} command={o['command']}"),
+            ("relay", f"http={p['httpStatus']} protocol={p['protocol']} ready={p['ready']}"),
+            ("relay extension", f"version={p.get('extensionVersion')} generation={p.get('generation')} incompatible={p.get('extensionIncompatible')}"),
+            ("profile binding", binding_text),
+            ("canonical extension", f"{e['path']} manifest={e['manifestVersion']} hashesMatch={e['hashesMatch']} uchg={e['immutable']}"),
+            ("result", "ok" if value["ok"] else ("degraded" if value["mode"] == "legacy" and value["livePreservation"]["matchesBaseline"] else "broken")))
+    for key, val in rows: print(f"{key}: {val}")
+    if value["livePreservation"] is not None:
+        print(f"live preservation: baseline={value['livePreservation']['baseline']} matches={value['livePreservation']['matchesBaseline']}")
+
+def status_command(as_json: bool) -> int:
+    value = facts(); print_facts(value, as_json)
+    if value["mode"] == "legacy": return DEGRADED if value["livePreservation"]["matchesBaseline"] else BROKEN
+    return OK if value["ok"] else BROKEN
+
+def wait_protocol(seconds: float, require_ready: bool | None = None) -> dict[str, Any]:
+    deadline = time.monotonic() + seconds; last = probe(PORT)
+    while time.monotonic() < deadline:
+        last = probe(PORT, min(1.5, max(.1, deadline - time.monotonic())))
+        if last["reachable"] and last["protocol"] >= PROTOCOL_REQUIRED and (require_ready is None or last["ready"] is require_ready): return last
+        time.sleep(.1)
+    return last
+
+def kickstart(timeout: float = 8) -> subprocess.CompletedProcess[str]:
+    return run([LAUNCHCTL, "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"], timeout)
+
+def ensure_command() -> int:
+    if read_mode() == "legacy": return OK
+    current = probe(PORT)
+    if current["reachable"] and current["protocol"] >= PROTOCOL_REQUIRED: return OK
+    started_at = time.monotonic()
+    try: started = kickstart(3)
+    except subprocess.TimeoutExpired:
+        print(f"omp-relay-share: WARN pinned relay unavailable after kickstart {LABEL}: launchctl timed out", file=sys.stderr)
+        return BROKEN
+    remaining = max(.1, 5 - (time.monotonic() - started_at)); after = wait_protocol(remaining)
+    if not (after["reachable"] and after["protocol"] >= PROTOCOL_REQUIRED):
+        reason = (started.stderr or started.stdout).strip() or f"protocol {after['protocol']} at {after['url']}"
+        print(f"omp-relay-share: WARN pinned relay unavailable after kickstart {LABEL}: {reason}", file=sys.stderr)
+        return BROKEN
+    return OK
+
+def verify_canonical(expected: dict[str, str], mv: str, require_minimum: bool = True) -> dict[str, str]:
+    actual = hashes(CANONICAL)
+    if actual != expected:
+        missing, extra = sorted(set(expected) - set(actual)), sorted(set(actual) - set(expected))
+        changed = sorted(k for k in expected.keys() & actual.keys() if expected[k] != actual[k])
+        raise ConfigError(f"canonical extension differs from pinned assets (missing={missing}, extra={extra}, changed={changed})")
+    found = manifest(CANONICAL)
+    if found != mv or (require_minimum and version(found) < version(EXTENSION_REQUIRED)):
+        raise ConfigError(f"canonical extension manifest {found!r} does not meet expected {mv!r}" + (f" / minimum {EXTENSION_REQUIRED}" if require_minimum else ""))
+    return actual
+
+def install_command() -> int:
+    if read_mode() != "pinned": print("omp-relay-share: live cutover deferred; run omp-relay-share cutover", file=sys.stderr); return REFUSED
+    exe, pin_sha, _ = verify_pin(); bundle, expected, mv = assets(exe, pin_sha)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    saved, actual = swap_staged(bundle, expected, mv, ts)
+    receipt = {"pinnedExecutable": str(exe), "sha256": pin_sha, "manifestVersion": mv, "fileHashes": actual,
+               "backup": str(saved) if saved else None, "installedAt": dt.datetime.now(dt.timezone.utc).isoformat()}
+    (STATE / "INSTALLED.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    print(f"atomically installed pinned browser extension {mv} at {CANONICAL}"); return OK
+
+def binding_file() -> Path: return HOME / ".omp" / "browser-relay" / "binding.json"
+
+def valid_install_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", value))
+
+def write_binding(install_id: str, note: str | None = None) -> None:
+    if not valid_install_id(install_id): raise ConfigError("install id must be a UUID")
+    path = binding_file(); path.parent.mkdir(parents=True, exist_ok=True); payload = {"installId": install_id, "boundAt": dt.datetime.now(dt.timezone.utc).isoformat()}
+    if note: payload["note"] = note
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as stream: stream.write(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, path)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+
+def bind_command(from_connected: bool, install_id: str | None, note: str | None, expected_fingerprint: str | None = None) -> int:
+    if read_mode() != "pinned": print("omp-relay-share: bind is available only after cutover enters pinned mode", file=sys.stderr); return REFUSED
+    if from_connected == bool(install_id): print("omp-relay-share: bind requires exactly one of --from-connected or --install-id UUID", file=sys.stderr); return USAGE
+    if from_connected:
+        if not expected_fingerprint: print("omp-relay-share: bind --from-connected requires --expect <fingerprint>", file=sys.stderr); return REFUSED
+        current = binding_probe(PORT)
+        install_id = current.get("connectedInstallId") if current.get("state") == "unbound" else None
+        if not isinstance(install_id, str): raise ConfigError("relay is not unbound with a connected extension; cannot bind --from-connected")
+        found_fingerprint = current.get("connectedFingerprint")
+        if found_fingerprint != expected_fingerprint:
+            print(f"omp-relay-share: connected fingerprint changed: expected {expected_fingerprint}, found {found_fingerprint}; inspect again and retry", file=sys.stderr)
+            return REFUSED
+    assert install_id is not None; write_binding(install_id, note)
+    deadline = time.monotonic() + 5; last = probe(PORT)
+    while time.monotonic() < deadline:
+        last = probe(PORT)
+        if last["ready"] and last.get("profileBinding") == "bound": print(f"bound relay profile {last.get('profileFingerprint') or binding_probe(PORT).get('boundFingerprint')}"); return OK
+        time.sleep(.1)
+    raise ConfigError(f"binding was written but relay did not confirm a bound ready extension: {last}")
+
+def unbind_command() -> int:
+    if read_mode() != "pinned": print("omp-relay-share: unbind is available only in pinned relay mode", file=sys.stderr); return REFUSED
+    path = binding_file()
+    try: path.unlink()
+    except FileNotFoundError: pass
+    print(f"relay profile unbound: {path} removed; pinned relay now fails closed until an explicit bind")
+    return OK
+
+def plist(exe: Path, home: Path = HOME, port: int = PORT) -> str:
+    def s(x: str) -> str: return f"\t\t<string>{html.escape(x)}</string>"
+    args = "\n".join(s(x) for x in (str(exe), "--profile=relay-service", "browser-relay", "serve", "--port", str(port), "--supervised"))
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "OMP_PROFILE": "relay-service", "PI_PROFILE": "relay-service", "PI_CONFIG_DIR": ".omp", "OMP_CHANNEL": "relay-service"}
+    env_xml = "\n".join(f"\t\t<key>{html.escape(k)}</key>\n\t\t<string>{html.escape(v)}</string>" for k, v in env.items()); logs = home / ".omp/profiles/relay-service/logs"
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+\t<key>Label</key><string>{LABEL}</string>
+\t<key>ProgramArguments</key><array>\n{args}\n\t</array>
+\t<key>EnvironmentVariables</key><dict>\n{env_xml}\n\t</dict>
+\t<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>5</integer>
+\t<key>StandardOutPath</key><string>{html.escape(str(logs / 'browser-relay.log'))}</string>
+\t<key>StandardErrorPath</key><string>{html.escape(str(logs / 'browser-relay.err.log'))}</string>
+</dict></plist>\n'''
+
+def install_service(load: bool) -> int:
+    exe, _, _ = verify_pin(); PLIST_SOURCE.parent.mkdir(parents=True, exist_ok=True); PLIST_SOURCE.write_text(plist(exe))
+    checked = run(["/usr/bin/plutil", "-lint", str(PLIST_SOURCE)])
+    if checked.returncode: raise ConfigError(f"rendered plist failed plutil: {(checked.stderr or checked.stdout).strip()}")
+    print(f"relay plist staged: {PLIST_SOURCE}")
+    if not load: return OK
+    PLIST_INSTALLED.parent.mkdir(parents=True, exist_ok=True); (HOME / ".omp/profiles/relay-service/logs").mkdir(parents=True, exist_ok=True); shutil.copy2(PLIST_SOURCE, PLIST_INSTALLED)
+    domain = f"gui/{os.getuid()}"; run([LAUNCHCTL, "bootout", domain, str(PLIST_INSTALLED)], 10); loaded = run([LAUNCHCTL, "bootstrap", domain, str(PLIST_INSTALLED)], 10)
+    if loaded.returncode: raise ConfigError(f"could not bootstrap {LABEL}: {(loaded.stderr or loaded.stdout).strip()}")
+    print(f"relay LaunchAgent loaded: {PLIST_INSTALLED}"); return OK
+
+def stop_old(exe: Path, stock: Path) -> None:
+    stopped = run([str(exe), "ps", "--global", "browser-relay", "stop", "omp.browser.relay"], 20)
+    if stopped.returncode == 0: return
+    live = owner(PORT, exe, stock)
+    live_pid = live.get("pid")
+    if not isinstance(live_pid, int) or live["classification"] == "pinned":
+        raise ConfigError(f"broker stop failed and port {PORT} has no proven non-pinned owner")
+    root = HOME / ".omp/run/daemons/global/browser-relay/daemons/omp.browser.relay"
+    for name in sorted(glob.glob(str(root / "meta.*"))):
+        try: text = Path(name).read_text()
+        except OSError: continue
+        found = {int(raw) for raw in re.findall(r'(?i)(?:"pid"\s*:\s*|\bpid\s*[=:]\s*)(\d+)', text)}
+        if live_pid not in found: continue
+        kind = classify(executable_paths(live_pid), exe, stock)
+        if kind not in ("stock", "legacy"): raise ConfigError(f"refusing fallback SIGTERM: port owner {live_pid} is {kind}, not a verified stock/legacy relay")
+        try: os.kill(live_pid, signal.SIGTERM); return
+        except ProcessLookupError: break
+    raise ConfigError(f"broker stop failed and metadata did not prove port owner pid {live_pid} under {root}")
+
+def restore_legacy_relay(before: dict[str, Any], executable: str | None = None) -> None:
+    current = probe(PORT)
+    if current["reachable"] and current["protocol"] == 1: return
+    if not before.get("owner", {}).get("listening"): return
+    legacy = Path(executable) if executable else None
+    if legacy is None or not legacy.is_file(): raise ConfigError("could not identify the pre-cutover stock/legacy relay executable for recovery")
+    subprocess.Popen([str(legacy), "browser-relay", "--port", str(PORT)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        current = probe(PORT)
+        if current["reachable"] and current["protocol"] == 1: return
+        time.sleep(.1)
+    raise ConfigError(f"legacy relay recovery failed on port {PORT}: {current}")
+
+def recovery_executable(before: dict[str, Any], stock: Path) -> str | None:
+    return next((path for path in before.get("owner", {}).get("executables", [])
+                 if os.path.realpath(path) == os.path.realpath(stock) or "omp-18.1.10" in path), None)
+
+
+def evidence(kind: str, ts: str, value: dict[str, Any]) -> Path:
+    EVIDENCE.mkdir(parents=True, exist_ok=True); path = EVIDENCE / f"{kind}-{ts}.json"; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n"); return path
+
+def cutover(yes: bool, no_wait: bool) -> int:
+    if not yes: print("omp-relay-share: cutover changes the live relay; re-run with --yes", file=sys.stderr); return REFUSED
+    exe, pin_sha, stock = verify_pin(); bundle, expected, mv = assets(exe, pin_sha)
+    ts = time.strftime("%Y%m%dT%H%M%S"); before = facts()
+    if before["owner"]["classification"] == "foreign": raise ConfigError(f"refusing cutover: port {PORT} is owned by an unrecognized process")
+    recoverable_executable = recovery_executable(before, stock)
+    if before["owner"].get("listening") and recoverable_executable is None:
+        raise ConfigError("refusing cutover: could not identify the pre-cutover stock/legacy executable for recovery")
+    if before["probe"].get("ready"): print("omp-relay-share: WARN relay extension is connected; confirm no browser automation task is mid-run", file=sys.stderr)
+    saved: Path | None = None; actual: dict[str, str] = {}; swapped = False
+    try:
+        saved, actual = swap_staged(bundle, expected, mv, ts); swapped = True
+        stop_old(exe, stock)
+        install_service(True)
+        available = wait_protocol(15)
+        if not available["reachable"] or available["protocol"] < PROTOCOL_REQUIRED:
+            raise ConfigError(f"pinned relay did not reach protocol {PROTOCOL_REQUIRED}: {available}")
+        write_mode("pinned")
+    except Exception as cutover_error:
+        recovery_errors: list[str] = []
+        domain = f"gui/{os.getuid()}"
+        stopped = run([LAUNCHCTL, "bootout", domain, str(PLIST_INSTALLED)], 10)
+        if stopped.returncode not in (0, 3): recovery_errors.append(f"bootout: {(stopped.stderr or stopped.stdout).strip()}")
+        try:
+            if swapped and saved is not None:
+                swap_staged(saved, hashes(saved), manifest(saved) or "0.0.0", f"{ts}-failed", False)
+            elif swapped and CANONICAL.exists():
+                flags("nouchg", (CANONICAL,), True); shutil.rmtree(CANONICAL)
+        except Exception as recovery_error: recovery_errors.append(f"extension restore: {recovery_error}")
+        try: write_mode("legacy")
+        except Exception as recovery_error: recovery_errors.append(f"mode restore: {recovery_error}")
+        try: restore_legacy_relay(before, recoverable_executable)
+        except Exception as recovery_error: recovery_errors.append(f"legacy relay restore: {recovery_error}")
+        if recovery_errors: raise ConfigError(f"cutover failed ({cutover_error}); recovery also failed: {'; '.join(recovery_errors)}") from cutover_error
+        raise
+    legacy_executable = recoverable_executable
+    (STATE / "INSTALLED.json").write_text(json.dumps({
+        "pinnedExecutable": str(exe), "sha256": pin_sha, "manifestVersion": mv, "fileHashes": actual,
+        "backup": str(saved) if saved else None, "backupManifestVersion": manifest(saved) if saved else None,
+        "backupHashes": hashes(saved) if saved else None, "legacyExecutable": legacy_executable,
+        "installedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }, indent=2) + "\n")
+    print(f"MANUAL STEP: reload the unpacked extension in chrome://extensions (path remains {CANONICAL})")
+    connected = binding_probe(PORT)
+    if not no_wait:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            connected = binding_probe(PORT)
+            if connected.get("state") == "bound" or (connected.get("state") == "unbound" and connected.get("connectedInstallId")): break
+            time.sleep(.5)
+    relay = probe(PORT)
+    if connected.get("state") == "unbound" and connected.get("connectedInstallId"):
+        identity = connected.get("connectedBrowser") if isinstance(connected.get("connectedBrowser"), dict) else {}
+        browser_version = identity.get("browserVersion") or relay.get("browserVersion")
+        user_agent = identity.get("userAgent") or relay.get("userAgent")
+        print(f"connected unbound extension: fingerprint={connected.get('connectedFingerprint')} browserVersion={browser_version} userAgent={user_agent}")
+        print(f"NEXT STEP: omp-relay-share bind --from-connected --expect {connected.get('connectedFingerprint')}")
+    elif connected.get("state") == "bound":
+        print(f"retained approved relay profile binding: fingerprint={connected.get('boundFingerprint')}")
+    elif not no_wait:
+        print("omp-relay-share: no extension hello arrived within 120 seconds", file=sys.stderr)
+    after = facts(); receipt = evidence("cutover", ts, {
+        "at": dt.datetime.now(dt.timezone.utc).isoformat(), "backup": str(saved) if saved else None,
+        "before": before, "after": after, "waitSkipped": no_wait, "connectedBinding": public_binding(connected),
+    })
+    print(f"cutover receipt: {receipt}"); print_facts(after)
+    return OK if no_wait or connected.get("state") == "bound" or connected.get("connectedInstallId") else BROKEN
+
+def newest_backup() -> Path | None:
+    values = sorted(p for p in BACKUPS.glob("extension-*") if p.is_dir() and re.fullmatch(r"extension-\d{8}T\d{6}(?:-\d+(?:-\d+)?)?", p.name))
+    return values[-1] if values else None
+
+def rollback() -> int:
+    ts = time.strftime("%Y%m%dT%H%M%S"); before = facts(); domain = f"gui/{os.getuid()}"
+    saved = newest_backup()
+    if saved is None: raise ConfigError(f"no extension backup exists under {BACKUPS}")
+    restored_version, restored_hashes = manifest(saved), hashes(saved)
+    if not restored_version or not restored_hashes: raise ConfigError(f"backup is incomplete or has no valid manifest: {saved}")
+    try: installed = json.loads((STATE / "INSTALLED.json").read_text())
+    except (OSError, ValueError, TypeError): installed = {}
+    if installed.get("backup") != str(saved) or installed.get("backupManifestVersion") != restored_version or installed.get("backupHashes") != restored_hashes:
+        raise ConfigError(f"backup does not match the cutover receipt: {saved}")
+    legacy_executable = installed.get("legacyExecutable")
+    if not isinstance(legacy_executable, str) or not Path(legacy_executable).is_file():
+        raise ConfigError("installed receipt does not contain the verified pre-cutover legacy executable")
+    stopped = run([LAUNCHCTL, "bootout", domain, str(PLIST_INSTALLED)], 10)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and probe(PORT)["protocol"] >= PROTOCOL_REQUIRED: time.sleep(.1)
+    if probe(PORT)["protocol"] >= PROTOCOL_REQUIRED:
+        raise ConfigError(f"pinned relay still owns port {PORT} after bootout; refusing to replace the extension")
+    displaced, _ = swap_staged(saved, restored_hashes, restored_version, f"{ts}-pinned", False)
+    write_mode("legacy")
+    restore_legacy_relay(before, legacy_executable)
+    print(f"MANUAL STEP: reload the unpacked extension in chrome://extensions (path remains {CANONICAL})")
+    print(f"binding retained at {binding_file()} (legacy relay ignores it)")
+    after = {"mode": read_mode(), "probe": probe(PORT), "bindingFilePresent": binding_file().exists(), "extension": {"path": str(CANONICAL), "manifestVersion": manifest(CANONICAL), **immutable(CANONICAL)}}
+    receipt = evidence("rollback", ts, {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "before": before, "after": after, "backupRestored": str(saved), "displacedPinned": str(displaced) if displaced else None, "bootout": {"rc": stopped.returncode, "stdout": stopped.stdout, "stderr": stopped.stderr}})
+    print(f"rollback receipt: {receipt}"); return OK
+
+def repair() -> int:
+    if read_mode() != "pinned": print("omp-relay-share: repair is available only in pinned relay mode", file=sys.stderr); return REFUSED
+    exe, _, stock = verify_pin(); own, current = owner(PORT, exe, stock), probe(PORT)
+    if own["classification"] in ("stock", "legacy", "foreign") or (own["classification"] == "pinned" and current["protocol"] < PROTOCOL_REQUIRED):
+        stop_old(exe, stock)
+    started = kickstart()
+    if started.returncode: raise ConfigError(f"could not kickstart {LABEL}: {(started.stderr or started.stdout).strip()}")
+    after = wait_protocol(15)
+    if not after["reachable"] or after["protocol"] < PROTOCOL_REQUIRED: raise ConfigError(f"pinned relay did not become available: {after}")
+    return status_command(False)
+
+def strip_action(args: list[str], action: str) -> list[str]:
+    out: list[str] = []; removed = False; before = True
+    for value in args:
+        if value == "--": before = False
+        if before and not removed and value == action: removed = True; continue
+        out.append(value)
+    return out
+
+def serve(args: list[str]) -> int:
+    if read_mode() != "pinned": print("omp-relay-share: live cutover deferred; run omp-relay-share cutover", file=sys.stderr); return REFUSED
+    exe, _, _ = verify_pin(); os.execv(str(exe), [str(exe), "--profile=relay-service", "browser-relay", "serve", *strip_action(args, "serve")]); return CONFIG
+
+def make_parser() -> argparse.ArgumentParser:
+    root = RelayParser(prog="omp-relay-share"); sub = root.add_subparsers(dest="command", required=True, parser_class=RelayParser)
+    p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
+    sub.add_parser("ensure")
+    sub.add_parser("stage")
+    p = sub.add_parser("install"); p.add_argument("routed", nargs="*")
+    p = sub.add_parser("serve"); p.add_argument("routed", nargs=argparse.REMAINDER)
+    p = sub.add_parser("install-service"); p.add_argument("--load", action="store_true")
+    p = sub.add_parser("cutover"); p.add_argument("--yes", action="store_true"); p.add_argument("--no-wait", action="store_true")
+    sub.add_parser("rollback"); sub.add_parser("repair")
+    p = sub.add_parser("baseline"); p.add_argument("--record", action="store_true", required=True)
+    p = sub.add_parser("bind"); g = p.add_mutually_exclusive_group(required=True); g.add_argument("--from-connected", action="store_true"); g.add_argument("--install-id"); p.add_argument("--expect"); p.add_argument("--note")
+    sub.add_parser("unbind")
+    return root
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        a = make_parser().parse_args(argv)
+        require_state_root()
+        if a.command == "status": return status_command(a.json)
+        if a.command == "stage": return stage_command()
+        if a.command == "ensure": return ensure_command()
+        if a.command == "install":
+            extra = strip_action(a.routed, "install")
+            if extra: print(f"omp-relay-share: install takes no arguments: {' '.join(extra)}", file=sys.stderr); return USAGE
+            return install_command()
+        if a.command == "serve": return serve(a.routed)
+        if a.command == "install-service": return install_service(a.load)
+        if a.command == "cutover": return cutover(a.yes, a.no_wait)
+        if a.command == "rollback": return rollback()
+        if a.command == "repair": return repair()
+        if a.command == "baseline": return record_baseline()
+        if a.command == "bind": return bind_command(a.from_connected, a.install_id, a.note, a.expect)
+        if a.command == "unbind": return unbind_command()
+        return USAGE
+    except ConfigError as e: print(f"omp-relay-share: {e}", file=sys.stderr); return CONFIG
+    except UsageError as e: print(f"omp-relay-share: {e}", file=sys.stderr); return USAGE
+    except subprocess.TimeoutExpired as e: print(f"omp-relay-share: command timed out after {e.timeout}s: {e.cmd}", file=sys.stderr); return CONFIG
+    except KeyboardInterrupt: return 130
+
+if __name__ == "__main__": sys.exit(main())

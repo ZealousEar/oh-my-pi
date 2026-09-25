@@ -1,0 +1,78 @@
+# Subscription-only model policy (approved defaults: Fable via Anthropic OAuth, Sol via
+# openai-codex OAuth; openrouter owner-approved 2026-09-22, key held by the shared authority).
+# Every other catalog provider and the keyless local discoverables are
+# disabled so an API key inherited from the shell environment (e.g. FIREWORKS_API_KEY from
+# ~/.zshenv) can never become the silently selected default. With no login yet, no model
+# resolves and the TUI shows the pending-login state instead of a paid fallback.
+# Generated from /Users/farhad/Code/omp-next-2026-09-18/packages/catalog/src/models.json: 69 catalog providers
+# - 3 allowed (anthropic, openai-codex, openrouter) + 3 keyless local discoverables = 69 denied ids.
+disabledProviders:
+  - abliteration
+  - aiand
+  - aimlapi
+  - alibaba-coding-plan
+  - alibaba-token-plan
+  - amazon-bedrock
+  - azure
+  - baseten
+  - bedrock-mantle
+  - cerebras
+  - cline-pass
+  - cloudflare-ai-gateway
+  - commandcode
+  - coreweave
+  - cursor
+  - deepinfra
+  - deepseek
+  - devin
+  - firepass
+  - fireworks
+  - github-copilot
+  - gitlab-duo
+  - gitlab-duo-agent
+  - gmi-cloud
+  - google
+  - google-antigravity
+  - google-gemini-cli
+  - google-vertex
+  - groq
+  - huggingface
+  - kilo
+  - kimi-code
+  - meta
+  - minimax
+  - minimax-cn
+  - minimax-code
+  - minimax-code-cn
+  - mistral
+  - moonshot
+  - muse-code
+  - nanogpt
+  - novita
+  - nvidia
+  - ollama-cloud
+  - openai
+  - opencode-go
+  - opencode-zen
+  - qianfan
+  - qwen-portal
+  - sakana
+  - synthetic
+  - together
+  - umans
+  - venice
+  - vercel-ai-gateway
+  - wafer-serverless
+  - xai
+  - xai-oauth
+  - xiaomi
+  - xiaomi-token-plan-ams
+  - xiaomi-token-plan-cn
+  - xiaomi-token-plan-sgp
+  - yolo-auto
+  - zai
+  - zenmux
+  - zhipu-coding-plan
+  - ollama
+  - llama.cpp
+  - lm-studio

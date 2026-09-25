@@ -1,0 +1,8 @@
+# Shared credential authority (shared-auth 2026-09-19): all channels read and write
+# credentials through the loopback auth broker served from ~/.omp/profiles/auth-authority
+# (launchd label ai.omp.auth-authority, pinned stock binary). The bearer token lives in
+# <profile root>/auth-broker.token (0600), never in this file. Removing this block makes the
+# channel refuse to start (wrapper check) rather than silently using a private store.
+auth:
+  broker:
+    url: http://127.0.0.1:41871

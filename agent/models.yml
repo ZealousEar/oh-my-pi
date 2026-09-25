@@ -1,0 +1,50 @@
+# converge L3 judges: pin each OpenRouter model to its vendor's own endpoint and
+# fail closed instead of degrading to another provider/quantization.
+# Source: local://openrouter-config.md (2026-09-24). The whole OpenRouter `provider`
+# object lives in compat.extraBody: extraBody is applied after the narrow
+# openRouterRouting object and therefore wins; never split fields between the two.
+providers:
+  openrouter:
+    modelOverrides:
+      moonshotai/kimi-k3:
+        compat:
+          extraBody:
+            provider:
+              only: [moonshotai/mxfp4]
+              order: [moonshotai/mxfp4]
+              allow_fallbacks: false
+              require_parameters: true
+              data_collection: deny
+              quantizations: [mxfp4]
+
+      z-ai/glm-5.3:
+        # Z.AI's own endpoint advertises a 131,072 completion ceiling; the
+        # cross-provider aggregate (943,717) belongs to third-party FP8 hosts.
+        maxTokens: 131072
+        compat:
+          extraBody:
+            provider:
+              only: [z-ai/fp8]
+              order: [z-ai/fp8]
+              allow_fallbacks: false
+              require_parameters: true
+              data_collection: deny
+              quantizations: [fp8]
+
+  # Featherless (owner-approved 2026-09-25; Developer plan, flat monthly). OpenAI-compatible.
+  # The key lives in the macOS Keychain only; add it once with
+  #   security add-generic-password -a "$USER" -s featherless-api-key -w
+  # Models are listed by hand: the endpoint serves ~22k ids, so discovery stays off.
+  # contextWindow = Featherless's published context_length for the id (GET /v1/models).
+  featherless:
+    baseUrl: https://api.featherless.ai/v1
+    api: openai-completions
+    apiKey: "!security find-generic-password -s featherless-api-key -w"
+    models:
+      - id: heretic-org/Qwen3.8-27B-heretic-ara
+        name: Qwen3.8 27B heretic-ara (Featherless)
+        reasoning: false
+        input: [text]
+        contextWindow: 32768
+        maxTokens: 8192
+        tokenizer: qwen3

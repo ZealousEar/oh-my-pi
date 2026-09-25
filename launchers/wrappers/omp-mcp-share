@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+"""omp-mcp-share: make managed MCP OAuth logins automatic across the omp/ompd/ompdev channels.
+
+Fork channels (ompd, ompdev) share in-process: with OMP_SHARED_MCP_PROFILES set (the wrappers pin it)
+`/mcp login|reauth` mints the url-keyed id `mcp_oauth:<url>`, lookup accepts that id plus every listed
+channel's own `mcp_oauth:profile:<p>:<url>` row (client-id guarded), and `/mcp unauth` removes all of
+them (packages/coding-agent/src/mcp/oauth-flow.ts, mcp/oauth-credentials.ts).
+
+The immutable stock build only resolves ITS profile-scoped row or a config `auth.credentialId`
+pointer. Its own logins are adopted by the fork channels automatically; the other direction needs a
+pointer, which this tool writes into the stock profile's user-level mcp.json at every `omp` launch.
+Adoptable rows, in order: the url-keyed `mcp_oauth:<url>` row (fork login), else the legacy-era
+`mcp_oauth:profile:default:<url>` row that handover-oauth.py transfers to the authority under its
+original id (the `default` profile is the legacy config root, not a channel).
+
+  sync   --profile <p> [--quiet]   add pointers for adoptable authority rows (never touches project files,
+                                   never overrides an existing pointer or a server that has its own scoped
+                                   row); drop pointers this tool wrote whose authority row no longer exists
+                                   (logout made elsewhere). Atomic write + timestamped backup; exit 0 always.
+  status --profile <p>             same analysis, JSON, no writes.
+
+Reads the authority store read-only (row ids/providers only). Never prints token material.
+"""
+# omp-mcp-share: stock channel adopts MCP OAuth logins made in the fork channels
+import argparse, json, os, sqlite3, sys, time
+
+HOME = os.path.expanduser("~")
+AUTHORITY_DB = f"{HOME}/.omp/profiles/auth-authority/agent/agent.db"
+PREFIX = "mcp_oauth:"
+SCOPED = "mcp_oauth:profile:"
+
+def authority_rows() -> tuple[set[str], dict[str, set[str]]]:
+    """url-keyed urls, and {profile: urls} for active profile-scoped rows."""
+    con = sqlite3.connect(f"file:{AUTHORITY_DB}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = con.execute("select provider from auth_credentials where credential_type='oauth' and provider like ? and coalesce(disabled_cause,'')=''", (PREFIX + "%",)).fetchall()
+    finally:
+        con.close()
+    shared, scoped = set(), {}
+    for (p,) in rows:
+        if p.startswith(SCOPED):
+            rest = p[len(SCOPED):]
+            prof, _, url = rest.partition(":")
+            scoped.setdefault(prof, set()).add(url)
+        else:
+            shared.add(p[len(PREFIX):])
+    return shared, scoped
+
+def mcp_files(profile: str) -> list[str]:
+    d = f"{HOME}/.omp/profiles/{profile}/agent"
+    return [p for p in (f"{d}/mcp.json", f"{d}/.mcp.json") if os.path.isfile(p)]
+
+def analyse(profile: str) -> dict:
+    shared, scoped = authority_rows()
+    own = scoped.get(profile, set()); legacy = scoped.get("default", set()) if profile != "default" else set()
+    def pointer_for(url): return PREFIX + url if url in shared else (SCOPED + "default:" + url if url in legacy else None)
+    report = {"profile": profile, "urlKeyedRows": len(shared), "ownScopedRows": len(own), "legacyDefaultRows": len(legacy), "files": []}
+    for fp in mcp_files(profile):
+        try:
+            cfg = json.load(open(fp))
+        except Exception as e:  # malformed file: never rewrite it
+            report["files"].append({"path": fp, "error": f"unreadable: {e}"}); continue
+        servers = cfg.get("mcpServers") if isinstance(cfg.get("mcpServers"), dict) else None
+        if servers is None:
+            report["files"].append({"path": fp, "servers": 0}); continue
+        add, drop, dup = {}, [], []            # add: name -> pointer id (new or re-pointed); drop: pointer whose row is gone
+        for name, s in servers.items():
+            if not isinstance(s, dict) or s.get("type") not in ("http", "sse") or not isinstance(s.get("url"), str): continue
+            url = s["url"]; auth = s.get("auth") if isinstance(s.get("auth"), dict) else None
+            cid = auth.get("credentialId") if auth else None
+            target = pointer_for(url)
+            if cid in (PREFIX + url, SCOPED + "default:" + url):      # a pointer this tool maintains
+                if url in own or cid == target: continue               # stock's own row wins locally / pointer still valid
+                if target is None: drop.append(name)                   # adopted row gone (logout in another channel) and no own row
+                else: add[name] = target                               # named row gone, another adoptable row exists: re-point
+            elif auth is None and target and url not in own:
+                add[name] = target                                     # fork-made login or transferred legacy grant, stock has no pointer yet
+            elif target and url in own:
+                dup.append(name)                                       # two grants for one server: stock's scoped row wins locally
+        report["files"].append({"path": fp, "servers": len(servers), "addPointer": add, "dropPointer": drop, "duplicateGrant": dup, "_cfg": cfg})
+    return report
+
+def write_atomic(fp: str, cfg: dict) -> str:
+    bak = f"{fp}.bak-mcp-share-{time.strftime('%Y%m%dT%H%M%S')}"
+    with open(bak, "w") as f: f.write(open(fp).read())
+    os.chmod(bak, 0o600)
+    tmp = f"{fp}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f: json.dump(cfg, f, indent=2); f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, fp)
+    return bak
+
+def main() -> int:
+    ap = argparse.ArgumentParser(); ap.add_argument("verb", choices=["sync", "status"]); ap.add_argument("--profile", required=True); ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    # The pointers name AUTHORITY rows; while the owner has rolled the channels back to private
+    # stores (policy/auth-mode = local) they must be neither written nor kept in sync.
+    try:
+        mode = open(os.environ.get("OMP_CHANNELS_DIR", f"{HOME}/.omp-channels") + "/policy/auth-mode").read().strip()
+    except OSError:
+        mode = "missing"
+    if mode != "authority":
+        if not a.quiet: print(json.dumps({"profile": a.profile, "skipped": f"auth-mode is '{mode}', pointers are only maintained in authority mode", "changed": []}))
+        return 0
+    try:
+        rep = analyse(a.profile)
+    except Exception as e:
+        if not a.quiet: print(json.dumps({"error": f"authority store unreadable: {e}"}))
+        return 0 if a.verb == "sync" else 1
+    changed = []
+    for f in rep["files"]:
+        cfg = f.pop("_cfg", None)
+        if a.verb != "sync" or cfg is None or not (f.get("addPointer") or f.get("dropPointer")): continue
+        servers = cfg["mcpServers"]
+        for name, pointer in f["addPointer"].items():
+            servers[name]["auth"] = {"type": "oauth", "credentialId": pointer}
+        for name in f["dropPointer"]:
+            del servers[name]["auth"]
+        f["backup"] = write_atomic(f["path"], cfg); changed.append(f["path"])
+    rep["changed"] = changed
+    if a.quiet:
+        for f in rep["files"]:
+            for n, pointer in f.get("addPointer", {}).items(): print(f"omp-mcp-share: {a.profile}: '{n}' now uses the shared MCP login {pointer} " + ("transferred from the legacy store" if pointer.startswith(SCOPED) else "made in another channel"), file=sys.stderr)
+            for n in f.get("dropPointer", []): print(f"omp-mcp-share: {a.profile}: '{n}' signed out (shared MCP login removed in another channel)", file=sys.stderr)
+            for n in f.get("duplicateGrant", []): print(f"omp-mcp-share: {a.profile}: '{n}' has both a channel-local and a shared login; this channel uses its own (run: omp-channels --doctor)", file=sys.stderr)
+    else:
+        print(json.dumps(rep, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

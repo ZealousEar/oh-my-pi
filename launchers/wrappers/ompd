@@ -1,0 +1,317 @@
+#!/bin/sh
+# omp channel launcher: ompd -> FROZEN integrated fork build (v18.2.6 + 2026-09-18 patches + 2026-09-22 upstream sync for opus-5-5, compiled with Bun 1.4.2)
+# Installed 2026-09-19 by the launcher-isolation wave (runbook: /Users/farhad/.omp/implementation-2026-09-18/launchers/RUNBOOK.md).
+# Contract: exec the pinned executable by ABSOLUTE path with the channel profile
+# fixed to 'daily-fork'; refuse profile/alias overrides and self-update at the
+# boundary; never fall back to another channel or another executable.
+# Installed copies are chflags-uchg (immutable) so a bypassed self-updater
+# cannot replace them; install.sh/uninstall.sh toggle the flag.
+set -u
+CHANNEL=ompd
+PROFILE=daily-fork
+RUNBOOK=/Users/farhad/.omp/implementation-2026-09-18/launchers/RUNBOOK.md
+ROOT=$HOME/.omp/profiles/$PROFILE
+CHANNELS_MAP=/Users/farhad/.omp-channels/channels.json
+CREDENTIAL_KEYS=/Users/farhad/.omp/implementation-2026-09-18/launchers/profile-seed/credential-keys.txt
+AUTH_RUNBOOK=/Users/farhad/.omp/implementation-2026-09-18/launchers/shared-auth/RUNBOOK.md
+AUTH_MODE_FILE=/Users/farhad/.omp-channels/policy/auth-mode
+RELAY_MODE_FILE=/Users/farhad/.omp-channels/policy/relay-mode
+BROKER_URL=http://127.0.0.1:41871
+
+
+fail() {
+	printf '%s: %s\n' "$CHANNEL" "$1" >&2
+	printf '%s: refusing to fall back to another channel; see %s\n' "$CHANNEL" "$RUNBOOK" >&2
+	exit "$2"
+}
+[ -r "$CHANNELS_MAP" ] || fail "channel map missing or unreadable: $CHANNELS_MAP (re-run install.sh)" 78
+[ -r "$CREDENTIAL_KEYS" ] || fail "credential key policy missing or unreadable: $CREDENTIAL_KEYS (re-run install.sh)" 78
+STOCK=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["channels"]["omp"]["executable"])' "$CHANNELS_MAP") ||
+	fail "cannot resolve the pinned stock executable from $CHANNELS_MAP" 78
+[ -x "$STOCK" ] || fail "pinned stock executable missing or not executable: $STOCK" 127
+TARGET=/Users/farhad/.omp-channels/fork/omp-18.2.6-next-2026-09-18-r9
+# The relay mode is machine-global. Fork builds enforce the protocol/supervisor
+# variables; stock ignores them and relies on the best-effort ensure before exec.
+[ -r "$RELAY_MODE_FILE" ] || fail "relay mode policy missing or unreadable: $RELAY_MODE_FILE (run $RUNBOOK's install.sh)" 78
+IFS= read -r RELAY_MODE <"$RELAY_MODE_FILE"
+case $RELAY_MODE in
+pinned)
+	OMP_BROWSER_RELAY_REQUIRE_PROTOCOL=2
+	OMP_BROWSER_RELAY_SUPERVISOR=launchd:ai.omp.browser-relay
+	export OMP_BROWSER_RELAY_REQUIRE_PROTOCOL OMP_BROWSER_RELAY_SUPERVISOR
+	if [ -x /usr/bin/python3 ] && ! /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share ensure >&2; then
+		printf '%s: WARN pinned browser relay ensure failed; the fork consumer will fail closed\n' "$CHANNEL" >&2
+	fi
+	;;
+legacy)
+	OMP_BROWSER_RELAY_SUPERVISOR=none
+	export OMP_BROWSER_RELAY_SUPERVISOR
+	;;
+*) fail "invalid relay mode '$RELAY_MODE' in $RELAY_MODE_FILE; expected 'legacy' or 'pinned'" 78 ;;
+esac
+
+
+# Channel boundary. The scan covers EVERY token before the first literal `--`,
+# including tokens after a subcommand (so `ompd grep --profile` is refused even
+# though upstream would treat that --profile as grep data). Escape hatch: put the
+# literal after `--`, or run the executable directly (see runbook).
+for arg in "$@"; do
+	case $arg in
+	--) break ;;
+	--profile | --profile=* | --alias | --alias=*)
+		fail "profile is pinned to '$PROFILE' for this channel; to use another profile run the executable directly: $TARGET" 64
+		;;
+	esac
+done
+route_shared_relay() {
+	relay_found=false relay_scan_value=false
+	while [ "$#" -gt 0 ]; do
+		if [ "$relay_scan_value" = true ]; then relay_scan_value=false; shift; continue; fi
+		case $1 in
+		browser-relay) relay_found=true; shift; break ;;
+		--) shift ;;
+		--cwd | --config | --add-dir | --mode | --fork | --provider | --model | --smol | --slow | --plan | --prewalk-into | --plan-yolo-into | --max-time | --service-tier | --api-key | --system-prompt | --append-system-prompt | --provider-session-id | --prompt-cache-key | --session-dir | --models | --tools | --thinking | --export | --hook | --extension | -e | --trusted-extension | --plugin-dir | --skills | --approval-mode) relay_scan_value=true; shift ;;
+		--resume | -r | --session) case ${2:-} in "" | -*) shift ;; *) shift; shift ;; esac ;;
+		--help | --version | --allow-home | --continue | --from-claude | --from-codex | --no-session | --no-tools | --no-lsp | --no-pty | --hide-thinking | --advisor | --external-thinking | --prewalk | --no-prewalk | --plan-yolo | --print | --print-thoughts | --no-extensions | --no-skills | --no-rules | --no-title | --auto-approve | --yolo | --verbose | -h | -v | -c) shift ;;
+		--*=*) shift ;;
+		--*) case ${2:-} in "" | -*) shift ;; *) shift; shift ;; esac ;;
+		-*) shift ;;
+		*) return 0 ;;
+		esac
+	done
+	[ "$relay_found" = true ] || return 0
+	relay_action= relay_has_dir=false relay_expect_value=false
+	for arg in "$@"; do
+		if [ "$relay_expect_value" = true ]; then relay_expect_value=false; continue; fi
+		case $arg in
+		--) ;;
+		--dir) relay_has_dir=true; relay_expect_value=true ;;
+		--dir=*) relay_has_dir=true ;;
+		--port | --token | -p) relay_expect_value=true ;;
+		-*) ;;
+		*) [ -z "$relay_action" ] && relay_action=$arg ;;
+		esac
+	done
+	if [ "$relay_has_dir" = false ]; then
+		case $relay_action in
+		install) exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share install ;;
+		stage) exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share stage ;;
+		serve | "") exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share serve ;;
+		esac
+	fi
+}
+route_shared_relay "$@"
+case ${1:-} in
+update | upgrade | self-update)
+	fail "self-update is disabled: this channel is a frozen fork build that no release server can update; rebuild from the checkout under a NEW filename via the runbook" 64
+	;;
+secret)
+	# Shared credential-marked settings: one command, every channel (see shared-auth/RUNBOOK.md).
+	shift
+	exec /usr/bin/python3 /Users/farhad/.local/bin/omp-secret "$@"
+	;;
+browser-relay)
+	relay_action= relay_has_dir=false relay_command_seen=false relay_expect_value=false
+	for arg in "$@"; do
+		if [ "$relay_command_seen" = false ]; then relay_command_seen=true; continue; fi
+		if [ "$relay_expect_value" = true ]; then relay_expect_value=false; continue; fi
+		case $arg in
+		--) ;;
+		--dir) relay_has_dir=true; relay_expect_value=true ;;
+		--dir=*) relay_has_dir=true ;;
+		--port | --token | -p) relay_expect_value=true ;;
+		-*) ;;
+		*) [ -z "$relay_action" ] && relay_action=$arg ;;
+		esac
+	done
+	if [ "$relay_has_dir" = false ]; then
+		shift
+		case $relay_action in
+		install) exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share install ;;
+		stage) exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share stage ;;
+		serve | "") exec /usr/bin/python3 /Users/farhad/.local/bin/omp-relay-share serve ;;
+		esac
+	fi
+	;;
+config)
+	# Match config-cli's positional model while accepting flags anywhere: action is
+	# the first non-flag, key the second, and value is the remaining positionals.
+	config_action= config_key= config_value= config_value_count=0
+	config_command_seen=false
+	for arg in "$@"; do
+		if [ "$config_command_seen" = false ]; then config_command_seen=true; continue; fi
+		case $arg in -*) continue ;; esac
+		if [ -z "$config_action" ]; then
+			config_action=$arg
+		elif [ -z "$config_key" ]; then
+			config_key=$arg
+		else
+			if [ "$config_value_count" -eq 0 ]; then config_value=$arg; else config_value="$config_value $arg"; fi
+			config_value_count=$((config_value_count + 1))
+		fi
+	done
+	credential_key=false
+	if [ -n "$config_key" ] && [ -r "$CREDENTIAL_KEYS" ]; then
+		while IFS= read -r managed_key || [ -n "$managed_key" ]; do
+			[ "$config_key" = "$managed_key" ] && credential_key=true && break
+		done <"$CREDENTIAL_KEYS"
+	fi
+	if [ "$credential_key" = true ]; then
+		case $config_action in
+		set)
+			[ "$config_value_count" -gt 0 ] || fail "usage: $CHANNEL config set $config_key <value>  (or: $CHANNEL secret set $config_key to be prompted)" 64
+			printf '%s: routing credential-marked config set to the shared credential overlay\n' "$CHANNEL" >&2
+			exec /usr/bin/python3 /Users/farhad/.local/bin/omp-secret set "$config_key" "$config_value"
+			;;
+		reset)
+			printf '%s: routing credential-marked config reset to the shared credential overlay\n' "$CHANNEL" >&2
+			exec /usr/bin/python3 /Users/farhad/.local/bin/omp-secret unset "$config_key"
+			;;
+		get)
+			exec /usr/bin/python3 /Users/farhad/.local/bin/omp-secret get "$config_key"
+			;;
+		esac
+	fi
+	;;
+auth-broker)
+	# Only read-only authority inspection is valid through a channel wrapper.
+	broker_action= broker_positionals=0
+	broker_command_seen=false
+	for arg in "$@"; do
+		if [ "$broker_command_seen" = false ]; then broker_command_seen=true; continue; fi
+		[ "$arg" = -- ] && fail "auth-broker '--' is refused; only status and list are allowed through channel wrappers (see $AUTH_RUNBOOK)" 64
+		case $arg in -*) continue ;; esac
+		broker_positionals=$((broker_positionals + 1))
+		[ "$broker_positionals" -eq 1 ] && broker_action=$arg
+	done
+	[ "$broker_positionals" -eq 1 ] || fail "auth-broker requires exactly one action; only status and list are allowed through channel wrappers (see $AUTH_RUNBOOK)" 64
+	case $broker_action in
+	status | list) ;;
+	*) fail "auth-broker $broker_action is disabled in channels; only status and list are allowed (see $AUTH_RUNBOOK)" 64 ;;
+	esac
+	;;
+__omp_worker_*)
+	# A running omp whose pinned executable vanished re-resolves its worker host
+	# via $which("omp") — i.e. this wrapper. Never host another channel's worker.
+	if [ -n "${OMP_CHANNEL:-}" ] && [ "$OMP_CHANNEL" != "$CHANNEL" ]; then
+		fail "refusing to host worker '$1' for channel '$OMP_CHANNEL' (its pinned executable is missing or was replaced in place; restart that channel)" 70
+	fi
+	;;
+esac
+
+# State-root selectors are PINNED (not merely unset): Bun autoloads $PWD/.env*
+# into the process env before any omp code runs (also in compiled binaries) and
+# omp merges ~/.env and the profile .env files afterwards, both with
+# existing-env-wins semantics, so a pinned value cannot be replaced by a dotenv file.
+OMP_PROFILE=$PROFILE
+PI_PROFILE=$PROFILE
+PI_CONFIG_DIR=.omp
+PI_CODING_AGENT_DIR=$ROOT/agent
+export OMP_PROFILE PI_PROFILE PI_CONFIG_DIR PI_CODING_AGENT_DIR
+# Overrides that have no pinnable value are dropped from the inherited env ...
+unset PI_PACKAGE_DIR PI_COMPILED OMP_LAUNCH_CWD OMP_DEV_LAUNCH_DIR OMP_WORKTREE_DIR \
+	OMP_GITHUB_CACHE_DB OMP_COMMIT_CACHE_DB OMP_AUTH_BROKER_SNAPSHOT_CACHE \
+	OMP_AUTH_BROKER_SNAPSHOT_TTL_MS OMP_AUTH_BROKER_URL OMP_AUTH_BROKER_TOKEN OMP_AUTH_BROKER_ACCOUNT_POOL_FILE
+# Disable the encrypted snapshot cache: every startup must synchronously observe
+# the current authority, and therefore requires the local authority to be healthy.
+OMP_AUTH_BROKER_SNAPSHOT_TTL_MS=0
+export OMP_AUTH_BROKER_SNAPSHOT_TTL_MS
+# ... and refused when a dotenv file omp would load tries to reintroduce them.
+# The scan uses shell builtins only (no grep/head), so a stripped or shadowed PATH
+# cannot make it fail open; an unreadable dotenv file also fails closed.
+dotenv_override_key() { # $1 file -> prints the first state-root key it defines; exit 2 if unreadable
+	[ -r "$1" ] || return 2
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=${line#"${line%%[![:space:]]*}"}
+		case $line in
+		export[[:space:]]*) line=${line#export}; line=${line#"${line%%[![:space:]]*}"} ;;
+		esac
+		case $line in *=*) ;; *) continue ;; esac
+		key=${line%%=*}
+		key=${key%"${key##*[![:space:]]}"}
+		case $key in
+		XDG_DATA_HOME | XDG_STATE_HOME | XDG_CACHE_HOME | PI_PACKAGE_DIR | PI_COMPILED | OMP_WORKTREE_DIR | OMP_GITHUB_CACHE_DB | OMP_COMMIT_CACHE_DB | OMP_AUTH_BROKER_SNAPSHOT_CACHE | OMP_AUTH_BROKER_SNAPSHOT_TTL_MS | OMP_AUTH_BROKER_URL | OMP_AUTH_BROKER_TOKEN | OMP_AUTH_BROKER_ACCOUNT_POOL_FILE)
+			printf '%s\n' "$key"
+			return 0
+			;;
+		esac
+	done <"$1"
+	return 1
+}
+for dotenv in "$PWD/.env" "$PWD/.env.local" "$PWD/.env.development" "$PWD/.env.development.local" \
+	"$PWD/.env.production" "$PWD/.env.production.local" "$PWD/.env.test" "$PWD/.env.test.local" \
+	"$HOME/.env" "$ROOT/.env" "$ROOT/agent/.env"; do
+	[ -e "$dotenv" ] || continue
+	hit=$(dotenv_override_key "$dotenv")
+	status=$?
+	if [ "$status" -eq 0 ]; then
+		fail "dotenv file $dotenv sets a state-root override ($hit); channel roots are pinned - remove that line or run from another directory" 78
+	elif [ "$status" -eq 2 ]; then
+		fail "dotenv file $dotenv exists but cannot be read; refusing to start with an unverifiable state-root configuration" 78
+	fi
+done
+# XDG_*_HOME is left for other tools, but omp would relocate THIS profile under it
+# once $XDG_x_HOME/omp/profiles/$PROFILE exists (dirs.ts DirResolver); fail closed.
+for xdg in "${XDG_DATA_HOME:-}" "${XDG_STATE_HOME:-}" "${XDG_CACHE_HOME:-}"; do
+	if [ -n "$xdg" ] && [ -e "$xdg/omp/profiles/$PROFILE" ]; then
+		fail "XDG relocation present for profile '$PROFILE' at $xdg/omp/profiles/$PROFILE; remove it or unset XDG_*_HOME" 78
+	fi
+done
+# Immutable launcher policy overlays load after global/project configuration.
+POLICY=/Users/farhad/.omp-channels/policy/subscription-only.yml
+BROWSER_POLICY=/Users/farhad/.omp-channels/policy/browser-identity.yml
+[ -r "$POLICY" ] || fail "provider policy overlay missing or unreadable: $POLICY (re-run install.sh)" 78
+[ -r "$BROWSER_POLICY" ] || fail "browser identity policy missing or unreadable: $BROWSER_POLICY (re-run install.sh)" 78
+# Shared credential-marked settings are the final, writable 0600 overlay.
+SHARED_CREDS=/Users/farhad/.omp-channels/shared/credential-settings.yml
+[ -r "$SHARED_CREDS" ] || fail "shared credential-settings overlay missing or unreadable: $SHARED_CREDS (re-run install.sh)" 78
+# Synced profile layer (git: ZealousEar/oh-my-pi, branch profile/daily-fork, checkout
+# ~/.omp/profile-layer). Its overlay loads FIRST so the policy overlays above still win.
+LAYER_OVERLAY=/Users/farhad/.omp/profile-layer/config/fork-overlay.yml
+[ -r "$LAYER_OVERLAY" ] || fail "profile layer overlay missing or unreadable: $LAYER_OVERLAY (restore ~/.omp/profile-layer from branch profile/daily-fork, then re-run install.sh)" 78
+PI_CONFIG_FILES=$LAYER_OVERLAY:$POLICY:$BROWSER_POLICY:$SHARED_CREDS
+export PI_CONFIG_FILES
+# Fork builds route every credential-marked settings write (config set/reset, /settings) to
+# the shared overlay in-process when this is set; the stock build ignores it (see the
+# `config` routing below and `omp-secret sync`).
+OMP_SHARED_SECRETS_FILE=$SHARED_CREDS
+export OMP_SHARED_SECRETS_FILE
+# A settings-panel secret saved into a profile config by the stock build (or any hand edit)
+# is moved into the shared overlay at the next launch of ANY channel, so it never stays
+# profile-local or shadowed. Remediation only: a missing python3 does not block the launch.
+[ -x /usr/bin/python3 ] && [ -r /Users/farhad/.local/bin/omp-secret ] && /usr/bin/python3 /Users/farhad/.local/bin/omp-secret sync --quiet >&2
+# Managed MCP OAuth logins are shared across the channels. The legacy default-profile
+# row `mcp_oauth:profile:default:<url>` is transferred to the authority under the same
+# id by the handover; fork channels resolve it as a sibling, stock via omp-mcp-share
+# pointers.
+OMP_SHARED_MCP_PROFILES=stock,daily-fork,dev-fork,default
+export OMP_SHARED_MCP_PROFILES
+OMP_CHANNEL=$CHANNEL
+export OMP_CHANNEL
+# Shared credential authority mode is owner-controlled and persistent. In
+# authority mode, use the pinned runtime itself as the config-resolution oracle;
+# status never opens a credential store and reports the resolved URL even when
+# the authority is unavailable. Local rollback mode deliberately skips wiring
+# and token checks while preserving every other wrapper boundary.
+[ -r "$AUTH_MODE_FILE" ] || fail "auth mode policy missing or unreadable: $AUTH_MODE_FILE (run the shared-auth installer or rollback runbook)" 78
+IFS= read -r AUTH_MODE <"$AUTH_MODE_FILE"
+case $AUTH_MODE in
+authority)
+	broker_status=$("$STOCK" --profile="$PROFILE" auth-broker status --json 2>&1)
+	case $broker_status in
+	*'"url":"http://127.0.0.1:41871"'*) ;;
+	*) fail "profile '$PROFILE' is not wired to the shared credential authority (resolved auth.broker.url is not $BROKER_URL); re-run install.sh - starting anyway would use a private credential store" 78 ;;
+	esac
+	[ -r "$ROOT/auth-broker.token" ] || fail "shared authority token missing or unreadable: $ROOT/auth-broker.token (re-run install.sh after install-authority.sh)" 78
+	;;
+local) ;;
+*) fail "invalid auth mode '$AUTH_MODE' in $AUTH_MODE_FILE; expected 'authority' or owner-selected rollback mode 'local'" 78 ;;
+esac
+
+[ -x "$TARGET" ] || fail "pinned executable missing or not executable: $TARGET" 127
+# Herdr recognizes agents by foreground argv0; mirror ompdev/upstream scripts/omp
+# and present as `omp` only inside Herdr so `ps` keeps the pinned path elsewhere.
+if [ "${HERDR_ENV:-}" = 1 ] && [ "$(uname -s)" = Darwin ]; then
+	exec -a omp "$TARGET" --profile="$PROFILE" "$@"
+fi
+exec "$TARGET" --profile="$PROFILE" "$@"
