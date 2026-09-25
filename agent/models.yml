@@ -52,3 +52,97 @@ providers:
         tokenizer: qwen3
         compat:
           supportsReasoningEffort: false
+
+      # --- Frontier (added 2026-09-25). All concurrency_cost 4 = the whole Developer-plan
+      # allowance: one request at a time across these. Featherless caps max_tokens at 32768
+      # (checked on V4-Pro, GLM-5.3, 27B). Each id was probed: plain answer + streamed tool call.
+      - id: deepseek-ai/DeepSeek-V4-Pro
+        name: DeepSeek V4 Pro (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: deepseek-v3
+        compat:
+          supportsReasoningEffort: false
+      - id: deepseek-ai/DeepSeek-V4.1-Flash
+        name: DeepSeek V4.1 Flash (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: deepseek-v3
+        compat:
+          supportsReasoningEffort: false
+      - id: deepseek-ai/DeepSeek-V4-Flash
+        name: DeepSeek V4 Flash (Featherless)
+        # Featherless serves this id without a thinking trace, and its non-streaming
+        # response was malformed JSON on 2026-09-25 (streaming, which omp uses, was fine).
+        # Prefer V4.1-Flash.
+        reasoning: false
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: deepseek-v3
+      - id: moonshotai/Kimi-K3
+        name: Kimi K3 (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: kimi-k2
+        compat:
+          supportsReasoningEffort: false
+      - id: zai-org/GLM-5.3
+        name: GLM-5.3 (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: glm5
+        compat:
+          supportsReasoningEffort: false
+      - id: Qwen/Qwen3.8-2.4T-A95B
+        name: Qwen3.8 2.4T-A95B (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: qwen3
+        compat:
+          supportsReasoningEffort: false
+      # 30B class. Featherless returns no_response whenever `tools` is sent to this id
+      # (2026-09-25), so it only works tool-free: `ompd --no-tools --model featherless/Qwen/Qwen3-30B-A3B-Instruct-2507`.
+      # Tool-capable 30B-class ids all failed under omp: Qwen3-Coder-30B-A3B emits its XML
+      # tool calls as plain text, and Qwen3.6-35B-A3B overflows its 32k window.
+      - id: Qwen/Qwen3-30B-A3B-Instruct-2507
+        name: Qwen3 30B-A3B Instruct 2507, tool-free only (Featherless)
+        reasoning: false
+        input: [text]
+        contextWindow: 262144
+        maxTokens: 32768
+        tokenizer: qwen3
+
+      # --- Uncensored. No abliterated/heretic build of a frontier MoE (DeepSeek, Kimi, GLM,
+      # Qwen 397B+) exists on Featherless; these are the strongest refusal-removed ids there.
+      # NousResearch/Hermes-4-70B was tried and dropped: its prompt overflows the 32k window
+      # under omp's header and the run ends in a handoff instead of an answer.
+      - id: huihui-ai/Huihui-Qwen3.8-27B-abliterated
+        name: Qwen3.8 27B abliterated, huihui (Featherless)
+        reasoning: true
+        input: [text]
+        contextWindow: 32768
+        maxTokens: 8192
+        tokenizer: qwen3
+        compat:
+          supportsReasoningEffort: false
+      - id: huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated
+        name: Qwen3.6 35B-A3B abliterated, huihui (Featherless)
+        # Slow on Featherless (25-45 s to first answer in probes).
+        reasoning: true
+        input: [text]
+        contextWindow: 32768
+        maxTokens: 8192
+        tokenizer: qwen3
+        compat:
+          supportsReasoningEffort: false
