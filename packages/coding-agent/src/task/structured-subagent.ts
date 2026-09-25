@@ -7,10 +7,11 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, getAgentDir, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, getAgentDir, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { normalizeModelPatternList, resolveAgentModelSelection } from "../config/model-resolver";
 import { type ServiceTierInheritSettingValue, validateAgentServiceTierOverrides } from "../config/service-tier";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import type { Skill } from "../extensibility/skills";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -405,11 +406,27 @@ async function leaseArtifacts(
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
-	const skills = [...(session.skills ?? [])];
+	const skills = listAgentSkills(session.skills ?? [], agent);
 	const autoloadSkills = agent.autoloadSkills?.length
 		? agent.autoloadSkills.map(name => skills.find(skill => skill.name === name)).filter(skill => skill !== undefined)
 		: [];
 	return { skills, autoloadSkills };
+}
+
+/**
+ * Applies the agent's `skills` allowlist to the rendered catalog. Unlisted skills are
+ * hidden on copies (the parent's objects are shared) and stay loadable via `skill://`.
+ */
+function listAgentSkills(parentSkills: readonly Skill[], agent: AgentDefinition): Skill[] {
+	const allowlist = agent.skills;
+	if (allowlist === undefined) return [...parentSkills];
+	const allowed = new Set(allowlist);
+	for (const name of allowed) {
+		if (!parentSkills.some(skill => skill.name === name)) {
+			logger.warn("Agent skills allowlist names an unavailable skill", { agent: agent.name, skill: name });
+		}
+	}
+	return parentSkills.map(skill => (allowed.has(skill.name) || skill.hide ? skill : { ...skill, hide: true }));
 }
 
 function buildExecutorOptions(
