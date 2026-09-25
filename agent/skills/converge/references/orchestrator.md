@@ -321,7 +321,7 @@ def configured_roles():
     """Effective modelRoles of the running profile: `ompd config get modelRoles`, else the config.yml block."""
     ompd = shutil.which("ompd") or os.path.expanduser("~/.local/bin/ompd")
     try:
-        out = subprocess.run([ompd, "config", "get", "modelRoles"], capture_output=True, text=True, timeout=90)
+        out = subprocess.run([ompd, "config", "get", "modelRoles"], capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
         if out.returncode == 0 and out.stdout.strip():
             return json.loads(out.stdout.strip().splitlines()[-1])
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -1792,7 +1792,7 @@ def enable_experiments(repo_cwd=None):
         path = f"/tmp/converge/{M['run_id']}/{side}"
         if not os.path.isdir(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            subprocess.run(["git", "worktree", "add", "--detach", path, "HEAD"], cwd=cwd, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "worktree", "add", "--detach", path, "HEAD"], cwd=cwd, check=True, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         M["experiment_worktrees"][side] = dict(path=path, repo=cwd)
     M["experiments"] = True
     save()
@@ -1822,7 +1822,7 @@ def enable_experiments(repo_cwd=None):
         t0 = time.time()
         with _EXP_LOCK:
             try:
-                proc = subprocess.run(["bash", str(spath)], cwd=wt, env=env, capture_output=True, text=True, timeout=timeout_s)
+                proc = subprocess.run(["bash", str(spath)], cwd=wt, env=env, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL)
                 out, err, code, timed_out = proc.stdout, proc.stderr, proc.returncode, False
             except subprocess.TimeoutExpired as exc:
                 out, err, code, timed_out = _text(exc.stdout), _text(exc.stderr) + f"\n[timeout after {timeout_s}s]", -1, True
@@ -1843,7 +1843,7 @@ def cleanup():
     load()
     M = RUN["manifest"]
     for side, wt in list(M.get("experiment_worktrees", {}).items()):
-        subprocess.run(["git", "worktree", "remove", "--force", wt["path"]], cwd=wt["repo"], capture_output=True, text=True)
+        subprocess.run(["git", "worktree", "remove", "--force", wt["path"]], cwd=wt["repo"], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         M["experiment_worktrees"].pop(side, None)
     if M["status"] == "running":
         M["status"] = "done"

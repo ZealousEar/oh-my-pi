@@ -29,7 +29,7 @@ fail() {
 STOCK=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["channels"]["omp"]["executable"])' "$CHANNELS_MAP") ||
 	fail "cannot resolve the pinned stock executable from $CHANNELS_MAP" 78
 [ -x "$STOCK" ] || fail "pinned stock executable missing or not executable: $STOCK" 127
-TARGET=/Users/farhad/.omp-channels/fork/omp-18.2.6-next-2026-09-18-r11
+TARGET=/Users/farhad/.omp-channels/fork/omp-18.2.6-next-2026-09-18-r12
 # The relay mode is machine-global. Fork builds enforce the protocol/supervisor
 # variables; stock ignores them and relies on the best-effort ensure before exec.
 [ -r "$RELAY_MODE_FILE" ] || fail "relay mode policy missing or unreadable: $RELAY_MODE_FILE (run $RUNBOOK's install.sh)" 78

@@ -40,3 +40,9 @@ skills:
   enableAgentsProject: false
   customDirectories:
     - ~/.omp/agent/skills
+# Bounded runs (2026-09-25): a long eval cell returns control after 60 s and delivers its
+# result later, instead of blocking the foreground (bash already does this by default).
+eval:
+  autoBackground:
+    enabled: true
+    thresholdMs: 60000
