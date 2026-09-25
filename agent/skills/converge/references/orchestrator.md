@@ -1,26 +1,27 @@
 # converge — orchestrator cell
 
-One Python cell for Main's eval kernel (state persists across calls; re-run only after a kernel reset). The cell never calls `task`, `ask`, `hub send`, or `hub cancel` — it builds batches, messages, and bookkeeping; Main submits and decides. Disk under `local://converge/<run-id>/` is the only truth: public helpers reload before reading and save after mutating; each round's ingestion is transactional (`rounds/<r>/state-before.json` snapshots the ledger and the ingestion-owned manifest keys; a re-run restores exactly those, never runtime provenance). Models and efforts are read from the configured `modelRoles` at `new_run` and frozen into `manifest.expected`; nothing in the cell names a model.
+One Python cell for Main's eval kernel (state persists across calls; re-run only after a kernel reset). The cell never calls `task`, `ask`, `wait`, or `write` on `agent://` / `proc://` — it builds batches, write requests, and bookkeeping; Main submits and decides. Disk under `local://converge/<run-id>/` is the only truth: public helpers reload before reading and save after mutating; each round's ingestion is transactional (`rounds/<r>/state-before.json` snapshots the ledger and the ingestion-owned manifest keys; a re-run restores exactly those, never runtime provenance). Models and efforts are read from the running channel's effective `modelRoles` at `new_run` and frozen into `manifest.expected`; nothing in the cell names a model. Every helper that consults jev is a coroutine (`await ingest_round(...)`, `await report_gate(...)`, …): 18.3's `judge()` returns answers directly under `await`.
 
 ## Call sequence
 
 ```text
-Preflight    exec the cell → new_run(question, tier, experiments, sides?, constraints, slug) → jev_probe()
+Preflight    exec the cell → new_run(question, tier, experiments, sides?, constraints, slug, channel=<binary>) → await jev_probe()
 Frame        write_brief(brief_md, evidence=[{claim, locator, quote, crux?}, …])   # E-0-n, frozen
 Tier ask     record_ask("tier", answer); record_ask("experiments", answer); enable_experiments(repo_cwd) if on
 Round r      load() → batch = spawn_round(r, tools=["run_experiment"] if experiments) → result = task(**batch)
-             ids = register_spawn(r, "converge", {requested name: job id from result})          # THIS batch: {"A": …, "B": …}
-             L1 only: for m in peer_messages(spawn_ids(r)): hub(**m)                            # releases peer contact (merged ids)
-             ≤60 s: snap = await tool.hub(op="jobs", i="identity check") → chk = identity_check(snap, expected_for(r, ids), ids)
-             chk["retry"] (rows still pending) → hub wait …, re-snapshot on the wake, identity_check again; NEVER time.sleep in eval
-             hub wait … → replies = {"A": <yield>, "B": <yield>} → res = ingest_round(r, replies)
+             ids = register_spawn(r, "converge", {requested name: "<agent id>" | {"agent": …, "job": …}})   # THIS batch: {"A": {agent, job}, "B": …}
+             L1 only: for m in peer_messages(spawn_ids(r)): write(**m)                      # PEER: <agent id> to each side (merged ids)
+             ≤60 s: snap = await tool.read(path="proc://") → chk = identity_check(snap, expected_for(r, ids), ids)
+             chk["retry"] (rows still pending) → wait, re-read proc:// on the wake, identity_check again; NEVER time.sleep in eval
+             bash(**wake_timer(deadline_in_s(r, "converge"))) → wait → on EVERY wake: od = overdue(snap); for m in od["kill"]: write(**m)
+             replies = {"A": <final yield>, "B": <final yield>} → res = await ingest_round(r, replies)
              res["action"] == "retry" → spawn_round(r, sides=res["retry"], attempt=2[, extra=l1_transcript(r, <valid side>)])
                  → ids = register_spawn(…)  → identity_check(snap, expected_for(r, ids), ids)   # expectations derive from THIS batch's ids
-                 → L1: for m in peer_messages(spawn_ids(r)): hub(**m)  → ingest_round(r, replies, attempt=2)
+                 → L1: for m in peer_messages(spawn_ids(r)): write(**m)  → await ingest_round(r, replies, attempt=2)
              spawn_meta(r, side, job=…, wall_ms=…, tool_calls=…, retries=…)                   # never cost/tokens: harvested from the session file
              checkpoint(r, synthesis_md) → act on res["action"]: continue | escalate (next spawn_round uses -esc agents) | stop | incomplete_transport
-Falsify      batch = spawn_round(r, phase="falsification") → task → f = ingest_falsification(replies)   ("retry" → attempt=2)
-             f["action"] == "reopen" → spawn_round(r+1, phase="reopen") + ingest_round(r+1, …, phase="reopen") + checkpoint, then final
+Falsify      batch = spawn_round(r, phase="falsification") → task → f = await ingest_falsification(replies)   ("retry" → attempt=2)
+             f["action"] == "reopen" → spawn_round(r+1, phase="reopen") + await ingest_round(r+1, …, phase="reopen") + checkpoint, then final
              f["unresolved"] (admitted objections, no round left) stay OPEN cruxes: the report can never say plain Converged
              wall cap with < 10 min left → skip_falsification("wall cap") instead (disclosed; never plain Converged)
 Escalation   e = escalation_needed() → ask (recommended = accept; e["advise"] == "escalate" ⇔ e["needed"] goes in the description)
@@ -28,20 +29,25 @@ Escalation   e = escalation_needed() → ask (recommended = accept; e["advise"] 
 L3           dossier() → task(**spawn_panel("verdict")) → ids = register_spawn(0, "verdict", …) → identity_check(snap, expected_judges("verdict", ids), ids)
              one failed judge spawn → spawn_panel("verdict", who=["J2-BA"], attempt=2) → ids = register_spawn(0, "verdict", …) → identity_check(snap, expected_judges("verdict", ids), ids)
              mapped = panel_verdicts({"J1-AB": …, "J1-BA": …, "J2-AB": …, "J2-BA": …})   # full 2.5.1 validation; invalid/missing recorded, never guessed
-             task(**spawn_panel("conference", mapped["verdicts"])) → ids → for m in peer_messages(spawn_ids(0, "conference")): hub(**m)
+             task(**spawn_panel("conference", mapped["verdicts"])) → ids → for m in peer_messages(spawn_ids(0, "conference")): write(**m)
              panel_aggregate(mapped, {"J1": …, "J2": …}, accept_changes={"J2": True})   # only after YOU validated the cited reason
-Report       fs = final_status() → report_gate(report_md) ≥ 0.70 → write report → finish() (harvests every spawn's cost) → cleanup()
+Report       fs = final_status() → await report_gate(report_md) ≥ 0.70 → write report → finish() (harvests every spawn's cost) → cleanup()
+Cancel       for m in cancel_requests(spawn_ids(r, phase)): write(**m)      # proc://<job id>/kill; identity mismatch, over-cap, stragglers
 jev outage   any helper raises JevUnavailable(digest, state, questions) → answer the same ids yourself
              → jev_answer(digest, answers) → re-run the SAME helper with the same arguments (ingestion restores its snapshot)
 ```
+
+Waking and deadlines (18.3): `wait` takes no ids, sender filter, or timeout — it returns on the first owned job result, peer message, or steering interrupt, with a 30-minute safety cap. The cell therefore owns the clock: `register_spawn` stamps every batch with `deadline_at` (spawn cap, judge cap for panels), `deadline_in_s(r, phase)` gives the seconds left, `wake_timer(seconds)` is the `bash` call for a finite background `sleep` whose completion wakes `wait` at that instant, and `overdue(snapshot)` names every registered job still running past its deadline together with the `proc://<job>/kill` write requests. Run every wake through `overdue`; an over-cap side is a timeout (retry once per §7), never silently extended. Peer messages a child sends you arrive through the same `wait`; the sender is in the message header (`[<id>] <from>: …`), so record what you expect from whom in the manifest (`spawn_ids`), not in your head.
+
+Wake-turn exchanges (L1, conference): subagents never have `wait`. A child sends with `write` to `agent://<peer agent id>` (never blocks); a message reaches it as an incoming message while it works, or wakes it for a new turn after it has yielded. Each turn ends in a schema-valid yield carrying `turn` (`opening` | `response` | `rebuttal` | `final`); every non-final yield is a progress signal Main receives as an ordinary job result and ignores; only `turn: "final"` (or no `turn`) is a reply. `ingest_round` / `panel_aggregate` raise on an interim yield rather than count it. A wake turn's yield arrives as a job whose `agentUrlId` is the child's agent id (its job id may carry a `-2` suffix): `overdue` and `identity_check` match rows by job id first, then `agentUrlId`.
 
 `ingest_round` = validate each reply against the COMPLETE phase schema (`validate_reply` → `_schema_errors`: nested required fields, types, enums, caps, `additionalProperties`; blocked/invalid ⇒ `retry` on attempt 1, failure count + forced non-progress on attempt 2, two failures of one side ⇒ `incomplete_transport`) → `save_replies` (every attempt persisted) → `admit_cruxes` (`_admit_candidate`: statement frozen at ≤ 80 words, per-side cap, jev M + duplicate, run cap, jev N for r ≥ 3) → `verify_evidence` (orchestrator fetches every locator; deterministic whitespace-normalised quote-presence check first — `quote_present`, diagnostics — then jev E; `verified` = the quote is at the locator AND `quote_supports_claim ≥ 0.70`, the one meaning every consumer reads: packets, dossier, report card, n_r, `moved_by`) → `converge_state` (prior positions from the pre-round snapshot; jev C per crux both sides addressed: `state` + `both_withdraw`; `moved_by` evidence ids must resolve to verified entries whose support for THAT crux is established — `_evidence_basis(L, eid, cid, r)` re-asks jev E `supports_crux` for reused/brief evidence; scoped_out needs both sides; sycophancy/invalid basis floor u at 0.5; standing flags refreshed) → `close_round` (Φ_r, progress, streak, escalation, round reserve for the reopen, `rounds/<r>/record.json`, `harvest_costs`). L1 runs the same path once: the responder yields the draft + objections (`SCHEMA_L1_DRAFT`), the opener yields per-crux concurrence (`SCHEMA_L1_CONCURRENCE`); objections go through the same admission gate and admitted ones stay open, unresolved cruxes (no reopen round exists).
 
 Transactional replay: `rounds/<r>/state-before.json` snapshots the ledger and the ingestion-owned manifest keys (`INGEST_MANIFEST_KEYS`: failures, falsification, reopened, escalated_at) — runtime provenance (`jev_backend`, `spawns`, `cost_by_job`, asks, tier) never rolls back, and a cached orchestrator answer re-asserts `jev_backend = "orchestrator"`.
 
-`identity_check(snap, expected, ids)` takes the batch `register_spawn` just returned and an expectation built FROM that batch — `expected_for(r, ids)` for debaters, `expected_judges(stage, ids)` for judges — and raises unless the two name exactly the same roles (a spawned id with no expectation can never pass silently; R12). Names repeat across rounds and retries get suffixes, so label matching is not allowed. It reads `details.jobs[*].resolvedModelIdentity` / `resolvedThinkingLevel` from the `hub jobs` snapshot returned to the kernel (`await tool.hub(...)` returns `{text, details}`). A running row without identity fields is `pending` (the child has not streamed yet, typically the first 20–25 s): the result is `{ok: False, retry: True, pending: [...]}` — re-check after the next `hub wait` wake; a 30 s eval timeout makes `time.sleep` inside eval a failure. `spawn_ids(r, phase)` returns the merged mapping across retries (peer release, `hub cancel`); it is never the identity-check input.
+`identity_check(snap, expected, ids)` takes the batch `register_spawn` just returned and an expectation built FROM that batch — `expected_for(r, ids)` for debaters, `expected_judges(stage, ids)` for judges — and raises unless the two name exactly the same roles (a spawned id with no expectation can never pass silently; R12). Names repeat across rounds and retries get suffixes, so label matching is not allowed. It reads `details.proc.jobs[*].resolvedModelIdentity` / `resolvedThinkingLevel` from the `proc://` snapshot returned to the kernel (`await tool.read(path="proc://")` returns `{text, details}`; reads never acknowledge delivery, so a result you see there still arrives through `wait`). A running row without identity fields is `pending` (the child has not streamed yet, typically the first 20–25 s): the result is `{ok: False, retry: True, pending: [...]}` — re-read after the next wake. 18.3 snapshots carry no fallback flag: a retry-fallback model shows up as a different identity, and the converge roles' empty `retry.fallbackChains` keep one from being chosen at all. Job id (`proc://`, cost keys) and agent id (`agent://`, `<agent id>.jsonl`) are kept apart everywhere: `register_spawn` accepts `"<id>"` when the task result printed the same id for both, else `{"agent": …, "job": …}`.
 
-Cost: each child's session file lives beside the parent's (`<session>/<job id>.jsonl`); `harvest_costs` sums its assistant-message `usage.cost.total` into `manifest.cost_by_job` / `cost_usd` (per-round `record.json` gets `spawn[side].cost_usd` and tokens) and is the ONLY source of spend — `spawn_meta` refuses `cost_usd`/`tokens`. It runs at every `close_round`, `ingest_falsification`, `panel_aggregate`, and `finish`; a job whose file is absent is reported in `missing` and `manifest.cost_missing`, never estimated.
+Cost: each child's session file lives beside the parent's (`<session>/<agent id>.jsonl`); `harvest_costs` sums its assistant-message `usage.cost.total` AND its `model_usage` entries (18.3 journals model calls outside the transcript — summaries, the child's own judgments — there, once each; the two sets never overlap) into `manifest.cost_by_job` / `cost_usd` (per-round `record.json` gets `spawn[side].cost_usd` and tokens) and is the ONLY source of spend — `spawn_meta` refuses `cost_usd`/`tokens`. Main's own jev spend lands in the parent session file as `model_usage` entries with `purpose: "judge"`; `harvest_costs` sums those since `started_at` into `manifest.jev_cost_usd`, reported separately and never added to `cost_usd`. It runs at every `close_round`, `ingest_falsification`, `panel_aggregate`, and `finish`; a job whose file is absent is reported in `missing` and `manifest.cost_missing`, never estimated.
 
 Packets: `_fit` budgets every variable section's minimal rendering (heading + continuation note + ellipsis) before allocating content; mandatory + that overhead > 3 000 words ⇒ `PacketOverflow` (no legal fit: shorten the question/constraints/extra); the assembled packet is re-measured before it is written.
 
@@ -54,7 +60,9 @@ Thresholds and question sets are the constants at the top of the cell (`TH`, `Q_
 # State persists across calls. Disk (local://converge/<run-id>/) is the only truth:
 # public helpers reload before reading and save after mutating; ingestion is
 # transactional per round (rounds/<r>/state-before.json). Main submits `task`
-# batches, sends hub messages, and calls `ask` itself; this cell only builds them.
+# batches, writes agent:// messages and proc://<id>/kill requests, calls `wait`,
+# `bash` (wake timers) and `ask` itself; this cell only builds them. Helpers that
+# consult jev are coroutines (18.3: `await judge(...)` returns the answers).
 import datetime as _dt
 import hashlib
 import json
@@ -62,6 +70,7 @@ import os
 import random
 import re
 import shutil
+import signal as _signal
 import subprocess
 import threading
 import time
@@ -123,18 +132,22 @@ SCHEMA_DRAFT = {"type": "object", "required": ["position", "cruxes", "evidence",
 SCHEMA_FALSIFICATION = {"type": "object", "required": ["objections", "verdict_stands", "confidence"], "additionalProperties": False,
     "properties": {"objections": SCHEMA_OBJECTIONS, "evidence": SCHEMA_EVIDENCE, "verdict_stands": {"type": "boolean"},
                    "confidence": _CONF, "blocked": {"type": "string"}}}
+# Wake-turn exchanges (L1, conference): subagents cannot block, so each protocol step ends in a schema-valid yield
+# tagged `turn`; only `final` (or no `turn`) is a reply. is_final() / ingest_round enforce it; the caller never counts an interim.
+_TURN = {"type": "string", "enum": ["opening", "response", "rebuttal", "final"]}
 # L1 responder: the converged draft PLUS objections falsifying its own draft (R6).
 SCHEMA_L1_DRAFT = {"type": "object", "required": ["position", "cruxes", "evidence", "concessions", "objections", "confidence"],
     "additionalProperties": False,
     "properties": {"position": {"type": "string"}, "cruxes": SCHEMA_CRUXES, "evidence": SCHEMA_EVIDENCE,
                    "concessions": SCHEMA_CONCESSIONS, "scoped_out": SCHEMA_SCOPED, "objections": SCHEMA_OBJECTIONS,
                    "verdict_stands": {"type": "boolean"}, "experiment_request": {"type": "string"}, "confidence": _CONF,
-                   "blocked": {"type": "string"}}}
+                   "blocked": {"type": "string"}, "turn": _TURN}}
 SCHEMA_L1_CONCURRENCE = {"type": "object", "required": ["per_crux", "objections", "confidence"], "additionalProperties": False,
     "properties": {"per_crux": {"type": "array", "items": {"type": "object", "required": ["ref", "state", "why"],
                        "properties": {"ref": {"type": "string"}, "state": {"type": "string", "enum": ["agree", "partial", "disagree"]},
                                       "why": {"type": "string"}}}},
-                   "objections": SCHEMA_OBJECTIONS, "evidence": SCHEMA_EVIDENCE, "confidence": _CONF, "blocked": {"type": "string"}}}
+                   "objections": SCHEMA_OBJECTIONS, "evidence": SCHEMA_EVIDENCE, "confidence": _CONF, "blocked": {"type": "string"},
+                   "turn": _TURN}}
 _FLAW = {"type": "object", "required": ["side", "statement", "cite"],
          "properties": {"side": {"type": "string", "enum": ["A", "B"]}, "statement": {"type": "string"}, "cite": {"type": "string"}}}
 # 2.5.2 + `exchange_completed` (N5): true only when at least one peer message was received; a silent peer yields false.
@@ -144,7 +157,11 @@ SCHEMA_CONFERENCE = {"type": "object", "additionalProperties": False,
                    "changed_from_independent": {"type": "boolean"}, "why": {"type": "string"},
                    "residual_disagreement": {"type": ["string", "null"]},
                    "agreed_fatal_flaws": {"type": "array", "items": _FLAW},
-                   "exchange_completed": {"type": "boolean"}}}
+                   "exchange_completed": {"type": "boolean"}, "turn": _TURN}}
+
+def is_final(reply):
+    """True when a yield is a reply, not a wake-turn progress signal (`turn` absent or "final")."""
+    return isinstance(reply, dict) and reply.get("turn") in (None, "final")
 SCHEMA_BY_KIND = {"draft": SCHEMA_DRAFT, "falsification": SCHEMA_FALSIFICATION, "l1_draft": SCHEMA_L1_DRAFT, "l1_concurrence": SCHEMA_L1_CONCURRENCE}
 JUDGE_CRITERIA = ("correctness", "constraints", "coherence", "operational_risk", "migration_rollback", "evidence_use", "uncertainty")
 _CRITERION = {"type": "object", "required": ["A", "B", "note"], "properties": {
@@ -316,27 +333,39 @@ def _schema_errors(v, schema, path="$"):
                     return err
     return None
 
-# ---- configured roles (R15): config.yml is the single source of model/effort -------------
-def configured_roles():
-    """Effective modelRoles of the running profile: `ompd config get modelRoles`, else the config.yml block."""
-    ompd = shutil.which("ompd") or os.path.expanduser("~/.local/bin/ompd")
+# ---- configured roles (R15): the running channel's effective settings are the single source of model/effort ----------
+def channel_binary(channel=None):
+    """The launcher of the channel this session runs under: the `channel` argument, else $CONVERGE_CHANNEL_BIN, else
+    $OMP_CHANNEL_BIN. A bare name is resolved on PATH; an absolute path is used as is. Nothing is guessed: a candidate
+    profile must never read the stable channel's roles (or vice versa)."""
+    name = channel or os.environ.get("CONVERGE_CHANNEL_BIN") or os.environ.get("OMP_CHANNEL_BIN")
+    if not name:
+        raise RuntimeError("no channel binary: pass new_run(..., channel=<launcher>) or set CONVERGE_CHANNEL_BIN to the "
+                           "launcher of THIS session's channel (e.g. ompnext); the cell never assumes ompd")
+    path = name if os.path.isabs(name) else shutil.which(name)
+    if not path or not os.access(path, os.X_OK):
+        raise RuntimeError(f"channel binary {name!r} is not executable or not on PATH")
+    return path
+
+def configured_roles(channel=None):
+    """Effective modelRoles of the running channel: a bounded, closed-stdin `<channel> config get modelRoles --json`,
+    parsed from the envelope's `value` (18.3 prints {key, value, type, description}). Missing or empty roles fail
+    setup here, before any spawn; there is no config.yml fallback (a raw file read ignores overlays and policy)."""
+    binary = channel_binary(channel)
     try:
-        out = subprocess.run([ompd, "config", "get", "modelRoles"], capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
-        if out.returncode == 0 and out.stdout.strip():
-            return json.loads(out.stdout.strip().splitlines()[-1])
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    cfg = Path(os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.omp/agent")) / "config.yml"
-    roles, inblock = {}, False
-    for line in cfg.read_text().splitlines():
-        if re.match(r"^modelRoles:\s*$", line):
-            inblock = True; continue
-        if inblock:
-            m = re.match(r"^  ([A-Za-z0-9_-]+):\s*(\S+)\s*$", line)
-            if m:
-                roles[m.group(1)] = m.group(2)
-            elif line.strip() and not line.startswith("  "):
-                break
+        out = subprocess.run([binary, "config", "get", "modelRoles", "--json"], capture_output=True, text=True,
+                             timeout=90, stdin=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"{binary} config get modelRoles --json failed: {exc}") from None
+    if out.returncode != 0:
+        raise RuntimeError(f"{binary} config get modelRoles --json exited {out.returncode}: {out.stderr.strip()[:400]}")
+    try:
+        env = json.loads(out.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"{binary} config get modelRoles --json printed no JSON envelope: {exc}") from None
+    roles = env.get("value") if isinstance(env, dict) else None
+    if not isinstance(roles, dict) or not roles:
+        raise RuntimeError(f"{binary} reports no effective modelRoles (value={roles!r}); configure the six converge-* roles first")
     return roles
 
 def _role_expectation(roles, role):
@@ -351,8 +380,8 @@ def _role_expectation(roles, role):
         raise RuntimeError(f"modelRoles.{role} = {sel!r} carries no :effort suffix; converge roles must")
     return dict(model=sel[:i], effort=sel[i + 1:], selector=sel)
 
-def _expected_from_config(sides, roles=None):
-    roles = roles or configured_roles()
+def _expected_from_config(sides, roles=None, channel=None):
+    roles = roles or configured_roles(channel)
     exp = {}
     for side, fam in sides.items():
         f = FAMILY[fam]
@@ -366,8 +395,9 @@ def _expected_from_config(sides, roles=None):
     return exp
 
 # ---- run lifecycle ----------------------------------------------------------------------
-def new_run(question, tier, experiments=False, sides=None, constraints=None, slug=None, roles=None):
-    """Create local://converge/<run-id>/ with manifest + empty ledger; freeze the configured roles into manifest.expected."""
+def new_run(question, tier, experiments=False, sides=None, constraints=None, slug=None, roles=None, channel=None):
+    """Create local://converge/<run-id>/ with manifest + empty ledger; freeze the running channel's effective roles into
+    manifest.expected (channel = launcher name/path of THIS session's channel, else $CONVERGE_CHANNEL_BIN)."""
     global RUN, _JEV_MODE
     assert tier in BUDGETS, tier
     _JEV_MODE = "typesafe"; _JEV_CACHE.clear()
@@ -379,11 +409,12 @@ def new_run(question, tier, experiments=False, sides=None, constraints=None, slu
         sides = {"A": fam[0], "B": fam[1]}
     manifest = dict(run_id=run_id, question=question, constraints=constraints or {}, tier=tier,
                     experiments=bool(experiments), sides=sides, opener=random.choice(SIDES) if tier == "L1" else None,
-                    expected=_expected_from_config(sides, roles), budgets=dict(BUDGETS[tier]), per_spawn=PER_SPAWN,
+                    expected=_expected_from_config(sides, roles, channel), channel=None if roles else channel_binary(channel),
+                    budgets=dict(BUDGETS[tier]), per_spawn=PER_SPAWN,
                     jev_backend=_JEV_MODE, started_at=_now(), status="running", terminal_state=None, final_status=None,
                     escalated_at=None, reopened=False, contaminated_identities=False, tier_escalations=[],
                     failures={"A": 0, "B": 0}, falsification=None, panel=None, report=None, report_gate=None,
-                    cost_usd=0.0, cost_by_job={}, wall_ms=0, ask={}, experiment_worktrees={}, spawns={})
+                    cost_usd=0.0, cost_by_job={}, jev_cost_usd=0.0, wall_ms=0, ask={}, experiment_worktrees={}, spawns={})
     ledger = dict(run_id=run_id, tier=tier, round=0, cruxes=[], evidence=[], phi=[], non_progress_streak=0,
                   escalated_at=None, reopened=False, deferred=[], flags=[], ref_map={})
     RUN = {"manifest": manifest, "ledger": ledger}
@@ -439,10 +470,11 @@ def escalate_tier(to_tier, approved, timed_out=False, reason=""):
     save()
     return dict(changed=ok, tier=M["tier"], budgets=M["budgets"], entry=entry)
 
-# ---- jev wrapper ----------------------------------------------------------------
-def jev(state, questions, tag="", r=None):
+# ---- jev wrapper (18.3: `await judge(state, questions)` returns {id: answer}; no handle, no .wait()) ----------------
+async def jev(state, questions, tag="", r=None):
     """judge() with logging + fail-closed fallback. Raises JevUnavailable when the backend is down and the
-    card has no orchestrator answer yet."""
+    card has no orchestrator answer yet. Backend provenance: "typesafe" = the native judge role chain answered,
+    "orchestrator" = a cached jev_answer. Awaited by every helper that consults it."""
     global _JEV_MODE
     digest = _digest([state, questions])
     entry = dict(at=_now(), tag=tag, digest=digest, state_digest=_digest(state), questions=list(questions),
@@ -457,8 +489,8 @@ def jev(state, questions, tag="", r=None):
     else:
         t0 = time.time()
         try:
-            answers, backend, error = judge(state, questions).wait(), "typesafe", None
-        except Exception as exc:  # judgmentFallback=none -> fails closed
+            answers, backend, error = await judge(state, questions), "typesafe", None
+        except Exception as exc:  # judge role pinned with an empty fallback chain -> fails closed, never substitutes
             _JEV_MODE = "orchestrator"
             if RUN:
                 RUN["manifest"]["jev_backend"] = "orchestrator"; save()
@@ -491,10 +523,10 @@ def _pchoice(ans, key):
     v = ans[key]
     return v["probabilities"] if isinstance(v, dict) and "probabilities" in v else v
 
-def jev_probe():
+async def jev_probe():
     """One trivial bool; sets manifest.jev_backend."""
     try:
-        jev("The orchestrator is checking that its bookkeeping judge answers.", {"alive": {"type": "bool",
+        await jev("The orchestrator is checking that its bookkeeping judge answers.", {"alive": {"type": "bool",
             "instructions": "Is this a check that the judge answers?"}}, tag="probe")
         backend = "typesafe"
     except JevUnavailable:
@@ -693,7 +725,7 @@ def _apply_position(L, cid, side, cx, r, event="position", overwrite=True):
     if event:
         c["history"].append(dict(round=r, event=event, side=side, detail=_cap_words(cx.get("mine", ""), 40)))
 
-def _admit_candidate(side, cand, r, counter, phase="converge", other_text="", create=True, tag=""):
+async def _admit_candidate(side, cand, r, counter, phase="converge", other_text="", create=True, tag=""):
     """One candidate crux through the canonical gate: per-side cap -> jev M (+duplicate) -> run cap -> jev N (r>=3 or
     falsification). cand = {statement, mine, evidence, steelman?, falsifier?}. Returns (cid|None, outcome).
     Statements are frozen at <= TH.statement_words words (N3: packets and cards stay bounded)."""
@@ -712,7 +744,7 @@ def _admit_candidate(side, cand, r, counter, phase="converge", other_text="", cr
         qs["duplicate"] = {"type": "choice",
             "instructions": "Is this crux the same disagreement as one of the existing open cruxes listed in state.open_cruxes?",
             "criteria": dict({"none": "distinct disagreement"}, **{c["id"]: c["statement"][:200] for c in open_[:254]})}
-    ans = jev(state, qs, tag=f"M:{tag or side}", r=r)
+    ans = await jev(state, qs, tag=f"M:{tag or side}", r=r)
     if "duplicate" in ans:
         probs = _pchoice(ans, "duplicate")
         dup, pdup = max(((k, float(v)) for k, v in probs.items() if k != "none"), key=lambda kv: kv[1], default=(None, 0.0))
@@ -729,8 +761,8 @@ def _admit_candidate(side, cand, r, counter, phase="converge", other_text="", cr
     vc = None
     if material and (r >= 3 or phase == "falsification"):
         syn = _cap_words(_read_or(_p("checkpoints/synthesis-latest.md"), ""), 500)
-        vc = _pbool(jev(dict(synthesis=syn, candidate_crux=cand["statement"], argument=cand.get("mine", "")), Q_N,
-                        tag=f"N:{tag or side}", r=r), "verdict_changing")
+        vc = _pbool(await jev(dict(synthesis=syn, candidate_crux=cand["statement"], argument=cand.get("mine", "")), Q_N,
+                              tag=f"N:{tag or side}", r=r), "verdict_changing")
         if vc < TH["verdict_changing"]:
             L["deferred"].append(dict(statement=cand["statement"], reason=f"not verdict-changing ({vc:.2f})", round=r, side=side, phase=phase))
             return None, f"deferred:not_verdict_changing:{vc:.2f}"
@@ -747,7 +779,7 @@ def _admit_candidate(side, cand, r, counter, phase="converge", other_text="", cr
     _apply_position(L, cid, side, cand, r, event=None)
     return cid, ("admitted" if material else "wording")
 
-def admit_cruxes(replies, r):
+async def admit_cruxes(replies, r):
     """Positions for existing refs; NEW-k through _admit_candidate. Returns {side: {"NEW-k": "C<n>"}}; persists ref_map."""
     load()
     L = RUN["ledger"]
@@ -762,7 +794,7 @@ def admit_cruxes(replies, r):
                 else:
                     L["deferred"].append(dict(statement=cx.get("statement", ""), reason=f"unknown ref {ref}", round=r, side=side))
                 continue
-            cid, outcome = _admit_candidate(side, cx, r, counter, other_text=(replies.get(_other(side)) or {}).get("position", ""), tag=f"{side}:{ref}")
+            cid, outcome = await _admit_candidate(side, cx, r, counter, other_text=(replies.get(_other(side)) or {}).get("position", ""), tag=f"{side}:{ref}")
             if cid:
                 mapping[side][ref] = cid
     L["ref_map"][str(r)] = mapping
@@ -806,7 +838,7 @@ def _quote_present(fetched, quote):
         return None
     return q in _norm(fetched)
 
-def verify_evidence(replies, r, mapping=None):
+async def verify_evidence(replies, r, mapping=None):
     """Fetch every locator; deterministic quote-presence check first (D4: `quote_present`, diagnostics), then jev E
     (`quote_supports_claim`, `supports_crux`); append to ledger.evidence. `verified` = the quote is at the locator AND
     supports its claim (N7); n_r counts verified entries that support an open crux and are unseen."""
@@ -835,7 +867,7 @@ def verify_evidence(replies, r, mapping=None):
                 card = dict(claim=ev["claim"], locator=ev["locator"], crux=cstmt, quote_present_verbatim=bool(present),
                             quote=quote if present else None,
                             context_as_fetched_by_orchestrator=_window(fetched, quote, 400) if present else fetched)
-                ans = jev(card, Q_E, tag=f"E:{eid}", r=r)
+                ans = await jev(card, Q_E, tag=f"E:{eid}", r=r)
                 entry["quote_supports_claim"] = round(_pbool(ans, "quote_supports_claim"), 3)
                 entry["supports_crux"] = round(_pbool(ans, "supports_crux"), 3)
                 # verified = the quote is at the locator (deterministic when checkable, else jev's call) AND it supports the claim (N7)
@@ -854,7 +886,7 @@ def verify_evidence(replies, r, mapping=None):
     save()
     return n_new
 
-def _evidence_basis(L, eid, cid, r=None):
+async def _evidence_basis(L, eid, cid, r=None):
     """(exists, valid, status) for a `moved_by` evidence id against the crux being conceded (R4). valid iff the entry is
     verified (quote present AND supports its claim) and its support for THIS crux is established: the score recorded when
     it was filed for this crux, else a fresh jev E `supports_crux` against this crux's statement (cached in entry.supports).
@@ -868,14 +900,14 @@ def _evidence_basis(L, eid, cid, r=None):
     if e.get("crux") == cid and e.get("supports_crux") is not None:
         sup.setdefault(cid, e["supports_crux"])
     if cid not in sup:
-        ans = jev(dict(claim=e["claim"], locator=e["locator"], quote=e.get("quote") or "", crux=_crux(L, cid)["statement"]),
-                  Q_E_CRUX, tag=f"E:{eid}:{cid}", r=r)
+        ans = await jev(dict(claim=e["claim"], locator=e["locator"], quote=e.get("quote") or "", crux=_crux(L, cid)["statement"]),
+                        Q_E_CRUX, tag=f"E:{eid}:{cid}", r=r)
         sup[cid] = round(_pbool(ans, "supports_crux"), 3)
     ok = sup[cid] >= TH["crux"]
     return True, ok, ("verified" if ok else f"verified but does not support {cid} ({sup[cid]:.2f})")
 
 # ---- convergence state (R3/R4/R5) -----------------------------------------------------
-def converge_state(r, replies, prior_cruxes=None, force=False):
+async def converge_state(r, replies, prior_cruxes=None, force=False):
     """jev C per open crux after round r (r>=2, or force); both_withdraw closure (D1); sycophancy + crux-specific
     moved_by validation (R4); scoped_out needs both sides; a crux not addressed by both sides this round is left
     untouched (never closed by silence). ledger.flags holds standing flags: a crux re-evaluated or closed this round
@@ -910,7 +942,7 @@ def converge_state(r, replies, prior_cruxes=None, force=False):
         for k in conc:
             mb = str(k.get("moved_by", "")).strip()
             if EVID_RE.match(mb):
-                exists, valid, status = _evidence_basis(L, mb, c["id"], r)
+                exists, valid, status = await _evidence_basis(L, mb, c["id"], r)
                 k["moved_by_kind"] = "evidence"
                 k["moved_by_status"] = status
                 invalid_basis = invalid_basis or not valid
@@ -923,7 +955,7 @@ def converge_state(r, replies, prior_cruxes=None, force=False):
         qs = {"state": Q_C_STATE, "both_withdraw": Q_C_WITHDRAW}
         if conc:
             qs["concession_without_evidence"] = Q_C_SYCO
-        ans = jev(state, qs, tag=f"C:{c['id']}", r=r)
+        ans = await jev(state, qs, tag=f"C:{c['id']}", r=r)
         p = _pchoice(ans, "state")
         pa, pp, pd = float(p.get("agree", 0)), float(p.get("partial", 0)), float(p.get("disagree", 0))
         u = pd + 0.5 * pp
@@ -1016,7 +1048,7 @@ def close_round(r, replies, n_new, phase="converge", spawn=None, flags=(), force
                 open=[dict(id=c["id"], s=c["stakes"], u=c["uncertainty"]) for c in _open(L)], flags=list(flags))
 
 # ---- falsification objections (R18/R23) ----------------------------------------------------
-def _classify_objections(replies, r):
+async def _classify_objections(replies, r):
     """Every objection (why_wrong + evidence ids retained) through _admit_candidate. Material, verdict-changing objections
     are ALWAYS admitted as open cruxes (N1): with a round left they drive the reopen; without one they stay open and
     unresolved, so no budget cap can turn a successful falsifier into plain Converged. Returns {admitted, residual, verdict_stands}."""
@@ -1026,7 +1058,7 @@ def _classify_objections(replies, r):
     for side, rep in replies.items():
         for ob in rep.get("objections") or []:
             cand = dict(statement=ob["statement"], mine=ob.get("why_wrong", ""), evidence=list(ob.get("evidence") or []))
-            cid, outcome = _admit_candidate(side, cand, r, counter, phase="falsification", other_text=syn, tag=f"F:{side}")
+            cid, outcome = await _admit_candidate(side, cand, r, counter, phase="falsification", other_text=syn, tag=f"F:{side}")
             item = dict(side=side, statement=ob["statement"], why_wrong=ob.get("why_wrong", ""), evidence=cand["evidence"],
                         severity=ob.get("severity", "minor"), outcome=outcome)
             (admitted if cid and outcome == "admitted" else residual).append(dict(item, id=cid) if cid else item)
@@ -1044,11 +1076,19 @@ def _mark_unresolved(out, r, why):
     return out
 
 # ---- ingestion entry points (R1/R2) ---------------------------------------------------------
-def ingest_round(r, replies, phase="converge", spawn=None, attempt=1):
+def _reject_interim(replies):
+    """A wake-turn progress yield (`turn` != final) is not a reply: passing one is a call-site error, never a debater
+    failure, so it raises before any state is touched or persisted."""
+    interim = [s for s, rep in replies.items() if isinstance(rep, dict) and not is_final(rep)]
+    if interim:
+        raise ValueError(f"interim wake-turn yield for {interim}: keep waiting for that side's `turn: \"final\"` yield")
+
+async def ingest_round(r, replies, phase="converge", spawn=None, attempt=1):
     """One call per round attempt. Validates each reply against its phase contract first: an invalid/blocked reply on
     attempt 1 => action `retry` (re-spawn those sides with the identical packet); on attempt 2 => that side's failure
     count rises, the round counts as non-progress, no crux is closed from failed input; a side failing twice in a run
     => `incomplete_transport`. Re-running the same (r, attempt) restarts from rounds/<r>/state-before.json."""
+    _reject_interim(replies)
     _restore_point(f"rounds/{r}/state-before.json")
     before = _rj(_p(f"rounds/{r}/state-before.json"))["ledger"]["cruxes"]
     M = RUN["manifest"]
@@ -1069,8 +1109,8 @@ def ingest_round(r, replies, phase="converge", spawn=None, attempt=1):
     l1 = M["tier"] == "L1"
     if l1 and invalid:  # L1 needs both sides; a half exchange is void
         return dict(close_round(r, valid, 0, phase, spawn, flags=flags, forced_non_progress=True), invalid=invalid, failures=dict(M["failures"]))
-    mapping = admit_cruxes(valid, r)
-    n_new = verify_evidence(valid, r, mapping)
+    mapping = await admit_cruxes(valid, r)
+    n_new = await verify_evidence(valid, r, mapping)
     if l1:
         L, opener = RUN["ledger"], M["opener"]
         drafter_map = mapping.get(_other(opener), {})
@@ -1080,15 +1120,15 @@ def ingest_round(r, replies, phase="converge", spawn=None, attempt=1):
                 _apply_position(L, cid, opener, dict(mine=f"[{pc.get('state')}] {pc.get('why', '')}"), r)
         save()
     if not invalid:
-        flags += converge_state(r, valid, prior_cruxes=before, force=l1)
+        flags += await converge_state(r, valid, prior_cruxes=before, force=l1)
         if l1:  # falsification is integrated into the single exchange; no reopen round exists in L1
-            out = _mark_unresolved(_classify_objections(valid, r), r, "L1 has no reopen round")
+            out = _mark_unresolved(await _classify_objections(valid, r), r, "L1 has no reopen round")
             RUN["manifest"]["falsification"] = dict(at=_now(), integrated=True, completed={s: True for s in SIDES}, **out)
             save()
     return dict(close_round(r, valid, n_new, phase, spawn, flags, forced_non_progress=bool(invalid)), invalid=invalid,
                 failures=dict(RUN["manifest"]["failures"]))
 
-def ingest_falsification(replies, attempt=1):
+async def ingest_falsification(replies, attempt=1):
     """Transactional (R1): verify evidence and classify against one state, commit objections + reopened together.
     Invalid/blocked reply: attempt 1 => `retry` those sides; attempt 2 => that side's falsification is `incomplete`
     (disclosed by final_status). Reopen only if a round remains (R19) and never twice."""
@@ -1101,10 +1141,10 @@ def ingest_falsification(replies, attempt=1):
     if invalid and attempt == 1:
         return dict(action="retry", retry=sorted(invalid), reasons=invalid)
     valid = {s: rep for s, rep in replies.items() if s not in invalid}
-    verify_evidence(valid, r)
+    await verify_evidence(valid, r)
     L, M = RUN["ledger"], RUN["manifest"]
     can_reopen = (not M["reopened"]) and (r + 1 <= M["budgets"]["max_rounds"])
-    out = _classify_objections(valid, r)
+    out = await _classify_objections(valid, r)
     reopen = bool(out["admitted"]) and can_reopen
     if reopen:
         M["reopened"] = L["reopened"] = True
@@ -1158,10 +1198,11 @@ def _rules_block(tier, l1=False):
         "- Yield structured output only (the schema given to you). Incomplete => set `blocked`.",
     ]
     if l1:
-        lines.append("- Hub: FIRST block with `hub wait from:Main` until Main sends `PEER: <id>`; only that id is your peer (<= 3 messages, fire-and-forget `hub send`, then `hub wait from:<id>`). `Main` for BLOCKED/NEEDS-APPROVAL only. Peer silent 15 min => yield `blocked`.")
+        lines.append("- Messaging: `write` with path `agent://<id>` (never blocks; `wait` is not available to you). Until Main's `PEER: <id>` message arrives, research; that id is your only peer (<= 3 messages to it). `agent://Main` for BLOCKED/NEEDS-APPROVAL only. Peer messages reach you while you work or wake you after a yield.")
+        lines.append("- Wake turns: when you need the peer's next message and have nothing left to do, yield your schema with `turn` = the step you just completed (`opening` | `response` | `rebuttal`; arrays may be empty). The peer's message wakes you: continue from there. Your last yield sets `turn: \"final\"` — only that one counts. Woken with no peer message for 15 min since your last send => yield `turn: \"final\"` with `blocked`.")
     else:
-        lines.append("- Hub: `Main` only, and only for `BLOCKED:` / `NEEDS-APPROVAL:` one-liners. NEVER `hub list`, NEVER contact any other agent.")
-    lines.append(f"- Budget: {b['spawn_cap_min']} min wall for this spawn; Main cancels over-cap spawns.")
+        lines.append("- Messaging: `write` with path `agent://Main` only, and only for `BLOCKED:` / `NEEDS-APPROVAL:` one-liners. NEVER contact any other agent; ignore any other sender.")
+    lines.append(f"- Budget: {b['spawn_cap_min']} min wall for this spawn; Main kills over-cap spawns (`proc://<job>/kill`).")
     return "\n".join(lines)
 
 def _open_ids_block():
@@ -1289,11 +1330,11 @@ def packet(side, r, phase="converge", extra=None):
                      ("m", _rules_block(tier), 0)]
     elif tier == "L1":
         opener = M["opener"] == side
-        sections += [("m", "\n".join(["## L1 protocol (one exchange, hub)",
-                     f"- Opener: {'you' if opener else 'the other side'}. Order: opener sends position (<= 500 words) + cruxes; responder sends position + cruxes + objections; opener sends rebuttal + concessions (`moved_by`); then both yield.",
-                     ("- You yield: concurrence per crux (`per_crux`: ref, agree|partial|disagree, why) and `objections` falsifying the responder's draft." if opener else
-                      "- You yield: the converged draft (`position` <= 700 words), `cruxes` with both positions, `concessions` with `moved_by`, `evidence`, and `objections` falsifying your own draft (`verdict_stands`)."),
-                     "- Wait for `PEER: <id>` from Main before any peer message; the peer id is NOT guessable."]), 0),
+        sections += [("m", "\n".join(["## L1 protocol (one exchange, wake turns over `agent://`)",
+                     f"- Opener: {'you' if opener else 'the other side'}. Order: opener sends position (<= 500 words) + cruxes, yields `turn: \"opening\"`; responder sends position + cruxes + objections, yields `turn: \"response\"`; opener sends rebuttal + concessions (`moved_by`) and yields `turn: \"final\"`; responder yields `turn: \"final\"` on receiving the rebuttal.",
+                     ("- Your final yield: concurrence per crux (`per_crux`: ref, agree|partial|disagree, why) and `objections` falsifying the responder's draft." if opener else
+                      "- Your final yield: the converged draft (`position` <= 700 words), `cruxes` with both positions, `concessions` with `moved_by`, `evidence`, and `objections` falsifying your own draft (`verdict_stands`)."),
+                     "- Wait for `PEER: <id>` from Main before any peer message; the peer id is NOT guessable. A peer message arrives as an incoming message (while you work, or waking you after a yield)."]), 0),
                      ("m", _rules_block(tier, l1=True), 0)]
     elif r == 1:
         sections += [("m", "## Task\nBlind first draft. Nobody else's position is available; do not seek one.\nAnswer the question; name <= 3 cruxes you consider decisive (`NEW-1..3`) with your falsifier for each; cite evidence.", 0),
@@ -1343,7 +1384,7 @@ def spawn_round(r, phase="converge", tools=None, sides=SIDES, attempt=1, extra=N
             t["tools"] = list(tools)
         tasks.append(t)
     ctx = (f"# Goal\nconverge run {M['run_id']}, tier {M['tier']}, round {r}, phase {phase}.\n"
-           f"# Constraints\nRead-only participants; structured yield only; hub per your packet. Per-spawn cap {M['budgets']['spawn_cap_min']} min.\n"
+           f"# Constraints\nRead-only participants; structured yield only; messaging per your packet (`write agent://…`). Per-spawn cap {M['budgets']['spawn_cap_min']} min.\n"
            f"# Contract\nYour packet is the whole assignment; the brief is at {_p('brief.md')}.")
     where = "falsification" if phase == "falsification" else f"rounds/{r}"
     _wj(_p(f"{where}/spawn-{phase}-a{attempt}.json"), dict(tasks=[dict(name=t["name"], agent=t["agent"], side=s) for t, s in zip(tasks, sides)],
@@ -1353,38 +1394,108 @@ def spawn_round(r, phase="converge", tools=None, sides=SIDES, attempt=1, extra=N
 def _spawn_dir(phase, r):
     return "falsification" if phase == "falsification" else ("l3" if phase in ("verdict", "conference") else f"rounds/{r}")
 
+def _spawn_id(v):
+    """Normalise one task-result allocation: "<id>" (the result printed the same id for agent and job) or
+    {"agent": <registry id>, "job": <job id>}. Agent id addresses agent:// and names <agent>.jsonl; job id addresses proc://."""
+    if isinstance(v, str):
+        return dict(agent=v, job=v)
+    if isinstance(v, dict) and v.get("agent") and v.get("job"):
+        return dict(agent=str(v["agent"]), job=str(v["job"]))
+    raise ValueError(f"spawn id must be '<id>' or {{'agent': …, 'job': …}} from the task result, got {v!r}")
+
+def _cap_min(phase):
+    b = RUN["manifest"]["budgets"]
+    return b.get("judge_cap_min", 25) if phase in ("verdict", "conference") else b["spawn_cap_min"]
+
 def register_spawn(r, phase, ids):
-    """ids = {requested name: allocated job/agent id} from ONE task result. Returns that batch's {side|judge: id} — the
-    set to identity-check. manifest.spawns["<phase>:<r>"] accumulates every batch (R12): `by_who` = the latest id per
-    role across retries (see spawn_ids), `batches` = every allocation (costs are harvested for all of them, D3)."""
+    """ids = {requested name: "<id>" | {"agent": …, "job": …}} from ONE task result (`- <agent id> (job <job id>)` lines).
+    Returns that batch's {side|judge: {agent, job}} — the set to identity-check. manifest.spawns["<phase>:<r>"]
+    accumulates every batch (R12): `by_who` = the latest ids per role across retries (see spawn_ids), `batches` = every
+    allocation with its `deadline_at` (spawn cap from registration; costs are harvested for all of them, D3)."""
     load()
     M = RUN["manifest"]
     by_name = {}
     for att in (1, 2, 3):
         for t in (_rj(_p(f"{_spawn_dir(phase, r)}/spawn-{phase}-a{att}.json")) or {}).get("tasks", []):
             by_name[t["name"]] = t.get("side") or t.get("who")
-    batch = {by_name.get(n, n): jid for n, jid in ids.items()}
+    norm = {n: _spawn_id(v) for n, v in ids.items()}
+    batch = {by_name.get(n, n): v for n, v in norm.items()}
     entry = M["spawns"].setdefault(f"{phase}:{r}", dict(ids={}, by_who={}, batches=[]))
-    entry["ids"].update(ids)
+    entry["ids"].update(norm)
     entry["by_who"].update(batch)
-    entry["batches"].append(dict(ids=dict(ids), by_who=batch, at=_now()))
+    at = _dt.datetime.now(_dt.timezone.utc)
+    entry["batches"].append(dict(ids=norm, by_who=batch, at=at.isoformat(timespec="seconds"),
+                                 cap_min=_cap_min(phase), deadline_at=(at + _dt.timedelta(minutes=_cap_min(phase))).isoformat(timespec="seconds")))
     entry["current"] = batch
     save()
     return batch
 
 def spawn_ids(r, phase="converge"):
-    """Merged {side|judge: latest id} for a phase/round across retries — the mapping for peer_messages (R12)."""
+    """Merged {side|judge: {agent, job}} for a phase/round across retries — the mapping for peer_messages / cancel_requests (R12)."""
     load()
     return dict((RUN["manifest"]["spawns"].get(f"{phase}:{r}") or {}).get("by_who", {}))
 
 def peer_messages(who_ids):
-    """L1 / conference peer release (R12): {"A": idA, "B": idB} or {"J1": id, "J2": id} -> hub sends for Main. After a
-    one-side retry pass spawn_ids(r, phase): the surviving peer (parked after its yield) is revived by the send."""
+    """L1 / conference peer release (R12): {"A": {agent, job}, "B": …} or {"J1": …, "J2": …} -> `write` requests for Main
+    (path agent://<agent id>, plain-text content). After a one-side retry pass spawn_ids(r, phase): the surviving peer
+    (parked after its yield) is revived by the write."""
     keys = list(who_ids)
     assert len(keys) == 2, f"peer release needs exactly two ids (use spawn_ids(r, phase) after a retry): {who_ids}"
     a, b = keys
-    return [dict(op="send", to=who_ids[a], message=f"PEER: {who_ids[b]} — you may now exchange with your peer per your packet."),
-            dict(op="send", to=who_ids[b], message=f"PEER: {who_ids[a]} — you may now exchange with your peer per your packet.")]
+    ida, idb = who_ids[a]["agent"], who_ids[b]["agent"]
+    return [dict(path=f"agent://{ida}", content=f"PEER: {idb} — you may now exchange with your peer per your packet.", i=f"Releasing peer contact {a}"),
+            dict(path=f"agent://{idb}", content=f"PEER: {ida} — you may now exchange with your peer per your packet.", i=f"Releasing peer contact {b}")]
+
+def cancel_requests(who_ids):
+    """`write` requests that kill the given spawns (identity mismatch, over-cap, stragglers): proc://<job id>/kill takes
+    no content. Cancelled jobs deliver no result; record the reason yourself (spawn_meta / manifest)."""
+    return [dict(path=f"proc://{v['job']}/kill", i=f"Cancelling {who}") for who, v in who_ids.items()]
+
+def _job_row(jobs, sid):
+    """The proc:// row for one registered spawn: by job id first, else by agentUrlId (a wake turn re-registers the same
+    agent under a suffixed job id). Newest matching row wins so a finished first run does not mask a live wake turn."""
+    exact = [j for j in jobs if j.get("id") == sid["job"]]
+    same_agent = [j for j in jobs if j.get("agentUrlId") == sid["agent"]]
+    live = [j for j in exact + same_agent if j.get("status") in (None, "queued", "pending", "running")]
+    return (live or exact or same_agent or [None])[-1]
+
+def deadline_in_s(r, phase="converge"):
+    """Seconds until the latest registered batch of a phase/round hits its cap (0 when past): the argument for wake_timer."""
+    load()
+    batches = (RUN["manifest"]["spawns"].get(f"{phase}:{r}") or {}).get("batches") or []
+    if not batches:
+        raise ValueError(f"no registered batch for {phase}:{r}")
+    end = _dt.datetime.fromisoformat(batches[-1]["deadline_at"])
+    return max(0, int((end - _dt.datetime.now(_dt.timezone.utc)).total_seconds()))
+
+def wake_timer(seconds):
+    """`bash` arguments for a finite background sleep: its completion is an owned job result, so `wait` wakes at the
+    deadline even if every child is silent (18.3 `wait` has no timeout of its own). Submit with bash(**wake_timer(n))."""
+    n = max(1, int(seconds))
+    return {"command": f"sleep {n}", "async": True, "timeout": n + 30, "i": f"Converge wake timer {n}s"}
+
+def overdue(snapshot):
+    """Every registered spawn still running past its batch deadline, from a `proc://` snapshot: {overdue: [...],
+    kill: [write requests]}. Run it on EVERY wake; an over-cap side is a timeout (retry once, §7). Written to
+    rounds/<r>/identity.json beside the identity results when anything is overdue."""
+    load()
+    jobs = ((snapshot or {}).get("details") or {}).get("proc", {}).get("jobs", []) if isinstance(snapshot, dict) else []
+    now = _dt.datetime.now(_dt.timezone.utc)
+    late = []
+    for key, entry in RUN["manifest"]["spawns"].items():
+        for b in entry.get("batches") or []:
+            if "deadline_at" not in b or _dt.datetime.fromisoformat(b["deadline_at"]) > now:
+                continue
+            for who, sid in b["by_who"].items():
+                row = _job_row(jobs, sid)
+                if row and row.get("status") in (None, "queued", "pending", "running"):
+                    late.append(dict(who=who, key=key, job=row.get("id"), agent=sid["agent"], deadline_at=b["deadline_at"],
+                                     over_s=int((now - _dt.datetime.fromisoformat(b["deadline_at"])).total_seconds())))
+    result = dict(overdue=late, kill=[dict(path=f"proc://{x['job']}/kill", i=f"Killing over-cap {x['who']} ({x['key']})") for x in late], at=_now())
+    if late:
+        path = _p(f"rounds/{RUN['ledger']['round'] + 1}/identity.json")
+        _wj(path, (_rj(path, []) or []) + [dict(result, kind="overdue")])
+    return result
 
 def l1_transcript(r, side):
     """`extra` for an L1 one-side retry: the surviving side's accepted yield rendered as the transcript so far (anonymised)."""
@@ -1424,29 +1535,31 @@ def expected_judges(stage, ids):
     return {n: dict(model=E[n.split("-")[0]]["model"], effort=E[n.split("-")[0]]["effort"]) for n in ids}
 
 def identity_check(snapshot, expected, job_ids):
-    """snapshot = `await tool.hub(op="jobs", i=...)` (dict with details.jobs). expected = {who: {model, effort}} for the
-    batch; job_ids = {who: job id} — the batch returned by register_spawn, REQUIRED (no label matching: stale jobs from
-    earlier rounds share names). The two MUST name the same roles: a spawned id without an expectation, or an expectation
-    without an id, is a call-site error (R12). A row whose identity fields are still `pending` (the child has not streamed
-    yet) is neither ok nor a mismatch: the result says `retry` — re-check after the next `hub wait` wake, never sleep in eval (D6)."""
+    """snapshot = `await tool.read(path="proc://")` (dict with details.proc.jobs; reads never acknowledge delivery).
+    expected = {who: {model, effort}} for the batch; job_ids = {who: {agent, job}} — the batch returned by register_spawn,
+    REQUIRED (no label matching: stale jobs from earlier rounds share names). The two MUST name the same roles: a spawned
+    id without an expectation, or an expectation without an id, is a call-site error (R12). A row whose identity fields
+    are still `pending` (the child has not streamed yet) is neither ok nor a mismatch: the result says `retry` — re-read
+    proc:// after the next `wait` wake, never sleep in eval (D6). 18.3 rows carry no fallback flag: a fallback model is
+    a different identity, and the converge roles' empty retry.fallbackChains forbid one anyway."""
     job_ids = job_ids or {}
-    missing = [w for w in expected if not job_ids.get(w)]
+    missing = [w for w in expected if not (job_ids.get(w) or {}).get("job")]
     unexpected = [w for w in job_ids if w not in expected]
     if missing or unexpected:
         raise ValueError(f"identity_check: expectations and the batch must cover the same roles (no id for {missing}; "
                          f"no expectation for {unexpected}); pass expected_for(r, ids) / expected_judges(stage, ids) with the ids you registered")
-    jobs = (snapshot or {}).get("details", {}).get("jobs", []) if isinstance(snapshot, dict) else []
+    jobs = ((snapshot or {}).get("details") or {}).get("proc", {}).get("jobs", []) if isinstance(snapshot, dict) else []
     rows, mismatches, pending = [], [], []
     for who, exp in expected.items():
-        job = next((j for j in jobs if j.get("id") == job_ids[who]), None)
+        job = _job_row(jobs, job_ids[who])
         ident = (job or {}).get("resolvedModelIdentity") or ""
         base = ident.split("@", 1)[0]
         level = (job or {}).get("resolvedThinkingLevel")
-        fb = (job or {}).get("resolvedModelIsFallback", False)
         is_pending = bool(job) and not ident and job.get("status") in (None, "queued", "pending", "running")
-        ok = bool(job) and base == exp["model"] and level == exp["effort"] and not fb
-        row = dict(who=who, job=job_ids[who], expected=exp, resolved_model=(job or {}).get("resolvedModel"),
-                   identity=ident, thinking=level, fallback=fb, ok=ok, pending=is_pending)
+        ok = bool(job) and base == exp["model"] and level == exp["effort"]
+        row = dict(who=who, job=job_ids[who]["job"], agent=job_ids[who]["agent"], row_job=(job or {}).get("id"),
+                   row_agent=(job or {}).get("agentUrlId"), expected=exp, resolved_model=(job or {}).get("resolvedModel"),
+                   identity=ident, thinking=level, status=(job or {}).get("status"), ok=ok, pending=is_pending)
         rows.append(row)
         if is_pending:
             pending.append(who)
@@ -1472,21 +1585,19 @@ def spawn_meta(r, side, **fields):
     _wj(path, rec)
     return rec["spawn"]
 
-# ---- cost accounting (D3): each child's session file lives beside the parent's, <session>/<job id>.jsonl ----------
+# ---- cost accounting (D3): each child's session file lives beside the parent's, <session>/<agent id>.jsonl ----------
 def _session_dir():
-    """The parent session directory, derived from where local:// lands on disk (…/<session>/local/converge/<run>/)."""
+    """The parent artifacts directory, derived from where local:// lands on disk (…/<session>/local/converge/<run>/).
+    The parent session file is <session>.jsonl beside it (18.3: children are <session>/<agent id>.jsonl)."""
     if _MANIFEST_DISK is None:
         save()
     p = Path(str(_MANIFEST_DISK)).resolve()
     return p.parents[3] if len(p.parents) > 3 and p.parents[2].name == "local" else None
 
-def _job_usage(job_id):
-    """Sum of assistant-message usage in the child's session file; None when the file is absent."""
-    sd = _session_dir()
-    f = (sd / f"{job_id}.jsonl") if sd else None
-    if not f or not f.is_file():
-        return None
-    usd, tin, tout, req = 0.0, 0, 0, 0
+def _usage_entries(f, since=None):
+    """Yield (kind, usage, entry) for every spend record in a session file: assistant messages (`message.usage`) and
+    `model_usage` entries (18.3 journals calls outside the transcript there — judgments, summaries — once each; the two
+    kinds never describe the same call). `since` (ISO) skips older entries."""
     with f.open(encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if '"usage"' not in line:
@@ -1495,20 +1606,53 @@ def _job_usage(job_id):
                 e = json.loads(line)
             except ValueError:
                 continue
-            m = e.get("message") if isinstance(e, dict) else None
-            u = m.get("usage") if isinstance(m, dict) and m.get("role") == "assistant" else None
-            if not isinstance(u, dict):
+            if not isinstance(e, dict) or (since and str(e.get("timestamp") or "") < since):
                 continue
-            req += 1
-            tin += int(u.get("input") or 0) + int(u.get("cacheRead") or 0) + int(u.get("cacheWrite") or 0)
-            tout += int(u.get("output") or 0)
-            usd += float((u.get("cost") or {}).get("total") or 0)
-    return dict(usd=round(usd, 4), tokens_in=tin, tokens_out=tout, requests=req)
+            if e.get("type") == "model_usage" and isinstance(e.get("usage"), dict):
+                yield "model_usage", e["usage"], e
+                continue
+            m = e.get("message")
+            u = m.get("usage") if isinstance(m, dict) and m.get("role") == "assistant" else None
+            if isinstance(u, dict):
+                yield "assistant", u, e
+
+def _sum_usage(f, since=None, keep=lambda kind, entry: True):
+    usd, aux, tin, tout, req, aux_req = 0.0, 0.0, 0, 0, 0, 0
+    for kind, u, e in _usage_entries(f, since):
+        if not keep(kind, e):
+            continue
+        cost = float((u.get("cost") or {}).get("total") or 0)
+        tin += int(u.get("input") or 0) + int(u.get("cacheRead") or 0) + int(u.get("cacheWrite") or 0)
+        tout += int(u.get("output") or 0)
+        if kind == "assistant":
+            req += 1; usd += cost
+        else:
+            aux_req += 1; aux += cost
+    return dict(usd=round(usd + aux, 4), usd_messages=round(usd, 4), usd_model_usage=round(aux, 4),
+                tokens_in=tin, tokens_out=tout, requests=req, model_usage_entries=aux_req)
+
+def _agent_usage(agent_id):
+    """Spend recorded in one child's session file (assistant usage + its own model_usage entries); None when absent."""
+    sd = _session_dir()
+    f = (sd / f"{agent_id}.jsonl") if sd else None
+    if not f or not f.is_file():
+        return None
+    return _sum_usage(f)
+
+def _jev_usage():
+    """Main's own judge spend for this run: `model_usage` entries with purpose "judge" in the parent session file since
+    manifest.started_at. Reported apart from cost_usd (children's spend), never added to it. None when the file is absent."""
+    sd = _session_dir()
+    f = (sd.parent / f"{sd.name}.jsonl") if sd else None
+    if not f or not f.is_file():
+        return None
+    return _sum_usage(f, since=RUN["manifest"]["started_at"], keep=lambda kind, e: kind == "model_usage" and e.get("purpose") == "judge")
 
 def harvest_costs(keys=None):
     """Read every registered spawn's usage (all batches, retries included) from its session file into
-    manifest.cost_by_job — the single source of spend (N8) — recompute manifest.cost_usd, and copy per-side cost/tokens
-    into rounds/<r>/record.json. Idempotent; jobs whose file is absent are reported in `missing` (and manifest.cost_missing)."""
+    manifest.cost_by_job (keyed by job id, carrying the agent id) — the single source of spend (N8) — recompute
+    manifest.cost_usd, copy per-side cost/tokens into rounds/<r>/record.json, and refresh manifest.jev_cost_usd from the
+    parent file. Idempotent; jobs whose file is absent are reported in `missing` (and manifest.cost_missing)."""
     load()
     M = RUN["manifest"]
     by_job = M.setdefault("cost_by_job", {})
@@ -1518,22 +1662,26 @@ def harvest_costs(keys=None):
             continue
         phase, r = key.split(":")
         for b in entry.get("batches") or [dict(by_who=entry.get("by_who", {}))]:
-            for who, jid in b["by_who"].items():
-                u = _job_usage(jid)
+            for who, sid in b["by_who"].items():
+                u = _agent_usage(sid["agent"])
                 if u is None:
-                    if jid not in by_job:
-                        missing.append(jid)
+                    if sid["job"] not in by_job:
+                        missing.append(sid["job"])
                     continue
-                by_job[jid] = dict(u, who=who, key=key)
+                by_job[sid["job"]] = dict(u, who=who, key=key, agent=sid["agent"])
                 if phase in ("converge", "reopen"):
                     path = _p(f"rounds/{r}/record.json")
                     rec = _rj(path, {}) or {}
-                    rec.setdefault("spawn", {}).setdefault(who, {}).update(job=jid, cost_usd=u["usd"], tokens=dict(**{"in": u["tokens_in"], "out": u["tokens_out"]}), requests=u["requests"])
+                    rec.setdefault("spawn", {}).setdefault(who, {}).update(job=sid["job"], agent=sid["agent"], cost_usd=u["usd"],
+                        tokens=dict(**{"in": u["tokens_in"], "out": u["tokens_out"]}), requests=u["requests"])
                     _wj(path, rec)
     M["cost_usd"] = round(sum(float(v.get("usd") or 0) for v in by_job.values()), 4)
     M["cost_missing"] = sorted(set([*(M.get("cost_missing") or []), *missing]) - set(by_job))
+    jev = _jev_usage()
+    M["jev_cost_usd"] = jev["usd"] if jev else M.get("jev_cost_usd", 0.0)
+    M["jev_cost_source"] = "parent session model_usage(purpose=judge)" if jev else "parent session file not found"
     save()
-    return dict(cost_usd=M["cost_usd"], jobs=len(by_job), missing=missing, session_dir=str(_session_dir()))
+    return dict(cost_usd=M["cost_usd"], jev_cost_usd=M["jev_cost_usd"], jobs=len(by_job), missing=missing, session_dir=str(_session_dir()))
 
 # ---- checkpoints -------------------------------------------------------------------
 def _coerce_header(text, state, has_stakes3):
@@ -1638,7 +1786,7 @@ def spawn_panel(stage, verdicts=None, who=None, attempt=1):
                 tasks.append(dict(name=name, agent=E[j]["agent"], outputSchema=SCHEMA_VERDICT, task="\n".join([
                     f"Mode: verdict. Dossier: `{d}` (read it whole; the labels A/B in that file are your labels).",
                     f"Score all 7 criteria 1–5 per side with a `cite` for every score < 5, then winner/margin/decisive_evidence/fatal_flaws/confidence. Cap {cap} min.",
-                    "Hub: `Main` only, `BLOCKED:` only."])))
+                    "Messaging: `write agent://Main` only, `BLOCKED:` only."])))
                 spec.append(dict(name=name, agent=E[j]["agent"], who=f"{j}-{order}"))
     else:
         v = json.dumps(verdicts or {}, indent=1, ensure_ascii=False)
@@ -1649,9 +1797,9 @@ def spawn_panel(stage, verdicts=None, who=None, attempt=1):
             tasks.append(dict(name=name, agent=E[j]["agent"], outputSchema=SCHEMA_CONFERENCE, task="\n".join([
                 f"Mode: conference. You are {j}. Dossier: `{_p('l3/dossier.md')}` (canonical labels).",
                 "All four independent verdicts (canonical labels; BA rows were mapped back):", "```json", v, "```",
-                "FIRST block with `hub wait from:Main` until Main sends `PEER: <id>`; that id is the other judge. Exchange <= 3 `hub send` messages, `hub wait from:<id>` between them; change your winner only for a cited reason.",
-                "`exchange_completed` = true ONLY if you received at least one message from the peer; a silent peer (15 min) => false, with `residual_disagreement` saying so.",
-                f"Yield the conference schema. Cap {cap} min. `Main` only for `BLOCKED:`."])))
+                "Until Main's `PEER: <id>` message arrives, re-read the dossier; that id is the other judge (never guess it). Exchange <= 3 messages with it via `write` path `agent://<id>` (never blocks; `wait` is not available to you): your winner, the criterion that decided it, the one evidence id you would ask them to re-read. When you need the peer's next message and have nothing left to do, yield the conference schema with `turn: \"opening\"` (first message sent) or `turn: \"response\"`; the peer's message wakes you — continue. Change your winner only for a cited reason.",
+                "`exchange_completed` = true ONLY if you received at least one message from the peer; woken with no peer message 15 min after your last send => false, with `residual_disagreement` saying so.",
+                f"Your last yield sets `turn: \"final\"` — only that one counts. Cap {cap} min. `agent://Main` only for `BLOCKED:`."])))
             spec.append(dict(name=name, agent=E[j]["agent"], who=j))
     _wj(_p(f"l3/spawn-{stage}-a{attempt}.json"), dict(tasks=spec, at=_now()))
     return dict(i=f"Spawning L3 panel ({stage})", context=f"# Goal\nconverge {M['run_id']} L3 panel, stage {stage}.\n# Constraints\nDossier only; read-only; structured yield.\n# Contract\nSee your task.", tasks=tasks)
@@ -1717,6 +1865,7 @@ def panel_aggregate(mapped, conferences, accept_changes=None):
     yield counts only if it validates and `exchange_completed` is true; otherwise missing/invalid/incomplete is recorded
     and the independent verdict stands. A consistent judge's changed final counts only with an accepted change (R11).
     joint.winner is A|B only; tie/insufficient/split/unavailable are outcomes, never a selection (R22)."""
+    _reject_interim(conferences)
     load()
     accept_changes = accept_changes or {}
     verdicts, cons, complete = mapped["verdicts"], mapped["consistent"], mapped.get("complete", {})
@@ -1798,8 +1947,8 @@ def enable_experiments(repo_cwd=None):
     save()
 
     @tool
-    def run_experiment(side: str, name: str, script: str, timeout_s: int = 300) -> str:
-        """Run a bash script in your side's throwaway /tmp worktree (serialized, scrubbed env, timeout). Returns a summary and an `exp:X<n>` id you may cite as an evidence locator. Scripts that push/publish/post or write outside the sandbox are refused; scripts over 12000 chars are refused unscreened."""
+    async def run_experiment(side: str, name: str, script: str, timeout_s: int = 300) -> str:
+        """Run a bash script in your side's throwaway /tmp worktree (serialized, scrubbed env, closed stdin, hard timeout that kills the whole process group). Returns a summary and an `exp:X<n>` id you may cite as an evidence locator. Scripts that push/publish/post or write outside the sandbox are refused; scripts over 12000 chars are refused unscreened."""
         load()
         M2 = RUN["manifest"]
         wt = M2["experiment_worktrees"].get(side, {}).get("path")
@@ -1807,7 +1956,10 @@ def enable_experiments(repo_cwd=None):
             return f"refused: unknown side {side!r}"
         if len(script) > TH["max_script_chars"]:
             return f"refused: script is {len(script)} chars; the safety screen covers at most {TH['max_script_chars']} — split it"
-        ans = jev(dict(script=script, cwd=wt), Q_X, tag=f"X:{side}:{name}")   # the COMPLETE script is screened
+        try:
+            ans = await jev(dict(script=script, cwd=wt), Q_X, tag=f"X:{side}:{name}")   # the COMPLETE script is screened
+        except JevUnavailable as exc:   # no screen, no run: a debater never gets an unscreened experiment
+            return f"refused: the safety screen is unavailable ({exc.error}); ask Main to answer card {exc.digest} and retry"
         bad = [k for k in Q_X if _pbool(ans, k) >= TH["experiment_screen"]]
         if bad:
             return f"refused: screen flagged {', '.join(bad)}; keep the script inside {wt} or /tmp and off the network's write paths"
@@ -1821,11 +1973,7 @@ def enable_experiments(repo_cwd=None):
         env.update(HOME=str(Path.home()), TMPDIR="/tmp", CONVERGE_SIDE=side, CONVERGE_EXPERIMENT=xid)
         t0 = time.time()
         with _EXP_LOCK:
-            try:
-                proc = subprocess.run(["bash", str(spath)], cwd=wt, env=env, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL)
-                out, err, code, timed_out = proc.stdout, proc.stderr, proc.returncode, False
-            except subprocess.TimeoutExpired as exc:
-                out, err, code, timed_out = _text(exc.stdout), _text(exc.stderr) + f"\n[timeout after {timeout_s}s]", -1, True
+            out, err, code, timed_out = _run_bounded(["bash", str(spath)], wt, env, timeout_s)
         ms = int((time.time() - t0) * 1000)
         write(_p(f"{base}/stdout"), out or "")
         write(_p(f"{base}/stderr"), err or "")
@@ -1838,8 +1986,27 @@ def enable_experiments(repo_cwd=None):
                 f"\n--- stderr (tail) ---\n{(err or '')[-600:]}")
     return ["run_experiment"]
 
+def _run_bounded(argv, cwd, env, timeout_s):
+    """Run argv in its own session/process group with stdin closed; on timeout SIGKILL the whole group (children,
+    daemons the script forked) and report the partial output. Returns (stdout, stderr, exit, timed_out). No rerun."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+        return out, err, proc.returncode, False
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:   # after the kill, communicate() returns the COMPLETE captured output (it includes exc.stdout)
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill(); out, err = _text(exc.stdout), _text(exc.stderr)
+        return _text(out), _text(err) + f"\n[timeout after {timeout_s}s; process group killed]", -1, True
+
 def cleanup():
-    """Remove experiment worktrees; mark manifest.status done. Cancel stragglers yourself (hub cancel) before calling."""
+    """Remove experiment worktrees; mark manifest.status done. Kill stragglers yourself first (write each cancel_requests(spawn_ids(r, phase)) entry)."""
     load()
     M = RUN["manifest"]
     for side, wt in list(M.get("experiment_worktrees", {}).items()):
@@ -1871,7 +2038,7 @@ def _first_position(c, side):
     h = next((h for h in c["history"] if h.get("event") == "position" and h.get("side") == side), None)
     return h.get("detail") if h else None
 
-def report_gate(report_text):
+async def report_gate(report_text):
     """jev R on header + convergence section vs the effective outcome. The card (D2) carries: effective status, debate
     state, disclosures, panel; per crux: statement, status, stakes, round-1 positions, final positions, concessions with
     moved_by (+status), withdrawn positions; verified evidence {id, claim, locator}; falsification objections with
@@ -1898,15 +2065,16 @@ def report_gate(report_text):
                    falsification=dict(verdict_stands=f.get("verdict_stands"), objections=objections))
     section, found = _convergence_section(report_text)
     header = report_text.split("\n## ", 1)[0]
-    p = _pbool(jev(dict(ledger=summary, report_header=header, convergence_section=section, convergence_section_found=found),
-                   Q_R, tag="R"), "report_matches_ledger")
+    p = _pbool(await jev(dict(ledger=summary, report_header=header, convergence_section=section, convergence_section_found=found),
+                         Q_R, tag="R"), "report_matches_ledger")
     M["report_gate"] = round(p, 3); M["report_gate_section_found"] = found; save()
     return p
 
-print("converge orchestrator loaded:", ", ".join(["configured_roles", "new_run", "load", "save", "write_brief", "escalate_tier", "jev", "jev_answer",
-      "jev_probe", "phi", "progress", "terminal_state", "final_status", "escalation_needed", "validate_reply", "admit_cruxes", "verify_evidence",
-      "converge_state", "close_round", "ingest_round", "ingest_falsification", "skip_falsification", "finish", "packet", "spawn_round",
-      "register_spawn", "spawn_ids", "peer_messages", "l1_transcript", "expected_for", "expected_judges", "identity_check", "spawn_meta",
-      "harvest_costs", "checkpoint", "dossier", "spawn_panel", "validate_verdict", "validate_conference", "panel_verdicts", "panel_aggregate",
-      "enable_experiments", "cleanup", "report_gate"]))
+print("converge orchestrator loaded (18.3):", ", ".join(["channel_binary", "configured_roles", "new_run", "load", "save", "write_brief", "escalate_tier",
+      "await jev", "jev_answer", "await jev_probe", "phi", "progress", "terminal_state", "final_status", "escalation_needed", "validate_reply", "is_final",
+      "await admit_cruxes", "await verify_evidence", "await converge_state", "close_round", "await ingest_round", "await ingest_falsification",
+      "skip_falsification", "finish", "packet", "spawn_round", "register_spawn", "spawn_ids", "peer_messages", "cancel_requests", "deadline_in_s",
+      "wake_timer", "overdue", "l1_transcript", "expected_for", "expected_judges", "identity_check", "spawn_meta", "harvest_costs", "checkpoint",
+      "dossier", "spawn_panel", "validate_verdict", "validate_conference", "panel_verdicts", "panel_aggregate", "enable_experiments", "cleanup",
+      "await report_gate"]))
 ```

@@ -7,6 +7,10 @@
 # converge: one role per debater/judge family. Model + effort are chosen HERE only;
 # converge freezes them into manifest.expected at new_run and identity-checks every spawn.
 modelRoles:
+  # jev bookkeeping for converge: native TypeSafe judge() backend, exact version pin.
+  # 18.3 seeds only typesafe/jev-latest; authenticated /v1/models discovery must offer jev-1.13.0,
+  # and the launcher policy must allow the typesafe provider (gen-disabled-providers-next.py).
+  judge: typesafe/jev-1.13.0
   converge-openai: openai-codex/gpt-6-astra:medium
   converge-openai-esc: openai-codex/gpt-6-astra:high
   converge-anthropic: anthropic/claude-fable-5-1:high
@@ -15,20 +19,16 @@ modelRoles:
   converge-judge-glm: openrouter/z-ai/glm-5.3:max
 
 # converge never substitutes a model: a failed role fails the spawn instead of falling back.
+# judge: [] is the no-silent-fallback guarantee for jev (replaces the r13 providers.judgmentFallback: none).
 retry:
   fallbackChains:
+    judge: []
     converge-openai: []
     converge-openai-esc: []
     converge-anthropic: []
     converge-anthropic-esc: []
     converge-judge-kimi: []
     converge-judge-glm: []
-
-# jev bookkeeping for converge: native TypeSafe judge() backend, no silent fallback.
-providers:
-  judgmentProvider: typesafe
-  typesafeModel: jev-1.13.0
-  judgmentFallback: none
 
 # Skill sources: the profile's own skills/ (this layer) plus the shared ~/.omp/agent/skills.
 # Claude/Codex/Agents skill folders stay off so their skills never leak into omp.

@@ -4,7 +4,7 @@
 
 Limits: packet ≤ 3 000 words + brief pointer; position ≤ 700 words; ≤ 30 tool calls, ≤ 10 `web_search`; per-spawn wall cap from the manifest (L1 20 min, L2/L3 15 min). **Budgeting** (`_fit`): the head, Task/Requested, Rules, and the `## Open cruxes (ids)` list (every id, stakes, u, and a ≤ 30-word statement summary; statements themselves are frozen at ≤ 80 words) are mandatory and never truncated — if they alone exceed the cap the cell raises `PacketOverflow` instead of shipping an over-budget packet; the variable sections (your last position, full crux statements, open-crux positions, novel claims/evidence, agreed synthesis, any `extra`) share the remaining budget by weight; a section over its share is capped in the packet and written whole to `packet-<side>-overflow.md`, which the packet names as permitted reading; the assembled packet is re-measured and never exceeds the cap. Delivery: the packet is the `task` item's `task` text; every item carries an explicit `outputSchema` (draft, L1 draft, L1 concurrence, falsification); the batch `context` is identical for both sides. The harness validates yields permissively; the cell's `validate_reply` checks the complete schema at ingestion and every attempt is persisted raw.
 
-Spawn names are run/round/phase-specific (`Cv<tag>R<r><side>`, `…F<r>…` falsification, `…O<r>…` reopen, `…b2` retry) and never used as hub addresses: only the ids allocated by the `task` result are (`register_spawn`).
+Spawn names are run/round/phase-specific (`Cv<tag>R<r><side>`, `…F<r>…` falsification, `…O<r>…` reopen, `…b2` retry) and never used as addresses: only the ids allocated by the `task` result are (`register_spawn`, which keeps the agent id — `agent://`, `<agent id>.jsonl` — apart from the job id — `proc://`, `proc://<job>/kill`).
 
 ## Round 1 — blind (L2, L3)
 
@@ -83,33 +83,33 @@ Each objection: statement, why_wrong, evidence ids (cite), severity fatal|materi
 
 Reply schema 2.4.2: `{objections: [≤ 6 × {statement, why_wrong, evidence: [id], severity: "fatal"|"material"|"minor"}], evidence?: [2.4.1 evidence objects], verdict_stands: bool, confidence, blocked?}`. Each objection goes through the shared admission gate (per-side cap 3, jev M + duplicate, run cap 12, jev N); a material, verdict-changing objection is ALWAYS admitted as an open crux — it reopens once if a round remains, otherwise (and in L1) it stays open and unresolved (`falsification.unresolved`, disclosed; never plain Converged); everything else is residual with its `why_wrong` and evidence ids retained for the report's *Residual dissent* / *Failure modes* and for the converged dossier's Position B. Objections are strongest-first for a reason: the per-side cap keeps the first three, and a `fatal` objection the caps kept from jev still blocks plain Converged.
 
-## L1 packet + hub protocol (one exchange)
+## L1 packet + peer protocol (one exchange, wake turns over `agent://`)
 
-Coin flip picks the opener (`manifest.opener`); the **non-opener drafts** (dilutes first-speaker anchoring). Each side gets its own `outputSchema`: responder = `SCHEMA_L1_DRAFT` (2.4.1 fields + required `concessions` and `objections` + `verdict_stands`), opener = `SCHEMA_L1_CONCURRENCE` (2.4.3).
+Coin flip picks the opener (`manifest.opener`); the **non-opener drafts** (dilutes first-speaker anchoring). Each side gets its own `outputSchema`: responder = `SCHEMA_L1_DRAFT` (2.4.1 fields + required `concessions` and `objections` + `verdict_stands`), opener = `SCHEMA_L1_CONCURRENCE` (2.4.3). Both carry the optional `turn` marker (`opening` | `response` | `rebuttal` | `final`): 18.3 subagents have no `wait`, so a child that needs the peer's next message yields its current schema tagged with the step it just completed and is woken by the peer's message; only the `turn: "final"` yield is a reply.
 
 ```markdown
 # converge <run-id> — tier L1 — round 1 — you are side A
 …
-## L1 protocol (one exchange, hub)
-- Opener: you | the other side. Order: opener sends position (<= 500 words) + cruxes; responder sends position + cruxes + objections; opener sends rebuttal + concessions (`moved_by`); then both yield.
-- [opener] You yield: concurrence per crux (`per_crux`: ref, agree|partial|disagree, why) and `objections` falsifying the responder's draft.
-- [responder] You yield: the converged draft (`position` <= 700 words), `cruxes` with both positions, `concessions` with `moved_by`, `evidence`, and `objections` falsifying your own draft (`verdict_stands`).
-- Wait for `PEER: <id>` from Main before any peer message; the peer id is NOT guessable.
+## L1 protocol (one exchange, wake turns over `agent://`)
+- Opener: you | the other side. Order: opener sends position (<= 500 words) + cruxes, yields `turn: "opening"`; responder sends position + cruxes + objections, yields `turn: "response"`; opener sends rebuttal + concessions (`moved_by`) and yields `turn: "final"`; responder yields `turn: "final"` on receiving the rebuttal.
+- [opener] Your final yield: concurrence per crux (`per_crux`: ref, agree|partial|disagree, why) and `objections` falsifying the responder's draft.
+- [responder] Your final yield: the converged draft (`position` <= 700 words), `cruxes` with both positions, `concessions` with `moved_by`, `evidence`, and `objections` falsifying your own draft (`verdict_stands`).
+- Wait for `PEER: <id>` from Main before any peer message; the peer id is NOT guessable. A peer message arrives as an incoming message (while you work, or waking you after a yield).
 ## Rules
-<rules block with: Hub: FIRST block with `hub wait from:Main` until Main sends `PEER: <id>`; only that id is your peer (<= 3 messages, fire-and-forget `hub send`, then `hub wait from:<id>`). `Main` for BLOCKED/NEEDS-APPROVAL only. Peer silent 15 min => yield `blocked`.>
+<rules block with: Messaging: `write` with path `agent://<id>` (never blocks; `wait` is not available to you). Until Main's `PEER: <id>` message arrives, research; that id is your only peer (<= 3 messages to it). `agent://Main` for BLOCKED/NEEDS-APPROVAL only. + Wake turns: … yield your schema with `turn` = the step you just completed … Your last yield sets `turn: "final"` … Woken with no peer message for 15 min since your last send => yield `turn: "final"` with `blocked`.>
 ```
 
 ```text
-Main   task [Cv…R1A, Cv…R1B] → ids = register_spawn(1, "converge", {name: id}) → hub send each side `PEER: <other id>` (peer_messages)
-opener     --hub--> responder : opening position (<=500 words) + cruxes
-responder  --hub--> opener    : position + cruxes + objections
-opener     --hub--> responder : rebuttal + concessions (moved_by)
-responder  yields SCHEMA_L1_DRAFT (draft + objections)          ← converged draft
-opener     yields SCHEMA_L1_CONCURRENCE {per_crux, objections, confidence}
-Main   ingest_round(1, {A, B}) — both replies required; one invalid ⇒ retry that side once: spawn_round(1, sides=[X], attempt=2, extra=l1_transcript(1, <other>)) → ids = register_spawn(1, "converge", …) → identity_check(snap, expected_for(1, ids), ids) [expectations derive from the retried batch's ids] → for m in peer_messages(spawn_ids(1)): hub(**m) [the surviving peer is parked after its yield; the PEER send revives it] → ingest_round(1, replies, attempt=2); a second failure voids the exchange (non-progress) and the escalation ask follows
+Main   task [Cv…R1A, Cv…R1B] → ids = register_spawn(1, "converge", {name: "<agent id>" | {agent, job}}) → for m in peer_messages(spawn_ids(1)): write(**m)   (path agent://<agent id>, content `PEER: <other agent id> — …`)
+       bash(**wake_timer(deadline_in_s(1))) → wait → on every wake: overdue(snap) → write its kill requests; interim yields (turn != final) are job results you ignore
+opener     --agent://--> responder : opening position (<=500 words) + cruxes      → opener yields turn "opening"; the message wakes the responder
+responder  --agent://--> opener    : position + cruxes + objections               → responder yields turn "response"; the message wakes the opener
+opener     --agent://--> responder : rebuttal + concessions (moved_by)            → opener yields SCHEMA_L1_CONCURRENCE turn "final"
+responder  (woken by the rebuttal) yields SCHEMA_L1_DRAFT turn "final" (draft + objections)   ← converged draft
+Main   await ingest_round(1, {A, B}) — both FINAL replies required (an interim one raises); one invalid ⇒ retry that side once: spawn_round(1, sides=[X], attempt=2, extra=l1_transcript(1, <other>)) → ids = register_spawn(1, "converge", …) → identity_check(snap, expected_for(1, ids), ids) [expectations derive from the retried batch's ids] → for m in peer_messages(spawn_ids(1)): write(**m) [the surviving peer is parked after its final yield; the PEER write revives it] → await ingest_round(1, replies, attempt=2); a second failure voids the exchange (non-progress) and the escalation ask follows
 ```
 
-Rules: ≤ 3 hub messages per side, `hub send` fire-and-forget, then repeated `hub wait from:<id>` (never `await:true` for a long reply — it times out at 120 s); a `failed` receipt or 15 min of silence ⇒ yield with `blocked`. L1 has one round, no effort escalation, and no reopen round: objections are classified in place (`falsification.integrated = true`); a heavy ledger triggers the tier-escalation ask (L1→L2 via `escalate_tier` continues the same ledger without blind drafts; the report discloses contaminated identities).
+Rules: ≤ 3 messages per side, `write agent://<peer>` never blocks; a `Failed:` receipt or being woken with no peer message 15 min after the last send ⇒ final yield with `blocked`; Main's `overdue()` kills a side past the spawn cap (a timeout, retried once). L1 has one round, no effort escalation, and no reopen round: objections are classified in place (`falsification.integrated = true`); a heavy ledger triggers the tier-escalation ask (L1→L2 via `escalate_tier` continues the same ledger without blind drafts; the report discloses contaminated identities).
 
 ## Debater rules block (rendered into every packet; the agent files restate it)
 
@@ -120,11 +120,11 @@ Rules: ≤ 3 hub messages per side, `hub send` fire-and-forget, then repeated `h
 - Address EVERY open crux listed in this packet; a crux you omit is not agreement and stays open.
 - Refer to the other participant only as 'the other side'. Never name or guess models.
 - Yield structured output only (the schema given to you). Incomplete => set `blocked`.
-- Hub: `Main` only, and only for `BLOCKED:` / `NEEDS-APPROVAL:` one-liners. NEVER `hub list`, NEVER contact any other agent.   [L1: PEER line instead]
-- Budget: <spawn_cap_min> min wall for this spawn; Main cancels over-cap spawns.
+- Messaging: `write` with path `agent://Main` only, and only for `BLOCKED:` / `NEEDS-APPROVAL:` one-liners. NEVER contact any other agent; ignore any other sender.   [L1: the Messaging + Wake turns lines instead]
+- Budget: <spawn_cap_min> min wall for this spawn; Main kills over-cap spawns (`proc://<job>/kill`).
 ```
 
-Hub discipline (all tiers, per `rule://orchestration-notify`): `BLOCKED:` and `NEEDS-APPROVAL:` are pushed to `Main` immediately as one-liners; DONE is the yield (auto-delivered) — no separate message; `MILESTONE:` only when the spawn's budget exceeds 10 min. A `NEEDS-APPROVAL:` that needs the owner is routed by Main through `ask` and answered on the same channel; the child blocks on `hub wait from:Main`, never spins. Experiment requests do not block: `experiment_request` rides in the reply and Main asks before the next round.
+Messaging discipline (all tiers, per `rule://orchestration-notify`): `BLOCKED:` and `NEEDS-APPROVAL:` are written to `agent://Main` immediately as one-liners; DONE is the yield (auto-delivered) — no separate message; `MILESTONE:` only when the spawn's budget exceeds 10 min. A `NEEDS-APPROVAL:` that needs the owner is routed by Main through `ask` and answered with `write agent://<child>`; the child continues reachable work meanwhile (the answer arrives as an incoming message, or wakes it after a yield), never spins. The debaters' `write` grant exists for `agent://` only; the agent files forbid file writes. Experiment requests do not block: `experiment_request` rides in the reply and Main asks before the next round.
 
 ## Reply schema 2.4.1 (agent-file default `output`; the caller's `outputSchema` always overrides)
 

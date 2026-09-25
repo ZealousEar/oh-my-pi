@@ -146,3 +146,27 @@ providers:
         tokenizer: qwen3
         compat:
           supportsReasoningEffort: false
+
+  # TypeSafe exact judge pin (owner decision 2026-09-25: replayable judgments on jev-1.13.0).
+  # Authenticated GET /v1/models only discovers `jev-latest` / `jev-preview`; `/v1/systemone`
+  # accepts the versioned id but does not list it, so it is declared here so that
+  # `modelRoles.judge: typesafe/jev-1.13.0` with `retry.fallbackChains.judge: []` resolves
+  # exactly and the judge sends model=jev-1.13.0 (as r13 did). Same shape as the bundled
+  # `jev-latest` seed (packages/catalog/src/compat/rules/providers/typesafe.kdl). The key
+  # stays on the shared authority; nothing here carries a credential: `auth: oauth` tells
+  # models.yml the credential comes from the login store (the TypeSafe key row), so no
+  # `apiKey` is declared here. The catalog's typesafe rule (`models "*" { kind "judge" }`)
+  # classifies this model as kind=judge like the seed. Probe 2026-09-25 (PORT source, candidate
+  # agentDir, broker key): pin resolves, hasNativeJudge=true, one judge call answered with
+  # model=jev-1.13.0 (noul 0.98, 308 tokens).
+  typesafe:
+    baseUrl: https://api.typesafe.ai
+    api: typesafe
+    auth: oauth
+    models:
+      - id: jev-1.13.0
+        name: TypeSafe jev 1.13.0
+        reasoning: false
+        input: [text]
+        supportsTools: false
+        cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 }

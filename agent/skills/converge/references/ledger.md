@@ -89,7 +89,7 @@ Statuses: `open | contested_closure | closed_agree | closed_evidence | closed_wi
  "checkpoint": "checkpoints/synthesis-2.md", "started_at": "…", "ended_at": "…", "action": "continue|escalate|stop"}
 ```
 
-Sibling files per round: `packet-A.md`, `packet-B.md` (exactly what each side received), `packet-<side>-overflow.md` (only when a variable section exceeded its share; named in the packet), `reply-<side>.a<n>.json` (every attempt, raw, immutable), `reply-A.json`, `reply-B.json` (the accepted attempt), `retry.json`, `jev.json` (every `judge()` call: state or its digest, questions, answers, backend, ms), `identity.json` (hub-jobs identity snapshots, incl. `retry`/`pending` results), `spawn-<phase>-a<n>.json` (requested names ↔ sides per attempt), `state-before.json` (ledger + ingestion-owned manifest keys restore point; ingestion is idempotent per round). `spawn[side].cost_usd/tokens/requests` are filled by `harvest_costs` from the child's session file.
+Sibling files per round: `packet-A.md`, `packet-B.md` (exactly what each side received), `packet-<side>-overflow.md` (only when a variable section exceeded its share; named in the packet), `reply-<side>.a<n>.json` (every attempt, raw, immutable), `reply-A.json`, `reply-B.json` (the accepted attempt), `retry.json`, `jev.json` (every `judge()` call: state or its digest, questions, answers, backend, ms), `identity.json` (`proc://` identity snapshots incl. `retry`/`pending` results, plus `overdue` entries with the kill requests issued), `spawn-<phase>-a<n>.json` (requested names → sides/who; `manifest.spawns` holds the allocated `{agent, job}` ids, every batch's `deadline_at`, and `cost_by_job` keyed by job id), `record.json` (Φ, progress, streak, action, spawn facts, cost/tokens harvested per side).
 
 ## `manifest.json`
 
@@ -112,7 +112,7 @@ local://converge/<run-id>/
 └── report.md
 ```
 
-## jev question sets (exact; `judge(state, questions)`; state = a compact card ≤ ~3 000 tokens, never a transcript)
+## jev question sets (exact; `await judge(state, questions)`; state = a compact card ≤ ~3 000 tokens, never a transcript)
 
 jev is a clerk: labels from small fixed sets and calibrated probabilities against the thresholds above. NEVER "which position is better".
 
@@ -172,4 +172,4 @@ jev is a clerk: labels from small fixed sets and calibrated probabilities agains
 
 **Q-set R — report gate** (state = `{ledger: {effective_status, debate_state, disclosures, panel, open_crux_ids, withdrawn_crux_ids, unresolved_objection_crux_ids, cruxes [{id, statement, status, stakes, initial {A, B}, final {A, B}, concessions [{side, round, moved_by, moved_by_status}], withdrawn, evidence}], verified_evidence [{id, claim, locator, crux}], falsification {verdict_stands, objections [{id, statement, why_wrong, severity, outcome}]}}, report_header, convergence_section, convergence_section_found}`): `report_matches_ledger` bool ("does the report's Status/Decision/Residual dissent match the ledger's final state and the panel ruling, without new claims? … a claim in the report absent from these is a new claim"). The convergence section is located by the `<!-- convergence -->` marker line the decision-writing skeleton carries (any heading works: Converged or No convergence); fallback = the first `## ` heading mentioning convergence/dissent/split; none ⇒ `convergence_section_found = false` on the card.
 
-Answer shapes returned by `judge().wait()`: bool → `{"type": "bool", "bool": p}`; choice → `{"type": "choice", "choice": label, "probabilities": {label: p}, "confidence": c}`; score → `{"score": s, "probabilities": {…}}`. When jev is unavailable Main supplies the same shapes via `jev_answer(digest, answers)`.
+Answer shapes returned by `await judge()` (18.3: answers directly, no handle): bool → `{"type": "bool", "bool": p}`; choice → `{"type": "choice", "choice": label, "probabilities": {label: p}, "confidence": c}`; score → `{"score": s, "probabilities": {…}}`. When jev is unavailable Main supplies the same shapes via `jev_answer(digest, answers)`. Manifest cost fields: `cost_usd` (children: assistant usage + their `model_usage` entries, once each), `jev_cost_usd` (Main's `model_usage` entries with `purpose: "judge"` since `started_at`, reported apart, never added to `cost_usd`).

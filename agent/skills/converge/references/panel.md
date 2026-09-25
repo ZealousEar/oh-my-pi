@@ -1,14 +1,14 @@
 # converge — L3 panel (design §1.12)
 
-Judges: `converge-judge-kimi` (J1) and `converge-judge-glm` (J2); models/efforts come from the configured roles frozen in `manifest.expected.judges` (Kimi K3 max via OpenRouter, vendor endpoint `moonshotai/mxfp4`; GLM-5.3 max, `z-ai/fp8`; routing pinned in `P/models.yml` with `allow_fallbacks: false`). Judges are full agents (`read grep hub`), never jev. Six spawns per panel: 4 verdict + 2 conference. Identity check applies to every batch: `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)` (the expectation is built from the batch; a spawned judge without one raises).
+Judges: `converge-judge-kimi` (J1) and `converge-judge-glm` (J2); models/efforts come from the configured roles frozen in `manifest.expected.judges` (Kimi K3 max via OpenRouter, vendor endpoint `moonshotai/mxfp4`; GLM-5.3 max, `z-ai/fp8`; routing pinned in `P/models.yml` with `allow_fallbacks: false`). Judges are full agents (`read grep write` — `write` for `agent://` messaging only), never jev. Six spawns per panel: 4 verdict + 2 conference. Identity check applies to every batch: `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)` with `snap = await tool.read(path="proc://")`; a mismatched judge is killed (`cancel_requests`) and retried once, then `unavailable`.
 
 ```text
 L2 loop (≤5 rounds) → falsification (+ reopen round 6) → dossier() → l3/dossier.md (A first) + l3/dossier-BA.md (B first, labels swapped)
 verdict spawns (parallel, 4): J1-AB, J1-BA, J2-AB, J2-BA      ← AB reads dossier.md, BA reads dossier-BA.md (genuinely counterbalanced)
   panel_verdicts: validate each verdict against the FULL 2.5.1 schema (validate_verdict; cite for every score < 5) BEFORE mapping; map BA back to canonical labels;
   per judge: complete iff both orderings valid; consistent iff same winner (or both ∈ {tie, insufficient}); else "inconsistent"
-conference spawns (parallel, 2): J1, J2 ← all four verdicts (canonical labels); peer released by Main's `PEER: <id>` message
-  ≤ 3 hub messages each → each yields 2.5.2
+conference spawns (parallel, 2): J1, J2 ← all four verdicts (canonical labels); peer released by Main's `PEER: <agent id>` write to agent://<judge>
+  ≤ 3 `agent://` messages each as wake turns (interim yields tagged `turn`, ignored by Main) → each yields 2.5.2 with `turn: "final"`
 panel_aggregate(mapped, conferences, accept_changes) → l3/panel.json
 ```
 
@@ -41,7 +41,7 @@ Converged run: Position A = the synthesis rendered as numbered `### n. <headline
 
 - Same block shape, same labels for A and B; each position ≤ 700 words (`_anon` caps and strips).
 - Strip model names, vendor strings, effort words, and self-references (`IDENTITY_STRIP` regex: gpt/astra/openai/codex/claude/fable/opus/sonnet/anthropic/kimi/moonshot/glm/z.ai/zhipu/gemini/"as an AI"); read both dossier files once yourself for anything the regex missed (a first-person aside, a tool name only one vendor has).
-- No round numbers, no "conceded in round 3", no hub excerpts. Evidence entries carry `verified`/`UNVERIFIED` so judges can discount, not who found them.
+- No round numbers, no "conceded in round 3", no message excerpts. Evidence entries carry `verified`/`UNVERIFIED` so judges can discount, not who found them.
 - Do not order positions by strength.
 
 ## Judge prompt (verdict spawn; `spawn_panel("verdict")`)
@@ -61,9 +61,9 @@ Criteria (schema 2.5.1, agent-file default): `correctness, constraints, coherenc
 ```text
 Mode: conference. You are J1. Dossier: `local://…/l3/dossier.md` (canonical labels).
 All four independent verdicts (canonical labels; BA rows were mapped back): ```json …```
-FIRST block with `hub wait from:Main` until Main sends `PEER: <id>`; that id is the other judge. Exchange <= 3 `hub send` messages, `hub wait from:<id>` between them; change your winner only for a cited reason.
-`exchange_completed` = true ONLY if you received at least one message from the peer; a silent peer (15 min) => false, with `residual_disagreement` saying so.
-Yield the conference schema. Cap 25 min. `Main` only for `BLOCKED:`.
+Until Main's `PEER: <id>` message arrives, re-read the dossier; that id is the other judge (never guess it). Exchange <= 3 messages with it via `write` path `agent://<id>` (never blocks; `wait` is not available to you): …. When you need the peer's next message and have nothing left to do, yield the conference schema with `turn: "opening"` (first message sent) or `turn: "response"`; the peer's message wakes you — continue. Change your winner only for a cited reason.
+`exchange_completed` = true ONLY if you received at least one message from the peer; woken with no peer message 15 min after your last send => false, with `residual_disagreement` saying so.
+Your last yield sets `turn: "final"` — only that one counts. Cap 25 min. `agent://Main` only for `BLOCKED:`.
 ```
 
 - Main sends the two `PEER:` messages (`peer_messages(spawn_ids(0, "conference"))`) right after `register_spawn(0, "conference", …)`; conference ids are never guessed.

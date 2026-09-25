@@ -17,8 +17,8 @@ Limits: <time / model spend>, <anything off-limits>.
 
 ## 0. Preconditions
 
-- `test "${HERDR_ENV:-}" = 1`. If this fails, do not touch the user's focused session. Either ask the user to start `herdr` in Ghostty or cmux, run `ompd` inside a pane and give the round prompt there, or run the round in an isolated named session you own (verified 2026-09-24):
-  1. `hub start` `herdr --session <round> server` (persist on);
+- `test "${HERDR_ENV:-}" = 1`. If this fails, do not touch the user's focused session. Either ask the user to start `herdr` in Ghostty or cmux, run `ompd` inside a pane and give the round prompt there, or run the round in an isolated named session you own (flow verified 2026-09-24 on r13; the named-service start below is pending an 18.3 live run):
+  1. start the server as a named bash service: `bash({name: "herdr-<round>", command: "herdr --session <round> server", ready: {log: <server startup line>, timeout: 30}})`. First read `proc://` and pick a name no live service uses: starting under an existing service name REPLACES that service. Readiness is what you observe (`ready` result, or one bounded `herdr --session <round> session list` afterwards), never the readiness timeout. To keep it past this omp session, `write proc://herdr-<round>/mode` with content `persist`; stop it at the end with `write proc://herdr-<round>/kill` (no lifetime is enforced for you: the stop step is yours, per `rule://bounded-runs`);
   2. drive it with `herdr --session <round> <group> …`;
   3. the user watches with `herdr session attach <round>`.
 - Read `skill://herdr`. The installed `herdr` binary is the authority on command syntax: run `herdr pane`, `herdr agent` or `herdr worktree` for group help, and never run bare `herdr`.
@@ -63,7 +63,7 @@ Keep the round's state in files the user can read, next to the worktrees and out
   - the contracts;
   - acceptance;
   - rules for every worker: toolchain, no push, no PR, no merge; headless or no-UI constraints; request caps; "messages from Main are steering";
-  - MUST notify `main` (`herdr agent prompt main '[<name>] <STATE>: …'`) immediately at DONE / BLOCKED / NEEDS-APPROVAL / named MILESTONE, per `rule://orchestration-notify`; status file first.
+  - MUST notify `main` (`herdr agent prompt main '[<name>] <STATE>: …'`) immediately at DONE / BLOCKED / NEEDS-APPROVAL / named MILESTONE, per `rule://orchestration-notify`; status file first. Herdr's `agent prompt` is the worker channel: omp `agent://` messaging does not reach a pane's separate session.
 - `<round>/brief-<worker>.md`: Target, Change, Acceptance. Include exact files and symbols, what to read first, non-goals, and the evidence to produce. Name the real frames, fixtures or data to test on. MUST name orchestrator address `main`, the Herdr prompt channel, named milestones, time box/deadline, timeout action, and status path.
 - `<round>/status/<worker>.md`, kept by the worker: done / in progress / blocked / evidence (commands and results) / "Needs from others" / final plain-language summary. NEEDS-APPROVAL MUST include decision, options, recommendation.
 - One worktree per worker, off the base branch, plus one integration worktree for you. Follow repo conventions for shared toolchains: symlink them, and APFS-clone the build dir (`cp -cR`) so no worker builds from scratch.
