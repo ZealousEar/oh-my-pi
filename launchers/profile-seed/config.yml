@@ -11,6 +11,7 @@ modelRoles:
 compaction:
   enabled: true
   thresholdPercent: 45
+  thresholdMinContextWindow: 512000
   thresholdTokens: -1
   midTurnEnabled: true
   autoContinue: true
