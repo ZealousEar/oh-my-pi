@@ -1,5 +1,5 @@
 #!/bin/sh
-# omp channel launcher: omp -> pinned STOCK upstream omp v18.2.9 (unmodified GitHub release asset)
+# omp channel launcher: omp -> pinned STOCK upstream omp v18.3.1 (unmodified GitHub release asset)
 # Installed 2026-09-19 by the launcher-isolation wave (runbook: /Users/farhad/.omp/implementation-2026-09-18/launchers/RUNBOOK.md).
 # Contract: exec the pinned executable by ABSOLUTE path with the channel profile
 # fixed to 'stock'; refuse profile/alias overrides and self-update at the
@@ -100,7 +100,7 @@ route_shared_relay() {
 route_shared_relay "$@"
 case ${1:-} in
 update | upgrade | self-update)
-	fail "self-update is disabled: this channel is pinned to stock v18.2.9; bump the pin via the runbook (download + verify a new release asset under a NEW filename, update channels.json, re-run install.sh)" 64
+	fail "self-update is disabled: this channel is pinned to stock v18.3.1; bump the pin via the runbook (download + verify a new release asset under a NEW filename, update channels.json, re-run install.sh)" 64
 	;;
 secret)
 	# Shared credential-marked settings: one command, every channel (see shared-auth/RUNBOOK.md).
