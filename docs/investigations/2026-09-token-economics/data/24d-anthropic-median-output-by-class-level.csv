@@ -1,0 +1,7 @@
+class,low,medium,high,xhigh,max
+hub-only,133,136,139,139,136
+todo-only,97,150,165,209,290
+read/search,185,185,248,231,209
+bash/eval,376,407,456,543,659
+edit/write,684,697,771,1096,722
+text-only,452,624,858,963,994
