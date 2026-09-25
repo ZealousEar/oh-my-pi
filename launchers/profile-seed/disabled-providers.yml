@@ -1,12 +1,12 @@
 # Subscription-only model policy (approved defaults: Fable via Anthropic OAuth, Sol via
 # openai-codex OAuth; openrouter owner-approved 2026-09-22, key held by the shared authority;
-# typesafe owner-approved as the native jev judgment route, pinned by modelRoles.judge).
+# typesafe = native jev judge route; web/local = 18.3 search backends and on-device models).
 # Every other catalog provider and the keyless local discoverables are
 # disabled so an API key inherited from the shell environment (e.g. FIREWORKS_API_KEY from
 # ~/.zshenv) can never become the silently selected default. With no login yet, no model
 # resolves and the TUI shows the pending-login state instead of a paid fallback.
 # Generated from /Users/farhad/Code/omp-next-2026-09-25/packages/catalog/src/models.json: 73 catalog providers
-# - 4 allowed (anthropic, openai-codex, openrouter, typesafe) + 3 keyless local discoverables = 72 denied ids.
+# - 6 allowed (anthropic, local, openai-codex, openrouter, typesafe, web) + 3 keyless local discoverables = 70 denied ids.
 disabledProviders:
   - abliteration
   - aiand
@@ -40,7 +40,6 @@ disabledProviders:
   - huggingface
   - kilo
   - kimi-code
-  - local
   - meta
   - minimax
   - minimax-cn
@@ -66,7 +65,6 @@ disabledProviders:
   - venice
   - vercel-ai-gateway
   - wafer-serverless
-  - web
   - xai
   - xai-oauth
   - xiaomi

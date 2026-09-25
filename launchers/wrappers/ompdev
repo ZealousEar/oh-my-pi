@@ -58,7 +58,7 @@ for arg in "$@"; do
 	case $arg in
 	--) break ;;
 	--profile | --profile=* | --alias | --alias=*)
-		fail "profile is pinned to '$PROFILE' for this channel; to use another profile run the executable directly: /Users/farhad/.omp/overnight/2026-09-17/followup-2026-09-18/bun-1.4.2/bun /Users/farhad/Code/omp-next-2026-09-18/packages/coding-agent/src/cli.ts" 64
+		fail "profile is pinned to '$PROFILE' for this channel; to use another profile run the executable directly: /Users/farhad/.omp/overnight/2026-09-17/followup-2026-09-18/bun-1.4.2/bun /Users/farhad/Code/omp-next-2026-09-25/packages/coding-agent/src/cli.ts" 64
 		;;
 	esac
 done
@@ -307,7 +307,7 @@ local) ;;
 *) fail "invalid auth mode '$AUTH_MODE' in $AUTH_MODE_FILE; expected 'authority' or owner-selected rollback mode 'local'" 78 ;;
 esac
 
-CHECKOUT=/Users/farhad/Code/omp-next-2026-09-18
+CHECKOUT=/Users/farhad/Code/omp-next-2026-09-25
 BUN=/Users/farhad/.omp/overnight/2026-09-17/followup-2026-09-18/bun-1.4.2/bun
 CLI=$CHECKOUT/packages/coding-agent/src/cli.ts
 PRELOAD=$CHECKOUT/packages/coding-agent/scripts/omp.ts

@@ -1,5 +1,5 @@
 #!/bin/sh
-# omp channel launcher: ompd -> FROZEN integrated fork build (v18.2.6 + 2026-09-18 patches + 2026-09-22 upstream sync for opus-5-5, compiled with Bun 1.4.2)
+# omp channel launcher: ompd -> FROZEN fork build (upstream v18.3.1 + full fork port, next/2026-09-25, compiled with Bun 1.4.2)
 # Installed 2026-09-19 by the launcher-isolation wave (runbook: /Users/farhad/.omp/implementation-2026-09-18/launchers/RUNBOOK.md).
 # Contract: exec the pinned executable by ABSOLUTE path with the channel profile
 # fixed to 'daily-fork'; refuse profile/alias overrides and self-update at the
@@ -29,7 +29,7 @@ fail() {
 STOCK=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["channels"]["omp"]["executable"])' "$CHANNELS_MAP") ||
 	fail "cannot resolve the pinned stock executable from $CHANNELS_MAP" 78
 [ -x "$STOCK" ] || fail "pinned stock executable missing or not executable: $STOCK" 127
-TARGET=/Users/farhad/.omp-channels/fork/omp-18.2.6-next-2026-09-18-r13
+TARGET=/Users/farhad/.omp-channels/fork/omp-18.3.1-next-2026-09-25-r14
 # The relay mode is machine-global. Fork builds enforce the protocol/supervisor
 # variables; stock ignores them and relies on the best-effort ensure before exec.
 [ -r "$RELAY_MODE_FILE" ] || fail "relay mode policy missing or unreadable: $RELAY_MODE_FILE (run $RUNBOOK's install.sh)" 78
