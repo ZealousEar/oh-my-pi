@@ -54,7 +54,7 @@ for raw in sys.stdin:
 ')
 	if [ -n "$hits" ]; then
 		git reset -q
-		status blocked "possible credential in $(printf '%s' "$hits" | tr '\n' ' ')- nothing committed; fix or allow by hand"
+		status blocked "possible credential at $(printf '%s' "$hits" | paste -sd ' ' -); nothing committed (fix the file, or commit it by hand if it is a false positive)"
 		finish 1
 	fi
 	git commit -q -m "sync(profile): $(now) from $(hostname -s)" || { status failed "git commit failed"; finish 1; }
