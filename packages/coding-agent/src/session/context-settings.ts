@@ -138,12 +138,12 @@ export const cfgCompactionThresholdMinContextWindow = register({
 		group: "Compaction",
 		label: "Compaction Threshold Min Window",
 		description:
-			"Smallest context window the configured threshold applies to; smaller windows compact at 85% (window minus 15%)",
+			"Smallest context window the configured threshold, reserve and kept-tail sizes apply to; smaller windows use window-relative sizes (compact at 85%, keep at most 25% verbatim)",
 		options: [
-			{ value: "-1", label: "All windows", description: "Configured threshold on every model" },
-			{ value: "256000", label: "256K+", description: "Below 256K: compact at 85%" },
-			{ value: "512000", label: "512K+", description: "Below 512K: compact at 85%" },
-			{ value: "1000000", label: "1M+", description: "Below 1M: compact at 85%" },
+			{ value: "-1", label: "All windows", description: "Configured sizes on every model" },
+			{ value: "256000", label: "256K+", description: "Below 256K: window-relative sizes" },
+			{ value: "512000", label: "512K+", description: "Below 512K: window-relative sizes" },
+			{ value: "1000000", label: "1M+", description: "Below 1M: window-relative sizes" },
 		],
 	},
 });

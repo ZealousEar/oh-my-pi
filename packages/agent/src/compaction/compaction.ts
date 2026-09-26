@@ -190,10 +190,12 @@ export interface CompactionSettings {
 	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent?: number;
 	/**
-	 * Smallest context window on which {@link thresholdPercent} and the absolute
-	 * reserve apply. Smaller windows (without a fixed {@link thresholdTokens})
-	 * compact at the window minus the 15% proportional reserve. `<= 0` (the
-	 * default) applies the configured threshold on every window.
+	 * Smallest context window on which the absolute settings apply
+	 * ({@link thresholdPercent}, {@link reserveTokens}, {@link keepRecentTokens}).
+	 * Smaller windows are sized from the window instead: compaction at the
+	 * window minus 15% (unless {@link thresholdTokens} is set), a verbatim tail of
+	 * at most 25%, and a 15% summary reserve. `<= 0` (the default) applies the
+	 * configured values on every window.
 	 */
 	thresholdMinContextWindow?: number;
 	thresholdTokens?: number;
@@ -1351,10 +1353,23 @@ export function findReadableCompactionIndex(
  */
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
-	settings: CompactionSettings,
+	configuredSettings: CompactionSettings,
 	activeModel?: Model,
 	tokenizer: Tokenizer = new Tokenizer(activeModel),
 ): CompactionPreparation | undefined {
+	// Below `thresholdMinContextWindow` size the verbatim tail (25%) and the
+	// summary reserve (15%) from the active window, like the threshold; the
+	// absolute defaults (20k tail, 16k reserve) are sized for 200k+ windows and
+	// alone would refill a 32k window.
+	const activeWindow = activeModel?.contextWindow ?? 0;
+	const settings =
+		activeWindow > 0 && activeWindow < (configuredSettings.thresholdMinContextWindow ?? 0)
+			? {
+					...configuredSettings,
+					keepRecentTokens: Math.min(configuredSettings.keepRecentTokens, Math.floor(activeWindow * 0.25)),
+					reserveTokens: Math.max(1, Math.floor(activeWindow * 0.15)),
+				}
+			: configuredSettings;
 	const lastEntry = pathEntries[pathEntries.length - 1];
 	// A speculative native record may leave uncovered messages before the record.
 	if (lastEntry?.type === "compaction" && !lastEntry.providerReplayThroughEntryId) {

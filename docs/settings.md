@@ -692,7 +692,7 @@ compaction:
   methodOrder: [remote, snapcompact, handoff, shake, soft]
   midTurnEnabled: true # check thresholds between tool-loop provider requests
   thresholdPercent: -1 # -1 = default reserve-based behavior
-  thresholdMinContextWindow: -1 # smaller windows compact at 85%; -1 = configured threshold everywhere
+  thresholdMinContextWindow: -1 # smaller windows use window-relative sizes; -1 = configured sizes everywhere
   thresholdTokens: -1 # fixed token limit when > 0
 memory:
   backend: off # off, local, hindsight, mnemopi
@@ -707,7 +707,7 @@ memory:
 | `compaction.midTurnEnabled`   | boolean | `true`                                   | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request.                                                                                                                                                  |
 | `compaction.methodOrder`      | array   | `remote, snapcompact, handoff, shake, soft` | Ordered fallbacks. `remote` uses provider-native server compaction (OpenAI Responses compact, Anthropic compaction beta); unavailable or failed methods advance. |
 | `compaction.thresholdPercent` | number  | `-1`                                     | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
-| `compaction.thresholdMinContextWindow` | number | `-1` | Smallest context window the configured threshold (`thresholdPercent` / `reserveTokens`) applies to. Smaller windows compact at the window minus 15% unless `thresholdTokens` is set. `-1` = every window. |
+| `compaction.thresholdMinContextWindow` | number | `-1` | Smallest context window the configured `thresholdPercent`, `reserveTokens` and `keepRecentTokens` apply to. Smaller windows compact at the window minus 15% (unless `thresholdTokens` is set), keep at most 25% of the window verbatim, and budget the summary from a 15% reserve. `-1` = every window. |
 | `compaction.thresholdTokens`  | number  | `-1`                                     | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
 | `task.agentCompactionThresholdOverrides` | record | `{}` | Exact-name task/eval agent → compaction trigger: a positive token count (`90000`) or a percentage string (`"80%"`). See below. |
 | `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
