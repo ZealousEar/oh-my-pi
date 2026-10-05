@@ -35,6 +35,22 @@ function bundled(selector: string) {
 	return model;
 }
 
+/**
+ * Ambient launcher state that would change what the tests observe: `Settings`
+ * loads `PI_CONFIG_FILES`/`OMP_SHARED_SECRETS_FILE` overlays even in memory
+ * (they would surface as shadowed `overlay` roles), and any provider key in
+ * the environment counts as an authed model for the "no authed model" case.
+ */
+function ambientEnvKeys(): string[] {
+	return Object.keys(Bun.env).filter(
+		key =>
+			key === "PI_CONFIG_FILES" ||
+			key === "OMP_SHARED_SECRETS_FILE" ||
+			key.endsWith("_API_KEY") ||
+			key.endsWith("_OAUTH_TOKEN"),
+	);
+}
+
 describe("model presets", () => {
 	let fixtureDir: TempDir;
 	let authStorage: AuthStorage;
@@ -42,7 +58,14 @@ describe("model presets", () => {
 	const sessions: AgentSession[] = [];
 	const tempDirs: TempDir[] = [];
 
+	const savedEnv = new Map<string, string>();
+
 	beforeAll(async () => {
+		for (const key of ambientEnvKeys()) {
+			savedEnv.set(key, Bun.env[key]!);
+			delete Bun.env[key];
+			delete process.env[key];
+		}
 		fixtureDir = TempDir.createSync("@pi-model-presets-fixture-");
 		authStorage = await AuthStorage.create(path.join(fixtureDir.path(), "auth.db"));
 		authStorage.keys.setRuntime("anthropic", "test-key");
@@ -58,6 +81,10 @@ describe("model presets", () => {
 	afterAll(() => {
 		authStorage.close();
 		fixtureDir.removeSync();
+		for (const [key, value] of savedEnv) {
+			Bun.env[key] = value;
+			process.env[key] = value;
+		}
 	});
 
 	function createSession(settings: Settings, initialModel = SONNET, thinkingLevel: Effort = Effort.High) {
@@ -199,6 +226,28 @@ describe("model presets", () => {
 
 		expect(result.kind).toBe("invalid");
 		expect(settings.getModelRole("default")).toBe(SONNET);
+	});
+
+	it("loads a fork-era v1 preset: `roles` as modelRoles, chains and cycle order ignored", async () => {
+		const settings = await projectSettings({
+			overlay: [
+				"modelPresets:",
+				"  legacy:",
+				"    version: 1",
+				"    roles:",
+				`      default: ${OPUS}`,
+				`      plan: [${SONNET}, ${SONNET_46}]`,
+				"    fallbackChains: {}",
+				"    cycleOrder: []",
+				"    defaultThinkingLevel: low",
+				"",
+			].join("\n"),
+		});
+
+		expect(getModelPreset(settings, "legacy")).toEqual({
+			kind: "found",
+			preset: { modelRoles: { default: OPUS, plan: `${SONNET},${SONNET_46}` }, defaultThinkingLevel: Effort.Low },
+		});
 	});
 
 	it("leaves settings untouched when the preset's default model is unavailable", async () => {

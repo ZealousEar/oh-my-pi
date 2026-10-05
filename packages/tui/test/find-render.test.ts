@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
-import { findToolRenderer, type FindToolDetails } from "@oh-my-pi/pi-tui/tools/find";
+import { findToolRenderer, type FindBoundedDetails, type FindCascadeDetails } from "@oh-my-pi/pi-tui/tools/find";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { applyHyperlinkSetting } from "../src/render/hyperlink";
 
@@ -12,7 +12,8 @@ afterEach(() => {
 	applyHyperlinkSetting("auto");
 });
 
-const details: FindToolDetails = {
+const details: FindCascadeDetails = {
+	mode: "cascade",
 	query: "retry budget",
 	keywords: ["retry", "budget"],
 	threshold: 0.2,
@@ -74,7 +75,7 @@ describe("findToolRenderer", () => {
 	it("links omp hits to their doc URL instead of joining them onto cwd", async () => {
 		applyHyperlinkSetting("always");
 		const uiTheme = (await getThemeByName("dark"))!;
-		const ompDetails: FindToolDetails = {
+		const ompDetails: FindCascadeDetails = {
 			...details,
 			scopePath: "omp://",
 			hits: [
@@ -137,5 +138,88 @@ describe("findToolRenderer", () => {
 		const text = sanitizeText(partial.render(200).join("\n"));
 		expect(text).toContain('"retry budget"');
 		expect(text).toContain("verifying 8 passages in 5 files");
+	});
+
+	it("renders bounded results as linked path:start-end rows with answerPresent beside the ranking", async () => {
+		applyHyperlinkSetting("always");
+		const uiTheme = (await getThemeByName("dark"))!;
+		const bounded: FindBoundedDetails = {
+			mode: "bounded",
+			query: "who may join?",
+			answerPresent: 0.12,
+			verdict: "absent",
+			results: [
+				{
+					path: "handbook.txt",
+					resolved: "/repo/handbook.txt",
+					startLine: 13,
+					endLine: 13,
+					score: 0.8,
+					snippet: "2.1 Membership",
+				},
+				{
+					path: "artifact://0",
+					resolved: "artifact://0",
+					startLine: 2,
+					endLine: 4,
+					score: 0.2,
+					snippet: "the spill\tthreshold",
+				},
+			],
+			coverage: {
+				files: 2,
+				passages: 30,
+				windows: 1,
+				passes: 1,
+				finalistsDropped: 0,
+				skipped: [{ path: "blob.bin", reason: "binary content" }],
+			},
+			verification: { verified: true, detail: "2 results re-read at the reported location" },
+			provenance: [{ backend: "native", provider: "typesafe", model: "jev-1.13.0", distribution: "native" }],
+			usage: { calls: 1, attempts: 1, input: 900, output: 4, costUsd: 0.0012 },
+			elapsedMs: 800,
+			cwd: "/repo",
+		};
+		const boundedArgs = {
+			query: bounded.query,
+			grep_keywords: [],
+			paths: ["handbook.txt", "artifact://0", "blob.bin"],
+		};
+		const rendered = findToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "" }], details: bounded },
+			{ expanded: true, isPartial: false },
+			uiTheme,
+			boundedArgs,
+		);
+		const raw = rendered.render(200).join("\n");
+		const text = sanitizeText(raw);
+		const uris = extractLinkUris(raw);
+		expect(uris.filter(uri => uri.endsWith("/repo/handbook.txt"))).toHaveLength(1);
+		expect(uris).toContain("artifact://0:2");
+		expect(text).toContain("handbook.txt:13");
+		expect(text).toContain("artifact://0:2-4");
+		// The presence verdict is its own signal: a top-ranked row coexists with a low answerPresent.
+		expect(text).toContain("answerPresent 0.12 absent");
+		expect(text).toContain("0.80");
+		expect(text).toContain("1 skipped");
+		expect(text).toContain("skipped blob.bin: binary content");
+		expect(text).toContain("native judge typesafe/jev-1.13.0, native distribution");
+		expect(text).not.toContain("\t");
+		const collapsed = sanitizeText(
+			findToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details: bounded },
+					{ expanded: false, isPartial: false },
+					uiTheme,
+					boundedArgs,
+				)
+				.render(200)
+				.join("\n"),
+		);
+		expect(collapsed).not.toContain("skipped blob.bin");
+		const call = sanitizeText(
+			findToolRenderer.renderCall(boundedArgs, { expanded: false, isPartial: true }, uiTheme).render(200).join("\n"),
+		);
+		expect(call).toContain("in 3 paths");
 	});
 });

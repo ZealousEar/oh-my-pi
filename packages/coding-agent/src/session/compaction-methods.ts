@@ -35,6 +35,12 @@ export const COMPACTION_METHOD_CHOICES = [
 		label: "Shake",
 		description: "Drop recoverable heavy content in place without an LLM call",
 	},
+	{
+		value: "semantic-shake",
+		label: "Semantic shake",
+		description:
+			"Like Shake, but a bounded judgment keeps the tool results still needed for the current goal (opt-in: sends selected tool output to the judgment backend when reduction.egress allows)",
+	},
 ] as const;
 
 /** One selectable automatic context-maintenance method. */
@@ -55,6 +61,7 @@ const COMPACTION_METHODS: Record<CompactionMethod, true> = {
 	handoff: true,
 	soft: true,
 	shake: true,
+	"semantic-shake": true,
 };
 
 /** Whether an unknown configuration value names a supported compaction method. */
@@ -82,6 +89,7 @@ const STRATEGY_BY_COMPACTION_METHOD: Record<CompactionMethod, "context-full" | "
 	handoff: "handoff",
 	soft: "context-full",
 	shake: "shake",
+	"semantic-shake": "shake",
 };
 
 /**

@@ -42,6 +42,7 @@ import {
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { PendingRun, TabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -50,12 +51,14 @@ function makeKind(socketSuffix: string): CmuxKind {
 }
 
 function makeSession(cwd: string): ToolSession {
-	return {
+	// Fixture scope: raw `tab.run` must reach the worker for the settle/resume
+	// assertions; the permission gate itself is covered elsewhere.
+	return grantBrowserFixtureScope({
 		cwd,
 		hasUI: false,
 		settings: Settings.isolated(),
 		getSessionFile: () => null,
-	} as unknown as ToolSession;
+	} as unknown as ToolSession);
 }
 
 let mockSurfaceSeq = 0;

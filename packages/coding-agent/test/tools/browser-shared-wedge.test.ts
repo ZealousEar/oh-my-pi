@@ -18,6 +18,11 @@
  * Contract pinned here: a timed-out target close keeps the ownership record and
  * re-checks the shared browser, and that check stops the daemon only when the
  * CDP endpoint no longer answers.
+ *
+ * Fork adaptation: the shared agent Chromium is machine-global, so the scope is
+ * the broker `runtimeDir` (not a `projectDir`), ownership records are v2
+ * {@link SharedTargetRecord}s, and only a tab that `ownsTarget` has a durable
+ * record to keep or forget. Every behaviour above holds on that structure.
  */
 
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
@@ -26,12 +31,12 @@ import * as path from "node:path";
 import { withTimeout } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
-import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import type { DaemonOperation } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import {
 	forgetSharedTarget,
 	recordSharedTarget,
 	resetOrphanRegistryForTest,
+	type SharedTargetRecord,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import type { BrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
@@ -41,6 +46,7 @@ import { getTabsMapForTest, releaseTab, runInTab } from "@oh-my-pi/pi-coding-age
 import type { TabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { grantBrowserFixtureScope } from "./browser-scope";
 
 const DAEMON_NAME = "omp.browser.headless";
 /** The target id the incident log names for the tab whose close never landed. */
@@ -48,7 +54,20 @@ const TARGET_ID = "D6895F960DB1F4D842FD7B0286F3F818";
 
 /** Unique per-test scope so registry dirs never collide across the suite. */
 function makeScope(): SharedTargetScope {
-	return { projectDir: path.join("/tmp", `omp-wedge-test-${crypto.randomUUID()}`), daemonName: DAEMON_NAME };
+	return { runtimeDir: path.join("/tmp", `omp-wedge-test-${crypto.randomUUID()}`), daemonName: DAEMON_NAME };
+}
+
+/** A v2 record for a target this process created; only `targetId` matters to the ownership contract. */
+function ownRecord(targetId: string): SharedTargetRecord {
+	return {
+		targetId,
+		name: "logos-b2b",
+		channel: "test",
+		persist: false,
+		createdAt: 0,
+		lastMeaningfulActivityAt: 0,
+		generation: "gen-wedge",
+	};
 }
 
 /** Scopes created since the last sweep; `afterEach` removes them even when a test fails. */
@@ -68,9 +87,9 @@ async function ownedTargets(scope: SharedTargetScope): Promise<string[]> {
 	// for a throwaway id joins that chain, so when it returns the earlier write
 	// has landed and the file below is stable.
 	const probe = `chain-probe-${crypto.randomUUID()}`;
-	await recordSharedTarget(scope, probe);
+	await recordSharedTarget(scope, ownRecord(probe));
 	await forgetSharedTarget(scope, probe);
-	const file = path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`, `${process.pid}.json`);
+	const file = path.join(scope.runtimeDir, `${scope.daemonName}.targets`, `${process.pid}.json`);
 	const raw = await Bun.file(file)
 		.text()
 		.catch(() => null);
@@ -78,7 +97,14 @@ async function ownedTargets(scope: SharedTargetScope): Promise<string[]> {
 	const parsed: unknown = JSON.parse(raw);
 	if (typeof parsed !== "object" || parsed === null || !("targets" in parsed)) return [];
 	const { targets } = parsed;
-	return Array.isArray(targets) ? targets.filter((id): id is string => typeof id === "string") : [];
+	if (!Array.isArray(targets)) return [];
+	return targets.flatMap((entry: unknown) => {
+		if (typeof entry === "string") return [entry];
+		if (typeof entry === "object" && entry !== null && "targetId" in entry && typeof entry.targetId === "string") {
+			return [entry.targetId];
+		}
+		return [];
+	});
 }
 
 /** How the stub's CDP close behaves: never answers, fails fast, or fails after a gate. */
@@ -123,7 +149,14 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 			disconnect: () => undefined,
 		},
 	};
-	if (shared) handle.sharedDaemon = { name: scope.daemonName, projectDir: scope.projectDir };
+	if (shared) {
+		handle.sharedDaemon = {
+			name: scope.daemonName,
+			runtimeDir: scope.runtimeDir,
+			profileDir: path.join(scope.runtimeDir, "profile"),
+			generation: "gen-wedge",
+		};
+	}
 	return handle as unknown as BrowserHandle;
 }
 
@@ -140,6 +173,7 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		kindTag: "headless",
 		ownerSessionId: "session-wedge",
 		persist: false,
+		ownsTarget: true,
 		lastActivityAt: Date.now(),
 		frozen: false,
 		worker: {
@@ -153,14 +187,15 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 	} as unknown as TabSession;
 }
 
-/** Minimal tool session for the `runInTab` entry point. */
+/** Minimal tool session for the `runInTab` entry point; raw `tab.run` needs the fixture grant to pass the automation gate. */
 function makeSession(): ToolSession {
-	return {
+	const session = {
 		cwd: "/tmp/omp-wedge-session",
 		hasUI: false,
 		settings: Settings.isolated(),
 		getSessionFile: () => null,
 	} as unknown as ToolSession;
+	return grantBrowserFixtureScope(session);
 }
 
 function makeSnapshot(readyMatch: string | undefined): DaemonSnapshot {
@@ -218,7 +253,7 @@ afterEach(async () => {
 		await releaseTab(name, { kill: false }).catch(() => undefined);
 	}
 	for (const scope of scopes.splice(0)) {
-		await fs.rm(daemonRuntimeDir(scope.projectDir), { recursive: true, force: true }).catch(() => undefined);
+		await fs.rm(scope.runtimeDir, { recursive: true, force: true }).catch(() => undefined);
 	}
 });
 
@@ -226,7 +261,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("keeps the ownership record and re-checks the shared browser", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope));
@@ -249,7 +284,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		// closed died with it, so its record must not linger until this process
 		// exits and be rewritten on every later write.
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "fail" }));
 
 		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
@@ -261,7 +296,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("still forgets a tab that was already dead when it was released", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		const tab = makeWedgeTab(scope);
 		tab.state = "dead";
 		getTabsMapForTest().set("logos-b2b", tab);
@@ -275,7 +310,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("force-kills a wedged tab without forgetting the target it could not close", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		// `runInTab` reaching its grace period is one of the two real entry points
 		// into `forceKillTab` (the other is a failed worker recycle — the
 		// incident's "Failed to recycle browser tab worker; killing tab").
@@ -294,7 +329,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("lets a release join an in-flight force-kill instead of tearing the tab down twice", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		const gate = Promise.withResolvers<void>();
 		const entered = Promise.withResolvers<void>();
 		let terminations = 0;
@@ -336,7 +371,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("bounds the close a joining release waits on when force-kill is stuck on a wedged browser", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		// Never resolves: the CDP close hangs exactly as it does against a wedged
 		// Chromium, so only the supervisor's own close budget can end this wait.
 		const wedged = Promise.withResolvers<void>();
@@ -381,7 +416,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 	it("treats an unconfirmed close (CDP session failure) as unclosed too", async () => {
 		const scope = trackedScope();
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
-		await recordSharedTarget(scope, TARGET_ID);
+		await recordSharedTarget(scope, ownRecord(TARGET_ID));
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "fail" }));
 
 		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
@@ -398,7 +433,7 @@ describe("shared browser reachability check", () => {
 		const broker = makeBroker({ snapshot: makeSnapshot(READY_MATCH) }, stops);
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-a", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-a", daemonName: DAEMON_NAME },
 			{
 				client: broker,
 				probe: async wsEndpoint => {
@@ -439,7 +474,7 @@ describe("shared browser reachability check", () => {
 		} as unknown as DaemonBrokerClient;
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-replaced", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-replaced", daemonName: DAEMON_NAME },
 			{
 				client: broker,
 				probe: async wsEndpoint => {
@@ -502,7 +537,7 @@ describe("shared browser reachability check", () => {
 			const broker = makeBroker({ snapshot: makeSnapshot(READY_MATCH), ...opts }, stops);
 
 			const stopped = await stopSharedBrowserIfUnreachable(
-				{ projectDir: "/tmp/omp-wedge-unconfirmed", daemonName: DAEMON_NAME },
+				{ runtimeDir: "/tmp/omp-wedge-unconfirmed", daemonName: DAEMON_NAME },
 				{ client: broker, probe: async () => false },
 			);
 
@@ -517,7 +552,7 @@ describe("shared browser reachability check", () => {
 		const broker = makeBroker({ snapshot: makeSnapshot(READY_MATCH) }, stops);
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-single", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-single", daemonName: DAEMON_NAME },
 			{
 				client: broker,
 				probe: async () => ++probes > 1,
@@ -556,7 +591,7 @@ describe("shared browser reachability check", () => {
 		);
 		try {
 			const stopped = await stopSharedBrowserIfUnreachable(
-				{ projectDir: "/tmp/omp-wedge-slow", daemonName: DAEMON_NAME },
+				{ runtimeDir: "/tmp/omp-wedge-slow", daemonName: DAEMON_NAME },
 				{ client: broker },
 			);
 
@@ -574,7 +609,7 @@ describe("shared browser reachability check", () => {
 		const broker = makeBroker({ snapshot: makeSnapshot(READY_MATCH) }, stops);
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-b", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-b", daemonName: DAEMON_NAME },
 			{
 				client: broker,
 				probe: async () => {
@@ -594,7 +629,7 @@ describe("shared browser reachability check", () => {
 		const broker = makeBroker({ snapshot: makeSnapshot(undefined) }, stops);
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-c", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-c", daemonName: DAEMON_NAME },
 			{ client: broker, probe: async () => false },
 		);
 
@@ -607,7 +642,7 @@ describe("shared browser reachability check", () => {
 		const broker = makeBroker({ fail: true }, stops);
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir: "/tmp/omp-wedge-d", daemonName: DAEMON_NAME },
+			{ runtimeDir: "/tmp/omp-wedge-d", daemonName: DAEMON_NAME },
 			{ client: broker, probe: async () => false },
 		);
 
@@ -621,7 +656,7 @@ describe("shared browser reachability check", () => {
 
 		await expect(
 			stopSharedBrowserIfUnreachable(
-				{ projectDir: "/tmp/omp-wedge-e", daemonName: DAEMON_NAME },
+				{ runtimeDir: "/tmp/omp-wedge-e", daemonName: DAEMON_NAME },
 				{
 					client: broker,
 					probe: async () => {

@@ -148,6 +148,10 @@ def _make_computer():
         async def ax(self, *args, **kwargs):
             return await self._method("ax", args, kwargs)
 
+        async def observe(self, *args, **kwargs):
+            """Structured accessibility observation: live window geometry plus queried nodes."""
+            return await self._method("observe", args, kwargs)
+
         async def find(self, *args, **kwargs):
             return [_Element(snapshot) for snapshot in await self._method("find", args, kwargs)]
 
@@ -236,6 +240,38 @@ def _make_computer():
             details = await _invoke(
                 "run",
                 {"code": code, "read_only": read_only, "timeout": timeout},
+            )
+            return details.get("value")
+
+        async def task(
+            self,
+            goal,
+            *,
+            app=None,
+            window=None,
+            values=None,
+            expect=None,
+            maxActions=None,
+            maxCalls=None,
+            timeout=None,
+            allowConsequential=None,
+        ):
+            """Pursue a desktop goal in one window through judged accessibility actions."""
+            if not isinstance(goal, str) or not goal.strip():
+                raise TypeError("computer.task() requires a non-empty goal")
+            details = await _invoke(
+                "task",
+                {
+                    "goal": goal,
+                    "app": app,
+                    "window": window,
+                    "values": values,
+                    "expect": expect,
+                    "maxActions": maxActions,
+                    "maxCalls": maxCalls,
+                    "timeout": timeout,
+                    "allowConsequential": allowConsequential,
+                },
             )
             return details.get("value")
 

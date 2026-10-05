@@ -35,3 +35,4 @@ NEVER repeat successful setup. Kernel-loss notice means reload setup.
 </critical>
 
 {{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}
+`timeout: 0` drops only the cell deadline; the session wall-clock cap (`tools.wallCapMs`) still bounds every call, including time parked on `agent()`/`judge()` waits.

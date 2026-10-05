@@ -30,15 +30,23 @@ export function isValidModelPresetName(name: string): boolean {
 
 type PresetLookup = { kind: "found"; preset: ModelPreset } | { kind: "missing" } | { kind: "invalid"; reason: string };
 
-/** Validate one raw `modelPresets` entry; hand-edited config can hold anything. */
+/**
+ * Validate one raw `modelPresets` entry; hand-edited config can hold anything.
+ *
+ * Besides the native `{ modelRoles, defaultThinkingLevel? }` shape, the fork-era v1 shape
+ * (`{ version: 1, roles, fallbackChains, cycleOrder, defaultThinkingLevel }`) still loads:
+ * `roles` stands in for `modelRoles` (string-array selectors join like `modelRoles` entries),
+ * while `version`, `fallbackChains` and `cycleOrder` are ignored — presets only carry roles and
+ * the default thinking level now.
+ */
 function parseModelPreset(raw: unknown): ModelPreset | string {
 	if (!isRecord(raw)) return "it is not a mapping";
-	const roles = raw.modelRoles;
+	const roles = raw.modelRoles ?? raw.roles;
 	if (!isRecord(roles)) return "`modelRoles` is missing or not a mapping";
 	const modelRoles: Record<string, string> = {};
 	for (const role of Object.keys(roles)) {
-		const value = roles[role];
-		if (typeof value !== "string" || value.trim() === "") return `role \`${role}\` is not a model selector`;
+		const value = presetRoleSelector(roles[role]);
+		if (value === undefined) return `role \`${role}\` is not a model selector`;
 		modelRoles[role] = value;
 	}
 	const level = raw.defaultThinkingLevel;
@@ -48,6 +56,14 @@ function parseModelPreset(raw: unknown): ModelPreset | string {
 		return "`defaultThinkingLevel` is not a thinking level";
 	}
 	return { modelRoles, defaultThinkingLevel: thinking };
+}
+
+/** A preset role's selector: a non-blank string, or a string array joined the way `modelRoles` lists are. */
+function presetRoleSelector(value: unknown): string | undefined {
+	if (typeof value === "string") return value.trim() === "" ? undefined : value;
+	if (!Array.isArray(value) || value.length === 0) return undefined;
+	if (!value.every((entry): entry is string => typeof entry === "string" && entry.trim() !== "")) return undefined;
+	return value.join(",");
 }
 
 function isDefaultThinkingLevel(

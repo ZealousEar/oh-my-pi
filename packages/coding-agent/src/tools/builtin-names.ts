@@ -29,6 +29,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"reflect",
 	"learn",
 	"manage_skill",
+	"recommend_skills",
 ] as const;
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];

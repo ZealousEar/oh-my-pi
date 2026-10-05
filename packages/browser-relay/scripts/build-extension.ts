@@ -23,6 +23,10 @@ const assetsDir = path.resolve(root, "../coding-agent/src/tools/browser/relay/ex
 await fs.rm(dist, { recursive: true, force: true });
 await fs.mkdir(distExtension, { recursive: true });
 
+// The bundler stamps module paths relative to the cwd into the output; pin it
+// so the generated asset is byte-identical from any working directory.
+process.chdir(root);
+
 const bundle = await Bun.build({
 	entrypoints: [path.join(root, "extension/background.ts")],
 	outdir: distExtension,

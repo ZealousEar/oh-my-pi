@@ -130,6 +130,25 @@ export const cfgCompactionThresholdPercent = register({
 	},
 });
 
+export const cfgCompactionThresholdMinContextWindow = register({
+	id: "compaction.thresholdMinContextWindow",
+	type: "number",
+	default: -1,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Compaction Threshold Min Window",
+		description:
+			"Smallest context window the configured threshold, reserve and kept-tail sizes apply to; smaller windows use window-relative sizes (compact at 85%, keep at most 25% verbatim)",
+		options: [
+			{ value: "-1", label: "All windows", description: "Configured sizes on every model" },
+			{ value: "256000", label: "256K+", description: "Below 256K: window-relative sizes" },
+			{ value: "512000", label: "512K+", description: "Below 512K: window-relative sizes" },
+			{ value: "1000000", label: "1M+", description: "Below 1M: window-relative sizes" },
+		],
+	},
+});
+
 export const cfgCompactionThresholdTokens = register({
 	id: "compaction.thresholdTokens",
 	type: "number",
@@ -300,12 +319,38 @@ export const cfgCompactionDropUseless = register({
 	},
 });
 
+export const cfgCompactionSemanticShakeProtectTokens = register({
+	id: "compaction.semanticShake.protectTokens",
+	type: "number",
+	default: 16_000,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Semantic Shake Protect Window",
+		description:
+			"Most recent context tokens semantic shake never touches; only tool results older than this window are offered to the judgment",
+	},
+});
+
+export const cfgCompactionSemanticShakeMaxRegionsPerCall = register({
+	id: "compaction.semanticShake.maxRegionsPerCall",
+	type: "number",
+	default: 12,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Semantic Shake Regions per Call",
+		description: "Eligible tool results judged in one request; the pass stops at reduction.maxCallsPerPass",
+	},
+});
+
 /** Every `compaction.*` setting as one memoized snapshot (the configured compaction policy). */
 export const cfgCompaction = combine({
 	enabled: cfgCompactionEnabled,
 	experimentalContextManagement: cfgCompactionExperimentalContextManagement,
 	methodOrder: cfgCompactionMethodOrder,
 	thresholdPercent: cfgCompactionThresholdPercent,
+	thresholdMinContextWindow: cfgCompactionThresholdMinContextWindow,
 	thresholdTokens: cfgCompactionThresholdTokens,
 	reserveTokens: cfgCompactionReserveTokens,
 	keepRecentTokens: cfgCompactionKeepRecentTokens,
@@ -325,6 +370,71 @@ export const cfgCompaction = combine({
 
 /** Configured compaction policy ({@link cfgCompaction}). */
 export type CompactionSettings = SettingValueOf<typeof cfgCompaction>;
+
+// Shared reduction policy (bash output pruning + semantic shake)
+export const cfgReductionEgress = register({
+	id: "reduction.egress",
+	type: "enum",
+	values: ["off", "selected"] as const,
+	default: "off",
+	ui: {
+		tab: "context",
+		group: "Reduction",
+		label: "Semantic Reduction Egress",
+		description:
+			"What may leave this machine for a reduction judgment. off: deterministic stages only, nothing is sent. selected: the candidate tool-output spans, the command or tool call, and a bounded task-context excerpt — never whole transcripts, environment, or credentials; configured secrets are placeholder-obfuscated and credential-shaped text is heuristically redacted first",
+	},
+});
+
+export const cfgReductionMaxCallsPerPass = register({
+	id: "reduction.maxCallsPerPass",
+	type: "number",
+	default: 3,
+	ui: {
+		tab: "context",
+		group: "Reduction",
+		label: "Reduction Calls per Pass",
+		description:
+			"Judgment requests admitted for one reduction pass (one command's output, one shake); retries, refinements, and failures all count",
+	},
+});
+
+export const cfgReductionMaxLatencyMs = register({
+	id: "reduction.maxLatencyMs",
+	type: "number",
+	default: 4_000,
+	ui: {
+		tab: "context",
+		group: "Reduction",
+		label: "Reduction Latency Budget",
+		description:
+			"Wall clock admitted for one reduction pass; when it runs out the unjudged content is kept as it was",
+	},
+});
+
+export const cfgReductionTaskContextChars = register({
+	id: "reduction.taskContextChars",
+	type: "number",
+	default: 2_000,
+	ui: {
+		tab: "context",
+		group: "Reduction",
+		label: "Reduction Task Context",
+		description:
+			"Characters of the original request, latest request, latest reply, and standing requirements a semantic reduction may read and, with egress enabled, send",
+	},
+});
+
+/** Every `reduction.*` setting as one memoized snapshot (the shared semantic-reduction policy). */
+export const cfgReduction = combine({
+	egress: cfgReductionEgress,
+	maxCallsPerPass: cfgReductionMaxCallsPerPass,
+	maxLatencyMs: cfgReductionMaxLatencyMs,
+	taskContextChars: cfgReductionTaskContextChars,
+});
+
+/** Shared semantic-reduction policy ({@link cfgReduction}). */
+export type ReductionSettings = SettingValueOf<typeof cfgReduction>;
 
 // Experimental: snapcompact inline imaging (transient, per-request; never persisted)
 export const cfgSnapcompactSystemPrompt = register({

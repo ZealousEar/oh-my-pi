@@ -752,6 +752,7 @@ compaction:
   methodOrder: [remote, snapcompact, handoff, shake, soft]
   midTurnEnabled: true # check thresholds between tool-loop provider requests
   thresholdPercent: -1 # -1 = default reserve-based behavior
+  thresholdMinContextWindow: -1 # smaller windows use window-relative sizes; -1 = configured sizes everywhere
   thresholdTokens: -1 # fixed token limit when > 0
 memory:
   backend: off # off, local, hindsight, mnemopi
@@ -767,6 +768,7 @@ memory:
 | `compaction.midTurnEnabled`   | boolean | `true`                                   | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request. Setting it to `false` affects only the session it is configured on; subagents always check, since their whole assignment is one turn.                |
 | `compaction.methodOrder`      | array   | `remote, snapcompact, handoff, shake, soft` | Ordered fallbacks. `remote` uses provider-native server compaction (OpenAI Responses compact, Anthropic compaction beta); unavailable or failed methods advance. |
 | `compaction.thresholdPercent` | number  | `-1`                                     | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
+| `compaction.thresholdMinContextWindow` | number | `-1` | Smallest context window the configured `thresholdPercent`, `reserveTokens` and `keepRecentTokens` apply to. Smaller windows compact at the window minus 15% (unless `thresholdTokens` is set), keep at most 25% of the window verbatim, and budget the summary from a 15% reserve. `-1` = every window. |
 | `compaction.thresholdTokens`  | number  | `-1`                                     | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
 | `task.agentCompactionThresholdOverrides` | record | `{}` | Exact-name task/eval agent → compaction trigger: a positive token count (`90000`) or a percentage string (`"80%"`). See below. |
 | `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
@@ -798,6 +800,10 @@ task:
 - `null` clears an entry set by a lower-priority settings layer. Any other value fails settings load.
 - Agents without an entry — including agents spawned by an overridden agent — use the main session's `compaction.*` thresholds. The main session and Vibe workers are unaffected.
 - The resolved trigger is stored with the subagent session and reused when it is revived.
+
+- Recoverable context reduction (shared gate): `reduction.egress` (`off` default; `selected` lets semantic stages send the candidate spans or results, the command or tool call, and the bounded task context to the judgment backend after secret obfuscation and credential redaction — nothing leaves the machine otherwise), `reduction.maxCallsPerPass` (3), `reduction.maxLatencyMs` (4000), `reduction.taskContextChars` (2000; bound of each task-context field — original request, latest request, latest reply, standing requirement sentences — read locally from the session). See [bash](tools/bash.md#output-pruning) and [compaction](compaction.md#semantic-shake).
+- Bash output pruning: `bash.outputPruning.mode` (`off` default; `deterministic` removes recognised noise runs and repeated lines by rule when the task context allows it; `semantic` adds a bounded judgment over the remaining routine spans when `reduction.egress` is `selected`), `bash.outputPruning.minTokens` (1500; smaller outputs are never touched), `bash.outputPruning.maxSegments` (40 per judgment request). A stated retention or counting requirement keeps the whole output; without task context only content-free collapses run. The exact original is archived before anything is replaced and named once in the result footer.
+- Semantic shake: `compaction.semanticShake.protectTokens` (16000; the recent window never offered), `compaction.semanticShake.maxRegionsPerCall` (12); the goal fields the judge sees are bounded by the shared `reduction.taskContextChars`. Run it with `/shake semantic` or by listing `semantic-shake` in `compaction.methodOrder` (not in the default order); with `reduction.egress` off it keeps everything and the auto path falls back to the next method. `/shake elide` remains the explicit mechanical reduction.
 
 ### Appearance and terminal
 
@@ -954,6 +960,7 @@ Every schema path not individually tabulated in this catalog is explicitly defer
 - Interface and startup: `composer.*`, `display.*`, `input.*`, `marketplace.*`, `spelling.*`, `statusLine.*`, `startup.*`, `stt.*`, `tui.*`, `ttsr.*`, and `update.*`.
 - Discovery, sharing, and auth: `auth.*`, `browser.*`, `claudeResets.*`, `codexResets.*`, `collab.*`, `commands.*`, `gc.*`, `ida.*`, `mcp.*`, `share.*`, `skills.*`, `stream.*`, and `telemetry.*`.
 - Ungrouped keys: `setupVersion`, `proseOnlyThinking`, `omitThinking`, `externalThinking`, `includeWorkspaceTree`, `autocompleteMaxVisible`, `emojiAutocomplete`, `disabledExtensions`, `inlineToolDescriptors`, and `treeFilterMode`.
+- Skill recommendation (`recommend_skills`): `skills.recommend.enabled` (true), `skills.recommend.maxCandidatesPerRequest` (200, clamped to `3..254`: windows are balanced so none holds a single skill, and one slot of the 255-option judgment cap is reserved for the `none` choice), `skills.recommend.minRelevance` (0.1), `skills.recommend.cacheEntries` (64). The judge is the `judge` model role; see [recommend_skills](tools/recommend_skills.md).
 
 These settings follow the same schema-defined type and default rules shown above.
 

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task fixture</title>
+    <style>
+      body { font: 14px system-ui; margin: 16px; width: 700px; }
+      label { display: block; margin-top: 10px; }
+      .listbox { border: 1px solid #ccc; margin: 0; padding: 0; list-style: none; }
+      .listbox[hidden] { display: none; }
+      .listbox li { padding: 4px; cursor: pointer; }
+      #cover-row { position: relative; width: 220px; }
+      #overlay { position: absolute; left: 0; top: 0; right: 0; bottom: 0; background: #222; color: #fff; z-index: 5; }
+      #hidden-action { display: none; }
+      #tall { height: 1400px; }
+    </style>
+  </head>
+  <body>
+    <h1>Reservation</h1>
+    <!--
+      Scenario set modelled on jev-ultrafast (MIT) static/fixture.html: labelled
+      text inputs, an async autocomplete combobox, a native select, a checkbox,
+      and deliberately awkward controls (disabled, hidden, overlay-occluded, a
+      control replaced after the first observation) plus a navigating submit.
+    -->
+    <form id="form" method="get" action="/done">
+      <label for="name">Full name</label>
+      <input id="name" name="name" type="text" />
+
+      <label for="city">City</label>
+      <input
+        id="city"
+        name="city"
+        type="text"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls="city-options"
+        aria-expanded="false"
+        autocomplete="off"
+      />
+      <ul id="city-options" class="listbox" role="listbox" hidden></ul>
+
+      <label for="room">Room type</label>
+      <select id="room" name="room">
+        <option value="">Choose</option>
+        <option value="single">Single room</option>
+        <option value="double">Double room</option>
+        <option value="suite">Suite</option>
+      </select>
+
+      <label><input id="news" name="news" type="checkbox" /> Email me offers</label>
+
+      <p>
+        <button id="submit" type="submit">Confirm reservation</button>
+        <button id="disabled-action" type="button" disabled>Apply voucher</button>
+        <button id="hidden-action" type="button">Secret action</button>
+      </p>
+      <p id="cover-row">
+        <button id="covered" type="button">Covered action</button>
+        <span id="overlay">Overlay</span>
+      </p>
+      <p id="movers"><button id="mover" type="button">Original label</button></p>
+      <div id="tall">Scroll region</div>
+    </form>
+    <script src="/app.js"></script>
+  </body>
+</html>

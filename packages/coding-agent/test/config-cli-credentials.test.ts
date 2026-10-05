@@ -7,6 +7,12 @@ import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { all, lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { getSettingDef } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { createSettingsHost } from "../src/config/settings-ui";
+import { restoreEnvValue } from "./helpers/settings-test-state";
+
+// Config overlays inherited from an omp channel launcher: real files, one of them
+// writable. A persisted `config set` of a credential must land in the fresh temp
+// agent dir, never in the user's shared credential overlay.
+const OVERLAY_ENV = ["PI_CONFIG_FILES", "OMP_SHARED_SECRETS_FILE"] as const;
 
 describe("credential settings", () => {
 	it("marks every known credential, including those with no settings panel entry", () => {
@@ -79,8 +85,15 @@ describe("config list output", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
+	const savedOverlayEnv: Partial<Record<(typeof OVERLAY_ENV)[number], string>> = {};
+
 	beforeEach(() => {
 		resetSettingsForTest();
+		for (const key of OVERLAY_ENV) {
+			const value = process.env[key];
+			if (value !== undefined) savedOverlayEnv[key] = value;
+			restoreEnvValue(key, undefined);
+		}
 		agentDir = TempDir.createSync("@omp-config-credentials-");
 		setAgentDir(agentDir.path());
 	});
@@ -89,6 +102,7 @@ describe("config list output", () => {
 		vi.restoreAllMocks();
 		AgentStorage.close();
 		resetSettingsForTest();
+		for (const key of OVERLAY_ENV) restoreEnvValue(key, savedOverlayEnv[key]);
 		if (originalAgentDir) setAgentDir(originalAgentDir);
 		else {
 			setAgentDir(fallbackAgentDir);
