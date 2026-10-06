@@ -5,8 +5,8 @@
 # disabled so an API key inherited from the shell environment (e.g. FIREWORKS_API_KEY from
 # ~/.zshenv) can never become the silently selected default. With no login yet, no model
 # resolves and the TUI shows the pending-login state instead of a paid fallback.
-# Generated from /Users/farhad/Code/omp-next-2026-09-25/packages/catalog/src/models.json: 73 catalog providers
-# - 6 allowed (anthropic, local, openai-codex, openrouter, typesafe, web) + 3 keyless local discoverables = 70 denied ids.
+# Generated from /Users/farhad/Code/omp-next-2026-10-06/packages/catalog/src/models.json: 74 catalog providers
+# - 6 allowed (anthropic, local, openai-codex, openrouter, typesafe, web) + 3 keyless local discoverables = 71 denied ids.
 disabledProviders:
   - abliteration
   - aiand
@@ -37,6 +37,7 @@ disabledProviders:
   - google-gemini-cli
   - google-vertex
   - groq
+  - helmcode
   - huggingface
   - kilo
   - kimi-code
