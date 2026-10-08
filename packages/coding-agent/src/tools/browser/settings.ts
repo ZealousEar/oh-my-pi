@@ -134,7 +134,7 @@ export const cfgBrowserPermissionsGrants = register({
 		group: "Grep & Browser",
 		label: "Browser Permission Grants",
 		description:
-			'Pre-authorized browser capabilities. Ordinary mutations use exact origin/action targets with no wildcards. Raw actions are never site-confined and require rawAccess:"broad" for the whole browser identity or an exact codeFingerprints entry; actions:"*" never covers raw. Optional ttlMinutes expires a grant within this session.',
+			'Pre-authorized browser capabilities. Ordinary mutations use exact origin/action targets; partial patterns are rejected, but targets:["*"] alone covers every origin. Raw actions are never site-confined and require rawAccess:"broad" for the whole browser identity or an exact codeFingerprints entry; actions:"*" never covers raw. Optional ttlMinutes expires a grant within this session.',
 	},
 });
 

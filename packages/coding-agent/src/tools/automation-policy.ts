@@ -62,7 +62,7 @@ export interface AutomationAction {
 export interface AutomationScope {
 	id: string;
 	surface: AutomationSurface;
-	/** Exact targets for ordinary actions. Raw capability fields are intentionally not target-confined. No wildcards. */
+	/** Exact targets for ordinary actions; a configured browser grant may use `["*"]` for every origin. Raw capability fields are intentionally not target-confined. */
 	targets: readonly string[];
 	/** Verb ids or `"*"` (all non-raw verbs). `raw` verbs must be listed explicitly. */
 	actions: readonly string[];
@@ -143,6 +143,13 @@ function sessionScopes(session: object, now: number): SessionScopes {
 	return state;
 }
 
+/**
+ * Sole `targets` entry of a user-configured browser grant that covers every
+ * origin. Accepted only from trusted settings; interactive grants and partial
+ * patterns (`https://*.example`) stay exact-only.
+ */
+const ANY_BROWSER_TARGET = "*";
+
 function exactTarget(surface: AutomationSurface, target: unknown): target is string {
 	if (typeof target !== "string" || target.length === 0 || target.includes("*")) return false;
 	if (surface === "computer" || target === "about:blank" || target === "file:") return true;
@@ -199,7 +206,8 @@ function configuredScopes(
 		const grant = entry as Record<string, unknown>;
 		const targets = stringList(grant.targets);
 		const actions = stringList(grant.actions);
-		if (!targets || !actions || !targets.every(target => exactTarget(surface, target))) continue;
+		const anyTarget = surface === "browser" && targets?.length === 1 && targets[0] === ANY_BROWSER_TARGET;
+		if (!targets || !actions || !(anyTarget || targets.every(target => exactTarget(surface, target)))) continue;
 		const configuredTtl = grant.ttlMinutes;
 		if (
 			configuredTtl !== undefined &&
@@ -471,7 +479,8 @@ function scopeCovers(scope: AutomationScope, action: AutomationAction, now: numb
 			action.codeFingerprint !== undefined && scope.codeFingerprints?.includes(action.codeFingerprint) === true;
 		if (scope.rawAccess !== "broad" && !exactCode) return false;
 	} else {
-		if (!scope.targets.includes(action.target)) return false;
+		const anyTarget = scope.surface === "browser" && scope.targets.includes(ANY_BROWSER_TARGET);
+		if (!anyTarget && !scope.targets.includes(action.target)) return false;
 		if (!(actionListed || scope.actions.includes("*"))) return false;
 	}
 	if (action.surface === "computer" && isBrowserDesktopApp(action.target) && scope.browserAppAccess !== "broad") {

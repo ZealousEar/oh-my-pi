@@ -225,6 +225,23 @@ describe("automation permission policy", () => {
 		expect(getAutomationScopes(session, 41_000)).toEqual([]);
 	});
 
+	it("lets a user-configured browser grant cover every origin only with a sole '*' target", () => {
+		const configured = [
+			{ targets: ["*"], actions: ["*"] },
+			{ targets: ["*", "https://example.test"], actions: ["browser.tab.press"] },
+		];
+		const session = { settings: { getGlobalSettings: () => ({ "browser.permissions.grants": configured }) } };
+		const scopes = getAutomationScopes(session, 42_000);
+		const decide = (overrides: Partial<AutomationAction>) =>
+			decideAutomationAction(action(overrides), { scopes, now: 42_000 }).verdict;
+		expect(decide({ action: "browser.tab.goto", target: "https://old.reddit.com" })).toBe("allow");
+		expect(decide({ target: "https://other.example" })).toBe("allow");
+		// Wildcard covers origins, not consequence or raw code.
+		expect(decide({ consequential: true })).toBe("deny");
+		expect(decide({ action: "browser.tab.run", raw: true, codeFingerprint: "abc" })).toBe("deny");
+		expect(scopes).toHaveLength(1);
+	});
+
 	it("accepts the lifecycle's exact about:blank and file targets without accepting wildcards", () => {
 		const session = {};
 		expect(() =>
