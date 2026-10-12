@@ -26,6 +26,8 @@ export interface DaemonSpec {
 	restart: DaemonRestartPolicy;
 	persist: boolean;
 	detached: boolean;
+	/** Total wall-clock lifetime across restarts; the broker stops the daemon when it elapses. Absent = unbounded service. */
+	lifetimeMs?: number;
 }
 
 /** Serializable daemon state visible to every client in one broker scope. */
@@ -48,4 +50,6 @@ export interface DaemonSnapshot {
 	readyPending?: ("log" | "port")[];
 	persist: boolean;
 	detached: boolean;
+	/** Absolute epoch-ms deadline fixed at first launch when the spec carries `lifetimeMs`; restarts do not move it. */
+	deadlineAt?: number;
 }
