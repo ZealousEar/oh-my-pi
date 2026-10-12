@@ -18,6 +18,7 @@ import {
 	runInTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable, visibleBrowserAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -232,12 +233,12 @@ describe("OMP-owned browser evaluation", () => {
 			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
 			const name = `handle-evaluate-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, browser, {
 					url: `data:text/html,${encodeURIComponent('<button id="first">First</button><button id="second">Second</button>')}`,
@@ -325,12 +326,12 @@ describe("OMP-owned browser input", () => {
 			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
 			const name = `background-input-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, browser, {
 					url: `data:text/html,${encodeURIComponent("<button onclick=\"document.querySelector('output').textContent++\">Increment</button><output>0</output>")}`,
