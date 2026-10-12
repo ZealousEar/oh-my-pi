@@ -661,31 +661,33 @@ If a role points at another role, the target model still inherits normally and a
 
 ### Model presets
 
-A model preset is a named snapshot of every role assignment plus `defaultThinkingLevel`, so you can swap a whole setup at once:
+A model preset is a named snapshot of the whole routing setup — every role assignment, the per-role fallback chains, the quick-switch cycle order, and `defaultThinkingLevel` — so you can swap it at once:
 
 ```text
-/modelpreset save cheap      # save the current roles and thinking level
-/modelpreset switch deep     # apply a saved preset
+/modelpreset save cheap      # save the current roles, chains, cycle order and thinking level
+/modelpreset switch deep     # apply a saved preset to this session (never persisted)
 /modelpreset                 # pick one from a list (interactive)
 /modelpreset list | delete <name>
 ```
 
-In `/models`, press `s` in the Roles view to save the current setup under a name. Presets live under `modelPresets` in `config.yml`:
+In `/models`, the **Presets** sidebar scope lists, loads, saves and deletes presets; `s` in the Roles view saves the current setup too, and `ctrl+←/→` (or `p`/`⇧P`) there steps through the saved presets. Presets live under `modelPresets` in `config.yml` (`version: 1`):
 
 ```yaml
 modelPresets:
   deep:
-    modelRoles:
+    version: 1
+    roles:
       default: anthropic/claude-opus-4-5:high
       smol: anthropic/claude-sonnet-4-5
+    fallbackChains:
+      default: [openai-codex/gpt-6-astra]
+    cycleOrder: [smol, default, slow]
     defaultThinkingLevel: high
 ```
 
-Switching writes roles the way the model picker does: into the scope chosen by `modelRoleStorage`, clearing roles the preset leaves out and replacing `--model`/`--smol` session overrides. The preset's `defaultThinkingLevel` is written to the global config. It then switches the active model to the resulting `default` (an automatic provider-default selection when the preset has none) and sets the session's thinking level from the `:level` suffix on that selector, or else the preset's `defaultThinkingLevel`; a `:inherit` suffix leaves the level the model switch set. When a preset's `default` model is unavailable, nothing is changed. Roles that another layer still decides — a `--config` file, a project config in `global` storage, or the global config in `project` storage — are listed in the switch message with the layer that wins, instead of being reported as switched. The same goes for a `defaultThinkingLevel` set by a project config or `--config` file: the session still switches to the preset's level, but the message names that layer, whose level returns on the next start.
+Every entry point — `/modelpreset switch`, the Presets view, and the Roles-view keys — applies a preset through the same session-scoped, transactional path described in [Model presets](#model-presets) below. Saving captures the effective configuration — including any `--model` session override and a currently loaded preset — and the configured `defaultThinkingLevel`, not the session's live thinking level.
 
 When several config layers define a preset of the same name, the highest layer (command line, then `--config` file, then project config, then global config) wins whole: entries are never merged across layers, so a project `deep` that only sets `default` applies without the global `deep`'s other roles. A `null` entry in a `--config` file (or a command-line override) hides the preset from lists and switches; a `null` entry in a project config is ignored, so the global preset of that name still applies. Saving always writes the named entry to the global config and reports when a higher layer still takes precedence for that name.
-
-Saving captures the effective assignments — including any `--model` session override — and the configured `defaultThinkingLevel`, not the session's live thinking level.
 
 Related settings:
 
@@ -717,6 +719,47 @@ disabledProviders:
 ```
 
 String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels`, `providers` for either provider setting, or `values` for any of them.
+
+## Model presets
+
+A **model preset** is a saved, named permutation of your model-role setup. It captures the routing knobs you tune together — which model fills each role, the per-role fallback chains, the quick-switch cycle order, and the default thinking level — so you can flip between whole configurations (for example a "cheap/fast" set and a "max-quality" set) in one action.
+
+Manage presets from the `/models` hub under the **Presets** sidebar scope:
+
+- **Save current** — `s` (or the trailing `+ Save current as preset…` row) snapshots the current effective configuration into a new named preset. Names start with a letter and may contain letters, digits, spaces, `-` and `_`.
+- **Load** — `Enter` applies the selected preset (see semantics below).
+- **Delete** — `x` is an armed confirm: the first `x` (or backspace) arms the row ("press x again to delete") and a second `x` deletes it; navigating away disarms. Deleting removes the global definition only; a same-name project or `--config` definition keeps listing.
+
+`/modelpreset list|save|switch|delete <name>` and the Roles-view `ctrl+←/→` / `p` / `⇧P` keys drive the same backend: a switch from any entry point applies the preset exactly as a load from the Presets view does.
+
+### What a preset captures
+
+A preset stores exactly four things:
+
+- `modelRoles` — the effective role -> model-selector map
+- `retry.fallbackChains` — per-role fallback chains
+- `cycleOrder` — the quick-switch cycle
+- `defaultThinkingLevel` — the default reasoning effort
+
+It does **not** capture enabled models, provider order or provider config, model tags, or credentials. Those remain whatever your persisted layers resolve to; a preset only re-points roles and their routing.
+
+### Loading semantics
+
+Loading a preset applies it **session-scoped as a runtime routing override** — the highest-precedence, never-persisted layer (see [Settings precedence](./settings.md#precedence)). This means:
+
+- It takes effect **immediately** for the current session and beats every persisted or overlay layer (global, project, `--config`), so nothing lower can shadow it.
+- It is **never written to disk**. Restarting the session (or not re-applying the preset) reverts to your persisted configuration.
+- Roles omitted from the preset resolve to **auto-selection**. The role map is an exact replacement, not a merge: omitted roles stay absent even if discovered later by settings reload, project change, or a cwd-scoped settings clone. Editing one role does not resurrect unrelated lower-layer roles.
+- Fallback chains and the cycle order are **replaced exactly**: a preset with no chains clears every chain for the session instead of merging with chains from lower layers. The `retry.modelFallback` policy is unchanged, including an explicit `false`.
+- Application is **transactional and validated**: a malformed or unsupported-version preset is rejected outright, and before anything changes every captured role must resolve to an available, authenticated model (role aliases like `@slow` resolve against the preset's own role map). If validation fails, **nothing changes**; if the live model switch afterwards is rejected or throws, the runtime routing settings are **rolled back**. Restoring the prior live model and thinking level is then attempted on a best-effort basis; that restore can itself fail, and provider or session side effects from the attempted switch are not generally reversible.
+- While a preset's live switch is pending, the hub ignores keyboard and mouse input, including Escape, so edits cannot race a rollback. Input resumes when the transaction settles.
+- Later explicit role, fallback-chain, cycle, and thinking edits retain their normal persistence behavior and update the active routing plan immediately. Loading itself does not persist routing. An explicit runtime `override` or `clearOverride` of a routing setting releases preset linkage for that path.
+
+### The "matches current" badge
+
+A preset row shows a **matches current** badge when its captured configuration equals your current effective configuration (roles, chains, cycle order, and default thinking level). It marks equality, not an "active" state — presets are never persisted as active.
+
+Preset **definitions** live in the `modelPresets` setting (`ModelPresetV1`, `version: 1`): saves and deletes write only the named entry in the **global** layer (other presets are never rewritten), while definitions from project or overlay layers are also listed and remain visible after a global delete. A queued save or delete does not overwrite a newer external edit to the same definition.
 
 ## `/model` and `omp models`
 
