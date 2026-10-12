@@ -1,4 +1,5 @@
 import {
+	getGlobalDaemonRuntimeDir,
 	getProjectDir,
 	getPuppeteerDir,
 	logger,
@@ -8,7 +9,7 @@ import {
 	withTimeout,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
-import type { CDPSession, Page, Target } from "puppeteer-core";
+import type { Browser, CDPSession, Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
 import { webpExclusionForModel } from "@oh-my-pi/pi-tui/chat/image-loading";
 import type { ToolSession } from "../index";
@@ -16,6 +17,13 @@ import { expandPath } from "../path-utils";
 import { CELL_BUDGET_SLACK_MS } from "../run-scope";
 import { ToolAbortError, toWorkerErrorPayload } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import {
+	type AutomationAction,
+	automationDeniedError,
+	decideAutomationAction,
+	fingerprintAutomationCode,
+	getAutomationScopes,
+} from "../automation-policy";
 import { gracefulKillTreeOnce, pickElectronTarget } from "./attach";
 import { CmuxTab } from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
@@ -26,9 +34,14 @@ import {
 	closeRelayTarget,
 	forgetSharedTarget,
 	forgetSharedTargets,
+	type OrphanDecision,
+	type OrphanTarget,
+	reapOrphanSharedTargets,
 	recordSharedTarget,
 	type SharedTargetScope,
+	touchSharedTarget,
 } from "./orphan-registry";
+import { RELAY_DAEMON_NAME } from "./relay/daemon";
 import { stopSharedBrowserIfUnreachable } from "./shared-daemon";
 import {
 	type BrowserHandle,
@@ -41,11 +54,14 @@ import {
 } from "./registry";
 import {
 	type AttachPage,
+	originOf,
 	ownsPage,
 	type ReadyInfo,
+	type RunBinding,
 	type RunErrorPayload,
 	type RunResultOk,
 	type SessionSnapshot,
+	targetChangedDenial,
 	type Transferable,
 	type Transport,
 	type WorkerInbound,
@@ -115,7 +131,12 @@ interface TabSessionBase<TBrowser extends BrowserHandle = BrowserHandle> {
 	 * tab live across turns is the creator's explicit decision.
 	 */
 	persist?: boolean;
-	/** Wall-clock (`Date.now()`) last use: create, reuse, or run start. Drives idle-close. */
+	/**
+	 * Wall-clock of the last MEANINGFUL, tool-driven use: create, reuse, run
+	 * start and run end. Websocket keepalives, settle freeze/unfreeze and
+	 * passive page reloads never refresh it. Drives idle-close, the abandoned
+	 * reaper, and the durable ownership record's activity stamp.
+	 */
 	lastActivityAt: number;
 	/**
 	 * True after a successful settle-freeze (`Page.setWebLifecycleState`
@@ -129,13 +150,21 @@ interface TabSessionBase<TBrowser extends BrowserHandle = BrowserHandle> {
 export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle> {
 	backend: "worker";
 	worker: WorkerHandle;
-	/** omp created this page (headless, or a relay open without a target): closing the tab closes it. */
+	/**
+	 * omp created this page (headless, a relay open without a target, or `app.new_tab`): closing the tab closes it.
+	 * Authoritative for policy and for reaping too: a borrowed user tab is never navigated freely, never reaped.
+	 */
 	ownsPage: boolean;
 	/**
 	 * The tab's upload staging folder. It outlives the tab's workers, since Chrome reads a picked file only when the page
 	 * does, and goes with the page when omp closes it; a page left open in the user's browser keeps it until the sweep.
 	 */
 	uploadDir: string;
+	/**
+	 * Borrowed the page the user was looking at (a user-driven open without `app.target`). `tab.task` refuses to
+	 * drive it; an owned page or an explicitly targeted borrowed one is never this.
+	 */
+	adoptedForeground: boolean;
 	/** In flight while a worker that exited on its own is replaced; runs wait for it before driving the tab. */
 	workerRecovery?: Promise<boolean>;
 	/** `Date.now()` of the last unexpected worker exit; a second one soon after closes the tab instead. */
@@ -167,6 +196,11 @@ export interface AcquireTabOptions {
 	waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	target?: string;
+	/**
+	 * Create a fresh omp-owned target on a user-driven (relay/connected)
+	 * browser instead of adopting one. Mutually exclusive with `target`.
+	 */
+	createTarget?: boolean;
 	signal?: AbortSignal;
 	timeoutMs: number;
 	/**
@@ -202,6 +236,12 @@ export interface AcquireTabOptions {
 	 * extend another session's tab lifetime.
 	 */
 	persist?: boolean;
+	/** Acquirer's tool session: supplies the user-granted automation scopes for reuse-time navigation. */
+	session?: ToolSession;
+	/** Acquirer's eval invocation (`toolCallId`): an approve-once scope for the reuse-time navigation binds to it. */
+	invocationId?: string;
+	/** `browser.tabs.abandonedIdleHours` in ms; governs the once-per-browser sweep of targets inherited from crashed owners and arms the deadline reaper. */
+	abandonedIdleMs?: number;
 }
 
 export interface AcquireTabResult {
@@ -216,6 +256,16 @@ export interface RunInTabOptions {
 	timeoutMs: number;
 	signal?: AbortSignal;
 	session: ToolSession;
+	/**
+	 * Policy descriptor for this dispatch. Decided by `decideAutomationAction`
+	 * with the session's user-granted scopes immediately before the worker
+	 * receives the code. Omitted → fail safe: the run is treated as raw
+	 * arbitrary page access (`mutate` + `raw`, `browser.tab.run`), which no
+	 * ordinary origin grant covers.
+	 */
+	automation?: AutomationAction;
+	/** Eval-prelude invocation (`toolCallId`); approve-once scopes bind to exactly this. */
+	invocationId?: string;
 }
 
 export interface ReleaseTabOptions {
@@ -430,6 +480,13 @@ async function acquireTabImpl(
 				holdBrowser(browser);
 				tempHold = true;
 				await releaseTab(name, { kill: false });
+			} else if (opts.createTarget && existing.backend === "worker" && !existing.ownsPage) {
+				// The caller asked for an omp-owned tab; the name currently
+				// holds a borrowed user tab. Release (never closes it) and
+				// create the owned one instead of silently reusing.
+				holdBrowser(browser);
+				tempHold = true;
+				await releaseTab(name, { kill: false });
 			} else if (
 				(opts.allowedDomains !== undefined && !sameAllowedDomains(opts.allowedDomains, existing.allowedDomains)) ||
 				(existing.backend === "tern" && opts.target !== undefined && !(await adoptsSameBlock(existing, opts)))
@@ -443,7 +500,7 @@ async function acquireTabImpl(
 				// resume fails the open here with the same actionable
 				// error a run would raise, instead of reporting a reuse
 				// that can never execute.
-				existing.lastActivityAt = Date.now();
+				existing.lastActivityAt = now();
 				// Resume BEFORE applying `persist` below: flipping the flag
 				// first would make `isSettleManaged` reject this very
 				// resume, so reopening a frozen tab with `persist: true`
@@ -467,6 +524,13 @@ async function acquireTabImpl(
 				if (opts.persist !== undefined && existing.ownerSessionId === opts.ownerSessionId) {
 					existing.persist = opts.persist;
 				}
+				const reuseScope = durableScopeOf(existing);
+				if (reuseScope) {
+					void touchSharedTarget(reuseScope, existing.targetId, {
+						lastMeaningfulActivityAt: existing.lastActivityAt,
+						persist: existing.persist === true,
+					});
+				}
 				const reuseSteps: string[] = [];
 				if (opts.viewport && browser.kind.kind !== "cmux" && browser.kind.kind !== "tern") {
 					const dsf = opts.viewport.deviceScaleFactor;
@@ -479,6 +543,10 @@ async function acquireTabImpl(
 						`await tab.emulate({ viewport: ${JSON.stringify({ width: opts.viewport.width, height: opts.viewport.height, scale: opts.viewport.deviceScaleFactor })} });`,
 					);
 				}
+				// Reuse-time steps are dispatches like any other: an OMP-owned tab
+				// navigates freely, steering an adopted user tab to a new URL is a
+				// mutation of the user's browser.
+				const owned = existing.backend !== "worker" || existing.ownsPage;
 				const reuse = async (): Promise<void> => {
 					if (reuseSteps.length) {
 						await runInTabWithSnapshot(
@@ -487,11 +555,23 @@ async function acquireTabImpl(
 								code: reuseSteps.join("\n"),
 								timeoutMs: opts.timeoutMs,
 								signal: opts.signal,
+								session: opts.session,
+								invocationId: opts.invocationId,
+								automation: {
+									surface: "browser",
+									tier: owned ? "navigate" : "mutate",
+									action: "browser.tab.viewport",
+									target: originOf(existing.info.url),
+									consequential: false,
+									raw: false,
+									ownsTarget: owned,
+									summary: `set viewport on tab ${JSON.stringify(name)}`,
+								},
 							},
 							{ cwd: getProjectDir() },
 						);
 					}
-					if (opts.url) await navigateOpenedTab(name, opts.url, opts, startedAt);
+					if (opts.url) await navigateOpenedTab(name, opts.url, opts, startedAt, owned);
 				};
 				let note: string | undefined;
 				try {
@@ -508,6 +588,7 @@ async function acquireTabImpl(
 				}
 				// The user may have navigated or switched tabs since: the result reports where the page is now.
 				if (existing.backend === "tern") existing.info = await existing.ternTab.readyInfo();
+				refreshAbandonedDeadline();
 				return { tab: tabs.get(name)!, created: false, note };
 			}
 		} else {
@@ -618,9 +699,14 @@ async function acquireTabImpl(
 		allowedDomains: opts.allowedDomains ? [...opts.allowedDomains] : undefined,
 		kindTag: browser.kind.kind,
 		ownsPage: ownsPage(initPayload),
+		adoptedForeground:
+			initPayload.mode === "attach" &&
+			initPayload.userDriven === true &&
+			initPayload.page.kind === "borrowed" &&
+			!opts.target,
 		ownerSessionId: opts.ownerSessionId,
 		persist: opts.persist ?? false,
-		lastActivityAt: Date.now(),
+		lastActivityAt: now(),
 		frozen: false,
 		uploadDir: initPayload.uploadDir,
 		ignoreHttpsErrors: opts.ignoreHttpsErrors,
@@ -628,11 +714,26 @@ async function acquireTabImpl(
 	attachTabWorker(tab, worker);
 	tabs.set(name, tab);
 	sweepClosedTabUploads();
-	// Durably record ownership so another live omp process can reap this page if
-	// this process dies abnormally before its own teardown closes the tab.
-	const scope = sharedScopeOf(browser);
-	if (scope) void recordSharedTarget(scope, info.targetId);
-	if (opts.url) await navigateOpenedTab(name, opts.url, opts, startedAt, tab);
+	// Durably record ownership + lifecycle metadata for every target OMP
+	// created in a browser that outlives this process, so another live omp
+	// process can reap it if this one dies before its own teardown, and so
+	// the abandoned-tab reaper can prove creation after a restart. Adopted
+	// user tabs get no record — nothing can ever reap them.
+	const scope = durableScopeOf(tab);
+	if (scope) {
+		void recordOwnedTarget(tab, scope, opts.ownerSessionId);
+		// First tab on this browser handle: reap targets left by omp processes
+		// that died without teardown. Detached so a slow sweep never delays the open.
+		void sweepInheritedTargets(tab, opts.abandonedIdleMs ?? 0);
+	}
+	if (opts.url) await navigateOpenedTab(name, opts.url, opts, startedAt, tab.ownsPage, tab);
+	if (opts.abandonedIdleMs !== undefined && opts.abandonedIdleMs > 0) {
+		// Arm (or shorten) the process-wide deadline so this tab is reaped even
+		// if no further turn or open ever happens.
+		armAbandonedDeadline({ idleMs: opts.abandonedIdleMs });
+	} else {
+		refreshAbandonedDeadline();
+	}
 	return { tab, created: true };
 }
 
@@ -642,13 +743,16 @@ async function acquireTabImpl(
  * what loaded, instead of losing to the open's bare deadline. A tab this open
  * created (`created`) is kept only for that timeout: a navigation that fails
  * outright, or an open cancelled or past its deadline, closes it again so the
- * failed open leaves nothing behind.
+ * failed open leaves nothing behind. The navigation is a dispatch like any
+ * other: an OMP-owned tab (`owned`) navigates freely, steering an adopted
+ * user tab to a new URL is a mutation of the user's browser.
  */
 async function navigateOpenedTab(
 	name: string,
 	url: string,
 	opts: AcquireTabOptions,
 	startedAt: number,
+	owned: boolean,
 	created?: WorkerTabSession,
 ): Promise<void> {
 	const remainingMs = opts.timeoutMs - (performance.now() - startedAt);
@@ -661,6 +765,18 @@ async function navigateOpenedTab(
 				// tab.goto bounds itself to the cell budget less CELL_BUDGET_SLACK_MS.
 				timeoutMs: gotoMs + CELL_BUDGET_SLACK_MS,
 				signal: opts.signal,
+				session: opts.session,
+				invocationId: opts.invocationId,
+				automation: {
+					surface: "browser",
+					tier: owned ? "navigate" : "mutate",
+					action: "browser.tab.goto",
+					target: originOf(url),
+					consequential: false,
+					raw: false,
+					ownsTarget: owned,
+					summary: `navigate ${owned ? "owned" : "adopted"} tab ${JSON.stringify(name)} to ${originOf(url)}`,
+				},
 			},
 			{ cwd: getProjectDir() },
 		);
@@ -769,7 +885,7 @@ async function acquireCmuxTab(
 			cmuxAttachedSurface: attachedSurface,
 			ownerSessionId: opts.ownerSessionId,
 			persist: opts.persist ?? false,
-			lastActivityAt: Date.now(),
+			lastActivityAt: now(),
 			frozen: false,
 		};
 		tabs.set(name, tab);
@@ -857,7 +973,7 @@ async function acquireTernTab(
 			kindTag: browser.kind.kind,
 			ownerSessionId: opts.ownerSessionId,
 			persist: opts.persist ?? false,
-			lastActivityAt: Date.now(),
+			lastActivityAt: now(),
 			frozen: false,
 		};
 		tabs.set(name, tab);
@@ -871,7 +987,14 @@ async function acquireTernTab(
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
 	const result = await runInTabWithSnapshot(
 		name,
-		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal, session: opts.session },
+		{
+			code: opts.code,
+			timeoutMs: opts.timeoutMs,
+			signal: opts.signal,
+			session: opts.session,
+			automation: opts.automation,
+			invocationId: opts.invocationId,
+		},
 		{
 			cwd: opts.session.cwd,
 			browserScreenshotDir: expandBrowserScreenshotDir(opts.session),
@@ -888,6 +1011,66 @@ export async function runInTab(name: string, opts: RunInTabOptions): Promise<Run
 	return result;
 }
 
+/** Fail-safe descriptor for a dispatch that named no action: arbitrary page access. */
+const RAW_RUN_ACTION: Omit<AutomationAction, "target"> = {
+	surface: "browser",
+	tier: "mutate",
+	action: "browser.tab.run",
+	consequential: false,
+	raw: true,
+	summary: "arbitrary browser code (tab.run)",
+};
+
+/** Verbs whose policy target is where the tab is GOING, not the page it is on. */
+const DESTINATION_ACTIONS: ReadonlySet<string> = new Set(["browser.tab.goto"]);
+
+/**
+ * Decide one dispatch against the session's user-granted scopes. Called
+ * immediately before the worker receives the code — after unfreeze, after
+ * any task candidate selection — so it always sees the freshest scope set
+ * and the page's current origin. Raw access (`tab.run`, `evaluate`, raw
+ * Puppeteer/CDP) is `mutate` + `raw` no matter what the code contains, so a
+ * "read-only looking" run cannot bypass the gate; every raw action carries
+ * the fingerprint of the exact string the worker will execute. `ownsTarget`
+ * is always overwritten from supervisor state: a caller cannot promote an
+ * adopted user tab to "owned" to unlock free navigation.
+ *
+ * Returns the binding the worker must re-prove against the live document
+ * for non-raw mutations (the decided origin), or undefined for reads and raw
+ * runs (raw is authorized by code, not origin).
+ */
+function gateDispatch(
+	tab: TabSession,
+	opts: { code: string; session?: ToolSession; automation?: AutomationAction; invocationId?: string },
+): RunBinding | undefined {
+	const requested = opts.automation ?? { ...RAW_RUN_ACTION, target: originOf(tab.info.url) };
+	const invocationId = requested.invocationId ?? opts.invocationId;
+	const identity = {
+		ownsTarget: tab.backend !== "worker" || tab.ownsPage,
+		...(invocationId ? { invocationId } : {}),
+	};
+	const action: AutomationAction = requested.raw
+		? {
+				...requested,
+				tier: "mutate",
+				codeFingerprint: requested.codeFingerprint ?? fingerprintAutomationCode(opts.code),
+				...identity,
+			}
+		: { ...requested, ...identity };
+	const scopes = opts.session ? getAutomationScopes(opts.session, now()) : [];
+	const verdict = decideAutomationAction(action, { scopes, now: now() });
+	if (verdict.verdict === "deny") throw automationDeniedError(verdict);
+	// Bind every decision that was ABOUT the current page (click/type/... on
+	// the origin the tab showed when classified). Raw runs are authorized by
+	// code, reads need no scope, and `goto` was decided for its destination —
+	// the page it leaves is irrelevant to that grant. The rule deliberately
+	// ignores `tab.info` here: a ready-info refresh landing between
+	// classification and this gate must not turn a bound action into an
+	// unbound one.
+	if (action.raw || action.tier === "read" || DESTINATION_ACTIONS.has(action.action)) return undefined;
+	return { target: action.target, action: action.action };
+}
+
 async function runInTabWithSnapshot(
 	name: string,
 	opts: {
@@ -897,6 +1080,8 @@ async function runInTabWithSnapshot(
 		session?: ToolSession;
 		/** This run follows a re-adoption that a detach before the previous attempt caused; it is not retried again. */
 		readopted?: boolean;
+		automation?: AutomationAction;
+		invocationId?: string;
 	},
 	snapshot: SessionSnapshot,
 ): Promise<RunResultOk> {
@@ -931,7 +1116,7 @@ async function runInTabWithSnapshot(
 	// for a not-yet-active run and then execute anyway.
 	if (opts.signal?.aborted) throw new ToolAbortError();
 	// A run is use: refresh the idle clock for idle-close.
-	tab.lastActivityAt = Date.now();
+	tab.lastActivityAt = now();
 	// A retry after a detach gets only what is left of this call's budget, not a fresh one.
 	const startedAt = performance.now();
 	const id = Snowflake.next();
@@ -997,7 +1182,23 @@ async function runInTabWithSnapshot(
 		const notAlive = new ToolError(`Tab ${JSON.stringify(name)} is not alive. Open it first with action:"open".`);
 		return await Promise.race([promise, Promise.reject(notAlive)]);
 	}
-	// A worker that exited during the resume already failed this run (its exit handler rejected it) and is being
+	// Permission gate: the last thing before the code leaves this process.
+	let binding: RunBinding | undefined;
+	try {
+		binding = gateDispatch(tab, opts);
+	} catch (error) {
+		tab.pending.delete(id);
+		throw error;
+	}
+	// Background-tab throttling on a user-driven browser: a relay/connected
+	// tab OMP owns but that is not the window's active tab stops producing
+	// frames, so clicks/fills time out although the DOM looks fine. Resume it
+	// — lifecycle `active` + focus emulation — right before input. Borrowed
+	// user tabs are left alone: emulating focus there changes the user's page.
+	if (tab.backend === "worker" && tab.ownsPage && (tab.kindTag === "relay" || tab.kindTag === "connected")) {
+		await resumeOwnedUserDrivenTab(tab);
+	}
+	// A worker that exited during the resumes already failed this run (its exit handler rejected it) and is being
 	// replaced; dispatching now would run the code on the replacement after the caller was told it failed.
 	if (tab.backend === "worker" && (tab.worker !== dispatchWorker || tab.workerRecovery)) {
 		tab.pending.delete(id);
@@ -1014,6 +1215,18 @@ async function runInTabWithSnapshot(
 			// rejected it — `Promise.withResolvers` settles on the first
 			// call and later resolve/reject are no-ops, so the tab-close
 			// error still wins the race.
+			// Same live-document binding as the worker path: neither cmux nor Tern
+			// has an in-process page, so ask the surface for its current URL now.
+			if (binding) {
+				const live =
+					tab.backend === "cmux"
+						? await tab.cmuxTab.readyInfo(tab.info.viewport).catch(() => undefined)
+						: await tab.ternTab.readyInfo().catch(() => undefined);
+				if (live) tab.info = live;
+				if (!live || originOf(live.url) !== binding.target) {
+					throw new ToolError(targetChangedDenial(binding, live?.url));
+				}
+			}
 			runInProcessTab(tab.backend === "cmux" ? tab.cmuxTab : tab.ternTab, {
 				code: opts.code,
 				timeoutMs: opts.timeoutMs,
@@ -1026,11 +1239,13 @@ async function runInTabWithSnapshot(
 			tab.pending.delete(id);
 			// Completion is use too: a run outlasting the idle timeout must
 			// not look stale to the sweep right after it finishes.
-			tab.lastActivityAt = Date.now();
+			tab.lastActivityAt = now();
 			// Tern pages report url/title through the tab itself (no worker `ready`).
 			if (tab.backend === "tern") {
 				tab.info = { ...tab.info, url: tab.ternTab.url(), title: tab.ternTab.lastTitle };
 			}
+			syncDurableActivity(tab);
+			refreshAbandonedDeadline();
 		}
 	}
 	const abort = (): void => {
@@ -1048,6 +1263,7 @@ async function runInTabWithSnapshot(
 				code: opts.code,
 				timeoutMs: opts.timeoutMs,
 				session: snapshot,
+				binding,
 			});
 		} catch (error) {
 			// Bun throws `InvalidStateError` once the worker is gone, which can precede its exit event.
@@ -1163,7 +1379,9 @@ async function runInTabWithSnapshot(
 		tab.pending.delete(id);
 		// Completion is use too: a run outlasting the idle timeout must
 		// not look stale to the sweep right after it finishes.
-		tab.lastActivityAt = Date.now();
+		tab.lastActivityAt = now();
+		syncDurableActivity(tab);
+		refreshAbandonedDeadline();
 	}
 }
 
@@ -1274,7 +1492,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		// is a no-op — `promise` still settles with the tab-close error via
 		// the `reject` call below. Without it, a run that isn't currently
 		// making a socket request (e.g. `await wait(60_000)`) would keep
-		// `runCmuxCode` blocked until timeout even after `pending.reject`
+		// `runInProcessTab` blocked until timeout even after `pending.reject`
 		// unblocked the caller (issue #4499 review feedback).
 		pending.closeAc?.abort(closeError);
 		pending.reject(closeError);
@@ -1344,6 +1562,9 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		return true;
 	}
 	let cleanupError: unknown;
+	// The durable record is forgotten only once the target is confirmed gone. A
+	// target that survived a failed close stays recorded so a later sweep (this
+	// process's crash transfer) can still find it.
 	let targetCloseFailed = false;
 	if (wasAlive) {
 		try {
@@ -1364,7 +1585,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		try {
 			// `false` is "not confirmed closed" (the CDP session could not be
 			// created, or `Target.getTargets` failed) — the same unconfirmed
-			// state the timeout reports as an error, so both mark the tab.
+			// state the timeout reports as an error, so both keep the record.
 			targetCloseFailed = !(await waitForTabCleanup(
 				tab,
 				timeoutMs,
@@ -1386,27 +1607,28 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		cleanupError ??= error;
 	} finally {
 		tabs.delete(name);
-		const scope = sharedScopeOf(tab.browser);
-		if (scope) {
-			if (targetCloseFailed) {
-				// The target outlived its close, so it is still open in the
-				// shared Chromium. Keep its durable ownership record — the only
-				// handle a later reap has on it — instead of forgetting a target
-				// that was never closed, and re-check the browser itself: a
-				// Chromium that stopped answering its CDP endpoint holds every
-				// unclosable target and must be replaced, not left to grow until
-				// the last omp client in the project exits.
-				recheckSharedBrowser(scope);
+		const scope = durableScopeOf(tab);
+		if (!targetCloseFailed) {
+			if (scope) void forgetSharedTarget(scope, tab.targetId);
+		} else {
+			// The target outlived its close, so it is still open in the
+			// browser. A durable ownership record stays — the only handle a
+			// later reap has on it — and the shared agent Chromium is re-checked:
+			// one that stopped answering its CDP endpoint holds every unclosable
+			// target and must be replaced, not left to grow until the last omp
+			// client exits.
+			const shared = sharedScopeOf(tab.browser);
+			if (shared) {
+				recheckSharedBrowser(shared);
 			} else {
-				void forgetSharedTarget(scope, tab.targetId);
+				// Nothing here retries it; a relay closes a tab of an offline browser once that browser reconnects.
+				logger.warn("Could not confirm a browser tab omp opened was closed; it may still be open", {
+					name,
+					targetId: tab.targetId,
+				});
 			}
-		} else if (targetCloseFailed) {
-			// Nothing here can retry it; a relay closes a tab of an offline browser once that browser reconnects.
-			logger.warn("Could not confirm a browser tab omp opened was closed; it may still be open", {
-				name,
-				targetId: tab.targetId,
-			});
 		}
+		refreshAbandonedDeadline();
 	}
 	if (cleanupError) throw cleanupError;
 	return true;
@@ -1654,9 +1876,9 @@ export async function releaseIdleTabsForOwner(
 	opts: { idleMs: number } & ReleaseTabOptions = { idleMs: 0 },
 ): Promise<number> {
 	if (!ownerId) return 0;
-	const now = Date.now();
+	const nowMs = now();
 	const names = [...tabs.values()]
-		.filter(tab => isIdleCloseCandidate(tab, ownerId, now, opts.idleMs))
+		.filter(tab => isIdleCloseCandidate(tab, ownerId, nowMs, opts.idleMs))
 		.map(tab => tab.name);
 	let count = 0;
 	// Program-order token: a cancel landing after this increment suppresses
@@ -1668,7 +1890,7 @@ export async function releaseIdleTabsForOwner(
 			// loop awaits worker cleanup, during which a later candidate may
 			// have been reused or started a run.
 			const current = tabs.get(name);
-			if (!current || !isIdleCloseCandidate(current, ownerId, Date.now(), opts.idleMs)) continue;
+			if (!current || !isIdleCloseCandidate(current, ownerId, now(), opts.idleMs)) continue;
 			try {
 				if (await releaseTab(name, opts)) count++;
 			} catch (error) {
@@ -1713,7 +1935,7 @@ const IDLE_DUE_RETRY_MS = 30_000;
  * checkpoints (turn settle, open) handle the due case synchronously; the
  * timer covers abandonment with no further activity.
  */
-export function earliestIdleCloseInMs(ownerId: string, idleMs: number, nowMs: number = Date.now()): number | undefined {
+export function earliestIdleCloseInMs(ownerId: string, idleMs: number, nowMs: number = now()): number | undefined {
 	if (!ownerId || !(idleMs > 0)) return undefined;
 	let earliest: number | undefined;
 	for (const tab of tabs.values()) {
@@ -1802,6 +2024,7 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	const browserWSEndpoint = browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
 	if (browser.kind.kind === "headless") {
+		if (opts.createTarget) throw new ToolError(NEW_TAB_KIND_ERROR);
 		return {
 			mode: "headless",
 			browserWSEndpoint,
@@ -1821,12 +2044,19 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	}
 
 	const userDriven = browser.kind.kind === "connected" || browser.kind.kind === "relay";
+	if (opts.createTarget) {
+		if (opts.target) throw new ToolError(NEW_TAB_TARGET_ERROR);
+		if (!userDriven) throw new ToolError(NEW_TAB_KIND_ERROR);
+	}
 	let page: AttachPage;
-	if (browser.kind.kind === "relay" && !opts.target) {
-		// A relay open without a target gets its own background tab, leaving the user's
-		// selected tab alone, in the browser of the tab omp used last on this relay.
-		// Focus emulation keeps it interactive without raising it.
-		page = { kind: "create", nearTargetId: lastUsedTargetOn(browser) };
+	if (opts.createTarget || (browser.kind.kind === "relay" && !opts.target)) {
+		// A relay open without a target, or any user-driven open with `app.new_tab`, gets its own
+		// background tab, leaving the user's selected tab alone; on the relay in the browser of the
+		// tab omp used last there. Focus emulation keeps it interactive without raising it.
+		page = {
+			kind: "create",
+			nearTargetId: browser.kind.kind === "relay" ? lastUsedTargetOn(browser) : undefined,
+		};
 	} else {
 		// A connected browser without a target adopts the tab the user is looking at
 		// rather than whichever CDP lists first; an explicit target is borrowed.
@@ -1862,6 +2092,37 @@ function lastUsedTargetOn(browser: PuppeteerBrowserHandle): string | undefined {
 		if (!last || tab.lastActivityAt > last.lastActivityAt) last = tab;
 	}
 	return last?.targetId;
+}
+
+const NEW_TAB_TARGET_ERROR =
+	"browser open: app.new_tab and app.target are mutually exclusive — a fresh tab has no existing target to select.";
+const NEW_TAB_KIND_ERROR =
+	"browser open: app.new_tab is only for user-driven browsers (app.relay or app.cdp_url); headless and spawned browsers already own their page.";
+
+/**
+ * Resume an OMP-owned tab on a user-driven browser before input: Chrome
+ * throttles background tabs (no frames, deferred input), and the relay's
+ * `chrome.debugger` path cannot raise the tab without stealing the user's
+ * focus. Lifecycle `active` plus focus emulation keeps it interactive in the
+ * background. Best-effort: a failure only logs and the dispatch proceeds.
+ */
+async function resumeOwnedUserDrivenTab(tab: WorkerTabSession): Promise<void> {
+	const target = await findTargetForTab(tab).catch(() => undefined);
+	if (!target) return;
+	const session = await target.createCDPSession().catch(() => null);
+	if (!session) return;
+	try {
+		await session.send("Page.enable").catch(() => undefined);
+		await session.send("Page.setWebLifecycleState", { state: "active" }).catch(() => undefined);
+		await session.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => undefined);
+	} finally {
+		await session.detach().catch(() => undefined);
+	}
+}
+
+/** Test hook for the pre-input resume without a tabs-map entry. */
+export function resumeOwnedUserDrivenTabForTest(tab: WorkerTabSession): Promise<void> {
+	return resumeOwnedUserDrivenTab(tab);
 }
 
 function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
@@ -2131,6 +2392,7 @@ async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: s
 		await tab.ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
 	await releaseBrowser(tab.browser, { kill: false });
 	tabs.delete(name);
+	refreshAbandonedDeadline();
 }
 
 /**
@@ -2157,18 +2419,24 @@ async function forceKillTabTeardown(tab: WorkerTabSession): Promise<void> {
 	}
 	await releaseBrowser(tab.browser, { kill: false });
 	tabs.delete(tab.name);
-	const scope = sharedScopeOf(tab.browser);
+	const scope = durableScopeOf(tab);
 	if (scope) {
-		if (targetClosed) void forgetSharedTarget(scope, tab.targetId);
-		else recheckSharedBrowser(scope);
+		if (targetClosed) {
+			void forgetSharedTarget(scope, tab.targetId);
+		} else {
+			const shared = sharedScopeOf(tab.browser);
+			if (shared) recheckSharedBrowser(shared);
+		}
 	}
+	refreshAbandonedDeadline();
 }
 
 /**
  * Best-effort close of a specific page target in the browser. Close through
  * the browser CDP session rather than `page.close()`: a page whose navigation
  * wedged during initialization can make Puppeteer's page close wait for the
- * protocol timeout, retaining the cleanup hold for tens of seconds.
+ * protocol timeout, retaining the cleanup hold for tens of seconds. Returns
+ * true only when the target is confirmed gone (closed, or already absent).
  */
 async function closeTargetById(
 	browser: PuppeteerBrowserHandle,
@@ -2179,15 +2447,66 @@ async function closeTargetById(
 	return await closeCdpTarget(browser.browser, targetId, confirmTimeoutMs);
 }
 
+// ---- durable ownership and the lifecycle clock -----------------------------
+
 /**
- * Durable-ownership scope for a browser handle, or undefined when the handle is
- * not the project-shared broker-owned Chromium (the only browser whose targets
- * outlive their creating process and thus need cross-process orphan reaping).
+ * Injectable wall clock. Every lifecycle decision (idle-close, abandoned
+ * reaper, durable activity stamps) reads this so tests can drive the
+ * six-hour path without waiting. Production never overrides it.
+ */
+let clock: () => number = Date.now;
+function now(): number {
+	return clock();
+}
+
+/** Test seam: replace the supervisor clock; returns a restore function. */
+export function setTabClockForTest(next: (() => number) | undefined): () => void {
+	const previous = clock;
+	clock = next ?? Date.now;
+	return () => {
+		clock = previous;
+	};
+}
+
+/**
+ * Durable-ownership scope for a tab, or undefined when nothing outlives this
+ * process that a reaper could act on: the machine-global agent Chromium's
+ * pages and relay tabs OMP created qualify; borrowed user
+ * tabs, process-local test browsers, spawned apps and cmux surfaces do not.
+ */
+function durableScopeOf(tab: TabSession): SharedTargetScope | undefined {
+	if (tab.backend !== "worker" || !tab.ownsPage) return undefined;
+	const browser = tab.browser;
+	if (browser.kind.kind === "headless" && browser.sharedDaemon) {
+		return { runtimeDir: browser.sharedDaemon.runtimeDir, daemonName: browser.sharedDaemon.name };
+	}
+	if (browser.kind.kind === "relay") {
+		return { runtimeDir: getGlobalDaemonRuntimeDir("browser-relay"), daemonName: RELAY_DAEMON_NAME };
+	}
+	return undefined;
+}
+
+/**
+ * Scope of the machine-global shared agent Chromium a tab lives in, or
+ * undefined for every other browser. Only this browser is health-checked and
+ * replaced after a close it could not confirm ({@link recheckSharedBrowser}).
  */
 function sharedScopeOf(browser: BrowserHandle): SharedTargetScope | undefined {
 	if (!("browser" in browser)) return undefined;
 	if (browser.kind.kind !== "headless" || !browser.sharedDaemon) return undefined;
-	return { projectDir: browser.sharedDaemon.projectDir, daemonName: browser.sharedDaemon.name };
+	return { runtimeDir: browser.sharedDaemon.runtimeDir, daemonName: browser.sharedDaemon.name };
+}
+
+/** Browser generation a target id belongs to; `unknown` (never matches a live generation) on a legacy relay. */
+function durableGenerationOf(browser: PuppeteerBrowserHandle): string {
+	return browser.sharedDaemon?.generation ?? browser.generation ?? "unknown";
+}
+
+/** Mirror the in-memory meaningful-activity stamp into the durable record (fire-and-forget). */
+function syncDurableActivity(tab: TabSession): void {
+	const scope = durableScopeOf(tab);
+	if (!scope) return;
+	void touchSharedTarget(scope, tab.targetId, { lastMeaningfulActivityAt: tab.lastActivityAt });
 }
 
 /**
@@ -2525,4 +2844,509 @@ function errorFromWorkerEvent(event: ErrorEvent): Error {
 	if (event.error instanceof Error) return event.error;
 	if (event.message) return new Error(event.message);
 	return new Error("Unknown tab worker error");
+}
+
+// ---- abandoned-tab reaper ---------------------------------------------------
+
+/** Page-level facts that protect a tab from the abandoned reaper. */
+export interface TabProtectionProbe {
+	/** URL path/query names a login/auth/verification step. */
+	loginPath: boolean;
+	/** A password or one-time-code field is present. */
+	credentialField: boolean;
+	/** A form control or contenteditable holds unsaved input, or the page registered `onbeforeunload`. */
+	unsavedInput: boolean;
+	/** The document is the visible tab of its window. */
+	visible: boolean;
+}
+
+/** In-page probe, evaluated read-only through a supervisor-owned CDP session. Returns JSON-serialisable facts only. */
+const PROTECTION_PROBE_EXPRESSION = String.raw`(() => {
+	const loc = String(location.pathname + location.search);
+	const loginPath = /(^|[\/?&#._-])(log-?in|sign-?in|auth|oauth|sso|password|passwd|verify|verification|otp|2fa|mfa|challenge|consent|checkpoint)([\/?&#._-]|$)/i.test(loc);
+	const credentialField = !!document.querySelector('input[type="password"],input[autocomplete="one-time-code"],input[autocomplete="current-password"],input[autocomplete="new-password"],input[name*="otp" i],input[name*="passcode" i]');
+	let unsavedInput = typeof window.onbeforeunload === "function";
+	if (!unsavedInput) {
+		for (const el of document.querySelectorAll("input,textarea,select")) {
+			if (el.disabled || el.readOnly) continue;
+			if (el instanceof HTMLSelectElement) {
+				for (const opt of el.options) if (opt.selected !== opt.defaultSelected) { unsavedInput = true; break; }
+			} else if (el.type === "checkbox" || el.type === "radio") {
+				if (el.checked !== el.defaultChecked) unsavedInput = true;
+			} else if (el.type === "hidden" || el.type === "submit" || el.type === "button") {
+				continue;
+			} else if (el.value !== el.defaultValue && el.value !== "") {
+				unsavedInput = true;
+			}
+			if (unsavedInput) break;
+		}
+	}
+	if (!unsavedInput) {
+		for (const el of document.querySelectorAll('[contenteditable=""],[contenteditable="true"],[role="textbox"]')) {
+			if ((el.textContent || "").trim().length > 0) { unsavedInput = true; break; }
+		}
+	}
+	return { loginPath, credentialField, unsavedInput, visible: document.visibilityState === "visible" };
+})()`;
+
+/**
+ * Probe a page for reaper protections. Fails SAFE: any failure (no target,
+ * no session, evaluation error, frozen renderer) reports every protection as
+ * engaged so the tab is retained.
+ */
+export async function probeTargetProtection(browser: Browser, targetId: string): Promise<TabProtectionProbe> {
+	const engaged: TabProtectionProbe = { loginPath: true, credentialField: true, unsavedInput: true, visible: true };
+	let target: Target | undefined;
+	for (const candidate of browser.targets()) {
+		if ((await targetIdForTarget(candidate).catch(() => "")) === targetId) {
+			target = candidate;
+			break;
+		}
+	}
+	if (!target) return engaged;
+	const session = await target.createCDPSession().catch(() => null);
+	if (!session) return engaged;
+	try {
+		const result = await withTimeout(
+			session.send("Runtime.evaluate", {
+				expression: PROTECTION_PROBE_EXPRESSION,
+				returnByValue: true,
+				awaitPromise: false,
+			}),
+			5_000,
+			"protection probe timed out",
+		);
+		const value = result.result.value as Partial<TabProtectionProbe> | undefined;
+		if (!value || result.exceptionDetails) return engaged;
+		return {
+			loginPath: value.loginPath !== false,
+			credentialField: value.credentialField !== false,
+			unsavedInput: value.unsavedInput !== false,
+			visible: value.visible !== false,
+		};
+	} catch {
+		return engaged;
+	} finally {
+		await session.detach().catch(() => undefined);
+	}
+}
+
+/** Active downloads per browser handle, keyed by the initiating frame id (== page target id for main frames). */
+const activeDownloads = new WeakMap<PuppeteerBrowserHandle, Map<string, Set<string>>>();
+const downloadTrackers = new WeakSet<PuppeteerBrowserHandle>();
+
+/**
+ * Best-effort download tracking on the browser session: `Browser.setDownloadBehavior`
+ * with events enabled reports begin/progress per frame. Relay browsers expose
+ * no browser target, so the tracker silently does nothing there.
+ */
+async function ensureDownloadTracker(browser: PuppeteerBrowserHandle): Promise<void> {
+	if (downloadTrackers.has(browser) || browser.kind.kind === "relay") return;
+	downloadTrackers.add(browser);
+	let session: CDPSession | null;
+	try {
+		session = await browser.browser.target().createCDPSession();
+	} catch {
+		return;
+	}
+	const byFrame = new Map<string, Set<string>>();
+	activeDownloads.set(browser, byFrame);
+	const guidFrame = new Map<string, string>();
+	session.on("Browser.downloadWillBegin", (event: { frameId: string; guid: string }) => {
+		guidFrame.set(event.guid, event.frameId);
+		let guids = byFrame.get(event.frameId);
+		if (!guids) {
+			guids = new Set();
+			byFrame.set(event.frameId, guids);
+		}
+		guids.add(event.guid);
+	});
+	session.on("Browser.downloadProgress", (event: { guid: string; state: string }) => {
+		if (event.state === "inProgress") return;
+		const frameId = guidFrame.get(event.guid);
+		guidFrame.delete(event.guid);
+		if (frameId === undefined) return;
+		const guids = byFrame.get(frameId);
+		guids?.delete(event.guid);
+		if (guids?.size === 0) byFrame.delete(frameId);
+	});
+	try {
+		await session.send("Browser.setDownloadBehavior", { behavior: "default", eventsEnabled: true });
+	} catch (error) {
+		logger.debug("Browser download tracking unavailable; reaper treats downloads as unknown", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		activeDownloads.delete(browser);
+		await session.detach().catch(() => undefined);
+	}
+}
+
+/** Whether a tracked download is in flight for a tab; `undefined` when tracking is unavailable on its browser. */
+function hasActiveDownload(tab: WorkerTabSession): boolean | undefined {
+	const byFrame = activeDownloads.get(tab.browser);
+	if (!byFrame) return undefined;
+	return (byFrame.get(tab.targetId)?.size ?? 0) > 0;
+}
+
+/** Why an abandoned-reaper candidate was retained (or `close` when nothing protects it). */
+export type AbandonedVerdict =
+	| "close"
+	| "not-owned"
+	| "persist"
+	| "busy"
+	| "fresh"
+	| "download"
+	| "login"
+	| "unsaved-input"
+	| "foreground"
+	| "unprovable";
+
+/** Injectable seams for the abandoned reaper; defaults touch the real page. */
+export interface AbandonedReapOptions {
+	/** Internal: a timer-driven sweep must not re-arm from inside the arm path. */
+	rearm?: boolean;
+	/** Idle threshold; `browser.tabs.abandonedIdleHours * 3_600_000`. Non-positive disables. */
+	idleMs: number;
+	/** Restrict to tabs created by this session; omitted sweeps every tab this process created. */
+	ownerId?: string;
+	/** Page probe override (tests). */
+	probe?: (tab: WorkerTabSession) => Promise<TabProtectionProbe>;
+	/** Download check override (tests). */
+	downloads?: (tab: WorkerTabSession) => boolean | undefined;
+	timeoutMs?: number;
+}
+
+/**
+ * Decide whether one in-process tab is abandoned. Pure over the tab's state
+ * plus the supplied probe results, so every protection is unit-testable:
+ *  - only OMP-created pages (`ownsPage`) — borrowed user tabs are `not-owned`;
+ *  - `persist`, an in-flight run, activity within `idleMs` retain;
+ *  - an active (or unknowable) download retains;
+ *  - login/auth URL or credential field, unsaved input, and being the visible
+ *    tab of a user-driven window retain (headless has no user to protect).
+ */
+export function classifyAbandoned(
+	tab: TabSession,
+	nowMs: number,
+	idleMs: number,
+	probe: TabProtectionProbe | undefined,
+	download: boolean | undefined,
+): AbandonedVerdict {
+	if (tab.backend !== "worker" || !tab.ownsPage || tab.state !== "alive") return "not-owned";
+	if (tab.persist) return "persist";
+	if (tab.pending.size > 0) return "busy";
+	if (!(idleMs > 0) || nowMs - tab.lastActivityAt < idleMs) return "fresh";
+	if (download !== false) return "download";
+	if (!probe) return "unprovable";
+	if (probe.loginPath || probe.credentialField) return "login";
+	if (probe.unsavedInput) return "unsaved-input";
+	if (probe.visible && tab.kindTag !== "headless") return "foreground";
+	return "close";
+}
+
+/**
+ * Close OMP-created tabs of this process abandoned for `idleMs` (six hours by
+ * default) unless protected. Distinct from the short `browser.idleCloseSec`
+ * backstop: that one only ever touches non-persistent headless worker tabs
+ * at turn settle; this one covers every tab OMP created — headless pages and
+ * relay/connected tabs omp opened — and consults the page before closing.
+ * Never throws; a wedged close counts as retained.
+ */
+export async function reapAbandonedTabs(
+	opts: AbandonedReapOptions,
+): Promise<{ closed: string[]; retained: Record<string, AbandonedVerdict> }> {
+	const closed: string[] = [];
+	const retained: Record<string, AbandonedVerdict> = {};
+	if (!(opts.idleMs > 0)) return { closed, retained };
+	const candidates = [...tabs.values()].filter(
+		(tab): tab is WorkerTabSession =>
+			tab.backend === "worker" &&
+			tab.ownsPage &&
+			(opts.ownerId === undefined || tab.ownerSessionId === opts.ownerId),
+	);
+	for (const tab of candidates) {
+		// Cheap in-memory checks first; only a due, unprotected candidate pays for a page probe.
+		const early = classifyAbandoned(tab, now(), opts.idleMs, undefined, false);
+		if (early !== "unprovable") {
+			retained[tab.name] = early;
+			continue;
+		}
+		if (!opts.downloads) await ensureDownloadTracker(tab.browser);
+		const download = (opts.downloads ?? hasActiveDownload)(tab);
+		// A relay browser cannot report downloads; a page-level download there
+		// is not distinguishable, so treat "unknown" as not-downloading ONLY on
+		// relay (its owned tabs are protected by the visibility probe instead).
+		const downloadKnown = download ?? (tab.kindTag === "relay" ? false : undefined);
+		// A settle-frozen renderer may not service `Runtime.evaluate`; a timed
+		// out probe would read as "all protections engaged" (a false `login`)
+		// and spin the 15-minute retry forever. Resume first; a page that will
+		// not resume is unprovable and stays. Refreeze afterwards when kept.
+		const wasFrozen = tab.frozen;
+		if (wasFrozen && !(await unfreezeTabSession(tab))) {
+			retained[tab.name] = "unprovable";
+			continue;
+		}
+		const probe = await (
+			opts.probe ?? (candidate => probeTargetProtection(candidate.browser.browser, candidate.targetId))
+		)(tab);
+		const verdict = classifyAbandoned(tab, now(), opts.idleMs, probe, downloadKnown);
+		if (verdict !== "close") {
+			retained[tab.name] = verdict;
+			if (wasFrozen && tabs.get(tab.name) === tab) await setTabFrozen(tab, true);
+			continue;
+		}
+		// Revalidate against the live map: the probe awaited, and a run may have started.
+		if (tabs.get(tab.name) !== tab || tab.pending.size > 0) {
+			retained[tab.name] = "busy";
+			continue;
+		}
+		try {
+			if (await releaseTab(tab.name, { kill: false, timeoutMs: opts.timeoutMs })) closed.push(tab.name);
+		} catch (error) {
+			retained[tab.name] = "busy";
+			logger.debug("Failed to close abandoned browser tab; continuing", {
+				name: tab.name,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	if (closed.length > 0) logger.debug("Closed abandoned browser tabs", { closed, retained });
+	// Whatever survived (protected or not yet due) gets the next deadline.
+	if (opts.rearm !== false) armAbandonedDeadline(opts);
+	return { closed, retained };
+}
+
+// ---- abandoned deadline timer (the controller between turns) ------------------
+
+/**
+ * ONE per-process one-shot timer for the earliest owned-tab expiry. Turn
+ * settle and open only run the reaper when they happen; a chat left idle for
+ * six hours has neither, so this timer is what actually closes its tabs.
+ * Always `unref()`'d: it never keeps a print/RPC process alive. Re-armed by
+ * every reap, open, release and activity; cancelled on session dispose.
+ * Owner scoping is deliberately process-wide — the timer sweeps every tab
+ * this process created, each still judged by its own owner/persist state.
+ */
+let abandonedTimer: NodeJS.Timeout | undefined;
+let abandonedTimerOpts: AbandonedReapOptions | undefined;
+/** Retry cadence when the due candidate was protected (busy/login/dirty/...): recheck rather than wait a full period. */
+const ABANDONED_RETRY_MS = 15 * 60_000;
+/** Injectable timer primitives so the deadline path is testable without real waits. */
+let abandonedTimers: {
+	set: (fn: () => void, ms: number) => NodeJS.Timeout;
+	clear: (timer: NodeJS.Timeout) => void;
+} = {
+	set: (fn, ms) => {
+		const timer = setTimeout(fn, ms);
+		timer.unref();
+		return timer;
+	},
+	clear: timer => clearTimeout(timer),
+};
+
+/** Test seam: replace the deadline timer primitives; returns a restore function. */
+export function setAbandonedTimersForTest(next: typeof abandonedTimers | undefined): () => void {
+	const previous = abandonedTimers;
+	abandonedTimers = next ?? previous;
+	return () => {
+		abandonedTimers = previous;
+	};
+}
+
+/**
+ * Milliseconds until the earliest owned tab reaches `idleMs` idle: `0` when
+ * one already has, undefined when this process owns no eligible tab.
+ * `persist` tabs and adopted tabs never produce a deadline.
+ */
+export function earliestAbandonedInMs(idleMs: number, nowMs: number = now()): number | undefined {
+	if (!(idleMs > 0)) return undefined;
+	let earliest: number | undefined;
+	for (const tab of tabs.values()) {
+		if (tab.backend !== "worker" || !tab.ownsPage || tab.state !== "alive" || tab.persist) continue;
+		const remaining = idleMs - (nowMs - tab.lastActivityAt);
+		if (remaining <= 0) return 0;
+		earliest = earliest === undefined ? remaining : Math.min(earliest, remaining);
+	}
+	return earliest;
+}
+
+/** Drop the pending deadline (session dispose, setting disabled). */
+export function cancelAbandonedDeadline(): void {
+	if (abandonedTimer !== undefined) abandonedTimers.clear(abandonedTimer);
+	abandonedTimer = undefined;
+	abandonedTimerOpts = undefined;
+}
+
+/** Test probe: whether a deadline is currently armed. */
+export function hasAbandonedDeadlineForTest(): boolean {
+	return abandonedTimer !== undefined;
+}
+
+/**
+ * (Re)arm the deadline for the earliest owned-tab expiry. The firing sweep
+ * runs `reapAbandonedTabs` with every protection and re-arms itself for the
+ * survivors; a due-but-protected tab is rechecked on the retry cadence.
+ */
+export function armAbandonedDeadline(opts: AbandonedReapOptions): void {
+	cancelAbandonedDeadline();
+	if (!(opts.idleMs > 0)) return;
+	const delay = earliestAbandonedInMs(opts.idleMs);
+	if (delay === undefined) return;
+	const wait = delay <= 0 ? ABANDONED_RETRY_MS : Math.min(delay, 2_147_483_647);
+	// The timer sweeps every tab this process created, not only the arming session's.
+	const sweep: AbandonedReapOptions = { ...opts, ownerId: undefined, rearm: false };
+	abandonedTimerOpts = sweep;
+	abandonedTimer = abandonedTimers.set(() => {
+		abandonedTimer = undefined;
+		void reapAbandonedTabs(sweep)
+			.catch(() => undefined)
+			.then(() => {
+				// A cancel or newer arm during the sweep wins.
+				if (abandonedTimer === undefined && abandonedTimerOpts === sweep) armAbandonedDeadline(sweep);
+			});
+	}, wait);
+}
+
+/** Activity/open/release hook: shorten or extend the armed deadline to match the tabs map. */
+function refreshAbandonedDeadline(): void {
+	if (abandonedTimerOpts) armAbandonedDeadline(abandonedTimerOpts);
+}
+
+/**
+ * Policy for targets inherited from a crashed owner (`reapOrphanSharedTargets`
+ * `decide` hook).
+ *  - Headless (no user in front): a legacy id-only record proves OMP creation
+ *    but nothing else and keeps the issue #10022 behaviour (close), as does a
+ *    non-persistent v2 record; a `persist` record is honoured until idle past
+ *    `idleMs` AND the page probe shows no login/unsaved-input protection.
+ *  - Relay/connected (the user's visible browser): every record — persist or
+ *    not — goes through the same idle + probe protections as a live-owned tab;
+ *    a half-typed form is never closed 15 s after its owner crashed. Relay
+ *    records must additionally match the live tab's marker (the extension's
+ *    per-tab UUID); an unmarked or differently marked tab is never touched.
+ */
+export function orphanDecisionFor(
+	browser: Browser,
+	opts: { idleMs: number; kind: BrowserKindTag; liveMarkers?: ReadonlyMap<string, string> },
+): (target: OrphanTarget) => Promise<OrphanDecision> {
+	return async target => {
+		const record = target.record;
+		if (opts.kind === "relay") {
+			if (!record?.marker) return "retain";
+			const live = opts.liveMarkers?.get(target.targetId);
+			if (live === undefined) return "discard"; // tab gone (or never marked): nothing to close
+			if (live !== record.marker) return "retain";
+		}
+		if (!record) return opts.kind === "headless" ? "close" : "retain";
+		if (opts.kind === "headless" && !record.persist) return "close";
+		if (!(opts.idleMs > 0) || now() - record.lastMeaningfulActivityAt < opts.idleMs) return "retain";
+		const probe = await probeTargetProtection(browser, target.targetId);
+		if (probe.loginPath || probe.credentialField || probe.unsavedInput) return "retain";
+		if (probe.visible && opts.kind !== "headless") return "retain";
+		return "close";
+	};
+}
+
+/** Browser handles whose inherited (crashed-owner) targets this process already swept. */
+const inheritedSwept = new WeakSet<PuppeteerBrowserHandle>();
+
+/** Bridge-side marker minting is asynchronous to `Target.createTarget`; a few short retries cover it. */
+const RELAY_MARKER_ATTEMPTS = 5;
+const RELAY_MARKER_RETRY_MS = 200;
+
+/**
+ * Durably record an OMP-created target. Relay targets additionally store the
+ * extension's per-tab marker (from the bridge's extended `Target.getTargets`),
+ * which is the only proof a later process may use before closing one — an
+ * unmarked relay record is retained forever by `orphanDecisionFor`, so the
+ * lookup is awaited (bounded) rather than skipped.
+ */
+async function recordOwnedTarget(
+	tab: WorkerTabSession,
+	scope: SharedTargetScope,
+	ownerSessionId?: string,
+): Promise<void> {
+	let marker: string | undefined;
+	if (tab.kindTag === "relay") {
+		for (let attempt = 0; attempt < RELAY_MARKER_ATTEMPTS && marker === undefined; attempt++) {
+			if (attempt > 0) await Bun.sleep(RELAY_MARKER_RETRY_MS);
+			marker = (await relayLiveMarkers(tab.browser)).get(tab.targetId);
+		}
+		if (marker === undefined) {
+			logger.warn("Relay tab recorded without a marker; only this process can reap it", {
+				name: tab.name,
+				targetId: tab.targetId,
+			});
+		}
+	}
+	await recordSharedTarget(scope, {
+		targetId: tab.targetId,
+		name: tab.name,
+		ownerSessionId,
+		channel: process.env.OMP_PROFILE || "default",
+		persist: tab.persist === true,
+		createdAt: tab.lastActivityAt,
+		lastMeaningfulActivityAt: tab.lastActivityAt,
+		generation: durableGenerationOf(tab.browser),
+		...(marker !== undefined ? { marker } : {}),
+	});
+}
+
+/** Test hook: the durable record for a hand-built owned tab, marker lookup included. */
+export function recordOwnedTargetForTest(tab: WorkerTabSession, scope: SharedTargetScope): Promise<void> {
+	return recordOwnedTarget(tab, scope, tab.ownerSessionId);
+}
+
+/** Test hook: live relay markers as the crash-transfer sweep reads them. */
+export function relayLiveMarkersForTest(browser: PuppeteerBrowserHandle): Promise<Map<string, string>> {
+	return relayLiveMarkers(browser);
+}
+
+/** Live relay tab markers (`PAGE<id>` → extension UUID) from the bridge's extended `Target.getTargets`. */
+async function relayLiveMarkers(browser: PuppeteerBrowserHandle): Promise<Map<string, string>> {
+	const markers = new Map<string, string>();
+	try {
+		const { targetInfos } = await browserConnection(browser.browser).send("Target.getTargets");
+		for (const info of targetInfos) {
+			// The bridge extends CDP `TargetInfo` with `ompMarker`; puppeteer's type does not know it.
+			const marker: unknown = "ompMarker" in info ? info.ompMarker : undefined;
+			if (typeof marker === "string" && marker.length > 0) markers.set(info.targetId, marker);
+		}
+	} catch (error) {
+		logger.debug("Relay marker discovery failed; inherited relay tabs are retained", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return markers;
+}
+
+/**
+ * Once per browser handle: reap targets recorded by omp processes that died
+ * without teardown (issue #10022), applying the same protections a live
+ * owner would. Detached from the open that triggers it; failures only log.
+ */
+async function sweepInheritedTargets(tab: WorkerTabSession, idleMs: number): Promise<void> {
+	const scope = durableScopeOf(tab);
+	if (!scope || inheritedSwept.has(tab.browser)) return;
+	inheritedSwept.add(tab.browser);
+	const generation = durableGenerationOf(tab.browser);
+	// A legacy relay reports no generation: nothing recorded there can be
+	// proven to name a live tab, so nothing is touched.
+	if (generation === "unknown") return;
+	const browser = tab.browser;
+	holdBrowser(browser);
+	try {
+		const liveMarkers = tab.kindTag === "relay" ? await relayLiveMarkers(browser) : undefined;
+		await reapOrphanSharedTargets(undefined, scope, {
+			generation,
+			decide: orphanDecisionFor(browser.browser, { idleMs, kind: tab.kindTag, liveMarkers }),
+			close: targetId => closeTargetById(browser, targetId),
+		});
+	} catch (error) {
+		logger.debug("Inherited browser target sweep failed", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} finally {
+		await releaseBrowser(browser, { kill: false }).catch(() => undefined);
+	}
 }

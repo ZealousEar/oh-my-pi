@@ -14,6 +14,7 @@ import {
 	webMcpSnapshotInPage,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/webmcp";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -21,7 +22,7 @@ const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const BROWSER_TEST_TIMEOUT_MS = 30_000;
 
 function createBrowserHost() {
-	const session: ToolSession = {
+	const session: ToolSession = grantBrowserFixtureScope({
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionFile: () => null,
@@ -33,7 +34,7 @@ function createBrowserHost() {
 			"browser.tern": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown) => prelude.invoke(parameters, { session, toolCallId: "browser-webmcp-test" });
 }

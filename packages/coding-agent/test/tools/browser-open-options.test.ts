@@ -20,13 +20,14 @@ import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { CLAUDE_TRACE_DEBUG_CERT, CLAUDE_TRACE_DEBUG_KEY } from "@oh-my-pi/pi-coding-agent/cli/claude-trace-cli";
 import type { Browser, Page } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const tempDirs: string[] = [];
 
 function browserHost(cwd: string = process.cwd()) {
-	const session: ToolSession = {
+	const session: ToolSession = grantBrowserFixtureScope({
 		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
@@ -38,7 +39,7 @@ function browserHost(cwd: string = process.cwd()) {
 			"browser.tern": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown, signal?: AbortSignal) =>
 		prelude.invoke(parameters, { session, toolCallId: `browser-open-options-${crypto.randomUUID()}`, signal });

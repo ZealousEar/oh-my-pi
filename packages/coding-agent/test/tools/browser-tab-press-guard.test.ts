@@ -4,17 +4,18 @@ import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/
 import { CmuxTab } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/cmux-tab";
 import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
 function makeSession(): ToolSession {
-	return {
+	return grantBrowserFixtureScope({
 		cwd: process.cwd(),
 		hasUI: false,
 		settings: Settings.isolated(),
 		getSessionFile: () => null,
-	} as unknown as ToolSession;
+	} as unknown as ToolSession);
 }
 
 describe("tab.press argument guard", () => {

@@ -234,11 +234,14 @@ import { type UploadRoute, UploadStaging } from "./upload-files";
 import {
 	type Observation,
 	type ObservationEntry,
+	originOf,
 	ownsPage,
 	type ReadyInfo,
+	type RunBinding,
 	type RunErrorPayload,
 	type ScreenshotResult,
 	type SessionSnapshot,
+	targetChangedDenial,
 	type ToolReply,
 	type Transport,
 	type WorkerInbound,
@@ -1520,7 +1523,10 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	/** The page is omp's to close: a headless page, or a tab omp created on a relay or connected browser. */
 	#ownsPage = false;
+	/** Init reported `ready`; later `ready` messages are URL refreshes, never init completion. */
+	#initialized = false;
 	/** The upload route this worker's browser connection takes, and the tab's staging folder. */
 	#uploads?: UploadStaging;
 	#dialogs?: RuntimeDialogController;
@@ -1784,6 +1790,15 @@ export class WorkerCore {
 				await this.#page.emulateFocusedPage(true);
 			}
 			this.#webmcp = await installWebMcp(this.#page);
+			// Keep the supervisor's cached URL honest between runs so the next
+			// dispatch is classified against the page the tab actually shows.
+			// The authoritative check is still `#bindLiveTarget` at run time.
+			// Only after init reported `ready`: the initial navigation's own
+			// frame events must not stand in for that completion signal.
+			this.#page.on("framenavigated", frame => {
+				if (!this.#initialized || this.#active || frame !== this.#page?.mainFrame()) return;
+				void this.#postReadyInfo();
+			});
 			await installVitalsObservers(this.#page);
 			if (payload.userAgent !== undefined) await applyUserAgentOverride(this.#page, payload.userAgent);
 			if (payload.ignoreHttpsErrors) this.#certificateOverride = await applyIgnoreHttpsErrors(this.#page);
@@ -1808,6 +1823,7 @@ export class WorkerCore {
 			const info = await this.#currentReadyInfo();
 			this.#started = true;
 			this.#transport.send({ type: "ready", info });
+			this.#initialized = true;
 		} catch (error) {
 			// A page this attempt created would be orphaned (the supervisor retries
 			// with a fresh worker), so close it before reporting. An adopted target —
@@ -1913,6 +1929,35 @@ export class WorkerCore {
 		this.#dialogs.observe();
 	}
 
+	/**
+	 * Re-prove a non-raw mutation's authorization against the LIVE document
+	 * right before the code executes: read `location.href` from the main frame
+	 * (not the cached URL the supervisor classified against) and refuse when
+	 * its origin is not the one the policy decided. An unreadable document
+	 * (execution context torn down by an in-flight navigation) fails closed.
+	 * While a JavaScript dialog blocks the renderer no script can run, so the
+	 * main frame's last committed URL stands in — that is the document the
+	 * dialog belongs to, and settling it is the only thing a run can do there.
+	 */
+	async #bindLiveTarget(binding: RunBinding): Promise<void> {
+		const page = this.#requirePage();
+		let liveUrl: string | undefined;
+		if (this.#dialogs?.state().open) {
+			liveUrl = page.mainFrame().url();
+		} else {
+			try {
+				const href: unknown = await page.mainFrame().evaluate("location.href");
+				liveUrl = typeof href === "string" ? href : undefined;
+			} catch {
+				liveUrl = undefined;
+			}
+		}
+		if (liveUrl === undefined || originOf(liveUrl) !== binding.target) {
+			await this.#postReadyInfo();
+			throw new ToolError(targetChangedDenial(binding, liveUrl));
+		}
+	}
+
 	async #currentReadyInfo(): Promise<ReadyInfo> {
 		const page = this.#requirePage();
 		const targetId = this.#targetId ?? (await targetIdForPage(page));
@@ -2008,6 +2053,7 @@ export class WorkerCore {
 		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
+			if (msg.binding) await this.#bindLiveTarget(msg.binding);
 			await untilAborted(signal, () => this.#emulation?.reapply() ?? Promise.resolve());
 			runPage = createRunPageScope(this.#requirePage(), () => this.#requireNetwork().restoreInterception());
 			const browser = this.#requireBrowser();

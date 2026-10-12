@@ -1,5 +1,5 @@
 /**
- * Relay crash-transfer proof (review F1): a relay `new_tab` target is recorded
+ * Relay crash-transfer proof (review F1): a relay tab omp created is recorded
  * WITH the extension's per-tab marker, and a dead owner's marked record is
  * actually swept by another process through the live-marker match — the path
  * `orphanDecisionFor` retains forever when the marker is missing.
@@ -10,7 +10,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { findFreeCdpPort } from "./attach";
+import { browserConnection } from "./launch";
 import {
+	closeRelayTarget,
 	ownedSharedTargets,
 	reapOrphanSharedTargets,
 	resetOrphanRegistryForTest,
@@ -20,7 +22,6 @@ import { acquireBrowser, type BrowserHandle, releaseBrowser } from "./registry";
 import type { RelayRpcRequest, TabSnapshot } from "./relay/protocol";
 import { type RelayServer, startRelayServer } from "./relay/server";
 import {
-	createOwnedTargetForTest,
 	orphanDecisionFor,
 	recordOwnedTargetForTest,
 	relayLiveMarkersForTest,
@@ -139,20 +140,21 @@ describe("relay durable records — marker recorded, dead owner swept by marker"
 			if (!("browser" in handle)) throw new Error("Expected a Puppeteer relay handle");
 			expect(handle.generation).toBe(GENERATION);
 
-			const owned = await createOwnedTargetForTest(handle);
-			expect(owned.targetId).toBe(PAGE7);
+			// The create a relay open without a target makes (the worker's `createTrackedPage`).
+			const connection = browserConnection(handle.browser);
+			const { targetId } = await connection.send("Target.createTarget", { url: "about:blank", background: true });
+			expect(targetId).toBe(PAGE7);
 			const scope = await tempScope();
 			const tab = {
 				name: "relay-owned",
 				browser: handle,
-				targetId: owned.targetId,
+				targetId,
 				state: "alive",
-				info: { url: "about:blank", viewport: { width: 1, height: 1 }, targetId: owned.targetId },
+				info: { url: "about:blank", viewport: { width: 1, height: 1 }, targetId },
 				pending: new Map(),
 				kindTag: "relay",
 				backend: "worker",
-				activateForScreenshot: false,
-				ownsTarget: true,
+				ownsPage: true,
 				ownerSessionId: "session-dead",
 				persist: false,
 				lastActivityAt: 1_000,
@@ -179,7 +181,7 @@ describe("relay durable records — marker recorded, dead owner swept by marker"
 				decide: orphanDecisionFor(handle.browser, { idleMs: 3_600_000, kind: "relay", liveMarkers }),
 				close: async id => {
 					closedIds.push(id);
-					await owned.close();
+					await closeRelayTarget(connection, id);
 					return true;
 				},
 			});

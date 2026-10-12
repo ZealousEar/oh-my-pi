@@ -5,10 +5,11 @@ import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { TERN_KIT_SOURCE } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/page-kit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
-const session: ToolSession = {
+const session: ToolSession = grantBrowserFixtureScope({
 	cwd: process.cwd(),
 	hasUI: false,
 	getSessionFile: () => null,
@@ -20,7 +21,7 @@ const session: ToolSession = {
 		"browser.tern": false,
 		"tools.maxTimeout": 0,
 	}),
-};
+});
 const prelude = createBrowserPrelude(session);
 const context = { session, toolCallId: "browser-queries-test" };
 const name = "queries";
