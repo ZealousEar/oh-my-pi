@@ -31,7 +31,12 @@ import {
 	lookupMcpOAuthCredentialForServer,
 	removeManagedMcpOAuthCredential,
 } from "./oauth-credentials";
-import { MCPOAuthFlow, type MCPStoredOAuthCredential, mcpOAuthCredentialId } from "./oauth-flow";
+import {
+	MCPOAuthFlow,
+	type MCPStoredOAuthCredential,
+	mcpOAuthCredentialId,
+	sharedMcpCredentialProfiles,
+} from "./oauth-flow";
 import type { AuthStorage } from "../session/auth-storage";
 import type { MCPAuthChallenge, MCPAuthConfig, MCPServerConfig } from "./types";
 
@@ -600,6 +605,7 @@ export async function runMcpOAuthFlow(opts: McpOAuthFlowRunOptions): Promise<OAu
 			clientId: flow.resolvedClientId?.trim() || resolvedClientId,
 			clientSecret: flow.registeredClientSecret ?? resolvedClientSecret,
 			resource: flow.resource,
+			scopes: flow.grantedScopes,
 			authorizationUrl: flow.authorizationUrl,
 		};
 
@@ -851,9 +857,21 @@ export async function reauthorizeMcpServer(
 	// authStorage is the binding, and the live reconnect applies it now.
 	const hadClientBearerHeader = hasMcpAuthorizationHeader(found.config);
 	const urlKeyedId = serverUrl ? mcpOAuthCredentialId(serverUrl) : undefined;
+	// Shared credential mode (OMP_SHARED_MCP_PROFILES): the minted row is url-keyed
+	// and meant for every channel. A project-level definition is the one file all
+	// channels load, so its (secret-free) pointer is written even for
+	// definition-only entries — that is how a build whose lookup only honours a
+	// config `auth.credentialId` resolves it. User-level entries stay clean: the
+	// other channels have their own user files, and the url-keyed lookup does not
+	// need a pointer.
+	const sharedProjectPointer =
+		sharedMcpCredentialProfiles() !== undefined && found.scope === "project" && !found.discovered;
 	const shouldPersist =
 		found.acpOwned !== true &&
-		(currentAuth !== undefined || hadClientBearerHeader || oauthResult.credentialId !== urlKeyedId);
+		(currentAuth !== undefined ||
+			hadClientBearerHeader ||
+			oauthResult.credentialId !== urlKeyedId ||
+			sharedProjectPointer);
 	const updatedConfig = shouldPersist
 		? // Strip the client-supplied auth surface (an `Authorization` header
 			// would both leak the bearer into the file and disable the url-keyed

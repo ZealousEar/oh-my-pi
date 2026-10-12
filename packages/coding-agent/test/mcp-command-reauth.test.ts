@@ -92,6 +92,9 @@ describe("/mcp auth commands", () => {
 	let agentDir = "";
 	let configPath = "";
 	let originalMcpHost: string | undefined;
+	// These contracts describe upstream profile-scoped bindings; a fork channel launcher
+	// exports OMP_SHARED_MCP_PROFILES, which would switch the flow to the shared namespace.
+	let originalSharedProfiles: string | undefined;
 	// Track every in-memory auth store so afterEach can close the underlying
 	// bun:sqlite Database. Leaked Database handles are JSDestructibleObjects that
 	// JSC otherwise finalizes during an arbitrary later GC sweep — under
@@ -113,6 +116,8 @@ describe("/mcp auth commands", () => {
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-reauth-agent-"));
 		configPath = path.join(projectDir, ".mcp.json");
 		originalMcpHost = Bun.env.MCP_HOST;
+		originalSharedProfiles = process.env.OMP_SHARED_MCP_PROFILES;
+		delete process.env.OMP_SHARED_MCP_PROFILES;
 		Bun.env.MCP_HOST = "mcp.example.com";
 		process.env.MCP_HOST = "mcp.example.com";
 		setProjectDir(projectDir);
@@ -138,6 +143,7 @@ describe("/mcp auth commands", () => {
 		while (openAuthStores.length > 0) openAuthStores.pop()?.close();
 		vi.restoreAllMocks();
 		restoreEnvValue("MCP_HOST", originalMcpHost);
+		restoreEnvValue("OMP_SHARED_MCP_PROFILES", originalSharedProfiles);
 		setProjectDir(originalProjectDir);
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
