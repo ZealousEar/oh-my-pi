@@ -15,6 +15,7 @@ import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { TERN_KIT_SOURCE } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/page-kit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -62,7 +63,7 @@ function valueFrom<T>(result: { details?: unknown }): T {
 }
 
 function makeSession(): ToolSession {
-	return {
+	return grantBrowserFixtureScope({
 		cwd: tempDir,
 		hasUI: false,
 		getSessionFile: () => null,
@@ -74,7 +75,7 @@ function makeSession(): ToolSession {
 			"browser.tern": false,
 			"tools.maxTimeout": 0,
 		}),
-	};
+	});
 }
 
 beforeAll(async () => {

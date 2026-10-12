@@ -12,7 +12,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type DaemonBrokerClient, DaemonBrokerRejectedError } from "@oh-my-pi/pi-coding-agent/launch/client";
 import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
-import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import type { DaemonOperation, DaemonRpcResult } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import * as browserAttach from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import * as browserLaunch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
@@ -34,17 +33,17 @@ async function makeProfileDir(): Promise<string> {
 }
 
 /**
- * Route `ensureSharedBrowser` to one fake daemon broker shared by every client
- * in a test. Like the real broker, `describe` and `list` answer from its state
- * on receipt, `describe` rejects an unknown name, `start` is rejected once the
- * daemon exists, and `restart` relaunches it. `onDescribe` runs after the reply
- * is fixed (to delay it, or to fail it in transit or with a rejection);
- * `onStop` runs when a stop is requested and returns the state the daemon ends
- * in (default `exited`); `onStart` runs once a launch is recorded, where
- * Chrome starts.
+ * Route `ensureSharedBrowser` to one fake global agent-browser broker shared
+ * by every client in a test. Like the real broker, `describe` and `list`
+ * answer from its state on receipt, `describe` rejects an unknown name,
+ * `start` is rejected once the daemon exists, and `restart` relaunches it.
+ * `onDescribe` runs after the reply is fixed (to delay it, or to fail it in
+ * transit or with a rejection); `onStop` runs when a stop is requested and
+ * returns the state the daemon ends in (default `exited`); `onStart` runs
+ * once a launch is recorded, where Chrome starts.
  */
 function fakeSharedBroker(
-	projectDir: string,
+	runtimeDir: string,
 	wsEndpoint: string,
 	hooks: {
 		onDescribe?: () => Promise<void>;
@@ -76,7 +75,7 @@ function fakeSharedBroker(
 	};
 	const unknown = (name: string) => new DaemonBrokerRejectedError(`Unknown daemon ${name}`);
 	const client = {
-		projectDir,
+		projectDir: runtimeDir,
 		onCompletion: () => () => {},
 		close() {},
 		async request(operation: DaemonOperation): Promise<DaemonRpcResult> {
@@ -115,7 +114,7 @@ function fakeSharedBroker(
 		},
 	};
 	spies.push(
-		spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client),
+		spyOn(daemonClient, "daemonClientForGlobal").mockResolvedValue(client),
 		spyOn(browserLaunch, "resolveSharedBrowserLaunchSpec").mockResolvedValue({
 			executablePath: "/fake/chrome",
 			args: [],
@@ -219,9 +218,9 @@ describe("owned Chromium profile preferences", () => {
 
 	it("lets only the client that launches the shared Chrome write its Preferences when two cold starts race", async () => {
 		const seed = browserLaunch.seedOwnedProfilePreferences;
-		const projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-race-"));
-		const name = sharedBrowserDaemonName(true);
-		const prefsFile = path.join(daemonRuntimeDir(projectDir), `${name}.profile`, "Default", "Preferences");
+		const runtimeDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-race-"));
+		const profileDir = path.join(runtimeDir, "agent-profile");
+		const prefsFile = path.join(profileDir, "Default", "Preferences");
 		const wsEndpoint = "ws://127.0.0.1:9222/devtools/browser/race";
 		let chromeRunning = false;
 		let launchPrefs: unknown;
@@ -232,7 +231,7 @@ describe("owned Chromium profile preferences", () => {
 		// reply is delivered at once, so a client that asked while the profile
 		// was still cold hears "no daemon" after the winner's Chrome is already
 		// live on the profile.
-		const broker = fakeSharedBroker(projectDir, wsEndpoint, {
+		const broker = fakeSharedBroker(runtimeDir, wsEndpoint, {
 			async onDescribe() {
 				if (describes++ > 0) await chromeLive.promise;
 			},
@@ -249,8 +248,8 @@ describe("owned Chromium profile preferences", () => {
 		});
 		try {
 			const [winner, loser] = await Promise.all([
-				ensureSharedBrowser({ projectDir, headless: true }),
-				ensureSharedBrowser({ projectDir, headless: true }),
+				ensureSharedBrowser({ profileDir, headless: true }),
+				ensureSharedBrowser({ profileDir, headless: true }),
 			]);
 			expect(winner?.wsEndpoint).toBe(wsEndpoint);
 			expect(loser?.wsEndpoint).toBe(wsEndpoint);
@@ -263,21 +262,20 @@ describe("owned Chromium profile preferences", () => {
 		} finally {
 			seedSpy.mockRestore();
 			broker.restore();
-			await fs.promises.rm(daemonRuntimeDir(projectDir), { recursive: true, force: true });
-			await fs.promises.rm(projectDir, { recursive: true, force: true });
+			await fs.promises.rm(runtimeDir, { recursive: true, force: true });
 		}
 	});
 });
 
 describe("shared Chromium session-restore state", () => {
 	it("discards the previous Chrome's sessions before a cold start and never touches a live Chrome's", async () => {
-		const projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-sessions-"));
-		const name = sharedBrowserDaemonName(true);
-		const sessionsDir = path.join(daemonRuntimeDir(projectDir), `${name}.profile`, "Default", "Sessions");
+		const runtimeDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-sessions-"));
+		const profileDir = path.join(runtimeDir, "agent-profile");
+		const sessionsDir = path.join(profileDir, "Default", "Sessions");
 		const wsEndpoint = "ws://127.0.0.1:9222/devtools/browser/sessions";
 		let sessionsAtLaunch: string[] | undefined;
 		let failNextDescribe: Error | undefined;
-		const broker = fakeSharedBroker(projectDir, wsEndpoint, {
+		const broker = fakeSharedBroker(runtimeDir, wsEndpoint, {
 			async onDescribe() {
 				const failure = failNextDescribe;
 				failNextDescribe = undefined;
@@ -296,12 +294,12 @@ describe("shared Chromium session-restore state", () => {
 			await Bun.write(path.join(sessionsDir, "Session_13435785841408923"), "previous chrome");
 			await Bun.write(path.join(sessionsDir, "Tabs_13435784948833957"), "previous chrome");
 			failNextDescribe = new Error("broker socket closed");
-			expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+			expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 			expect(sessionsAtLaunch).toEqual([]);
 
 			// The running Chrome records its own session; attaching to it must leave that alone.
 			await Bun.write(path.join(sessionsDir, "Session_13436291949708538"), "live chrome");
-			expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+			expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 			expect(await fs.promises.readdir(sessionsDir)).toEqual(["Session_13436291949708538"]);
 
 			// A describe lost in transit, or rejected for a reason other than an
@@ -311,24 +309,23 @@ describe("shared Chromium session-restore state", () => {
 				new DaemonBrokerRejectedError("Daemon broker authentication failed"),
 			]) {
 				failNextDescribe = failure;
-				expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+				expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 				expect(await fs.promises.readdir(sessionsDir)).toEqual(["Session_13436291949708538"]);
 			}
 			expect(broker.starts).toBe(1);
 		} finally {
 			broker.restore();
-			await fs.promises.rm(daemonRuntimeDir(projectDir), { recursive: true, force: true });
-			await fs.promises.rm(projectDir, { recursive: true, force: true });
+			await fs.promises.rm(runtimeDir, { recursive: true, force: true });
 		}
 	});
 
 	it("starts Chrome only while holding the profile claim, though an unclaimed client may adopt it", async () => {
-		const projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-claim-"));
-		const name = sharedBrowserDaemonName(true);
-		const sessionsDir = path.join(daemonRuntimeDir(projectDir), `${name}.profile`, "Default", "Sessions");
+		const runtimeDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-claim-"));
+		const profileDir = path.join(runtimeDir, "agent-profile");
+		const sessionsDir = path.join(profileDir, "Default", "Sessions");
 		const wsEndpoint = "ws://127.0.0.1:9222/devtools/browser/claim";
 		let sessionsAtLaunch: string[] | undefined;
-		const broker = fakeSharedBroker(projectDir, wsEndpoint, {
+		const broker = fakeSharedBroker(runtimeDir, wsEndpoint, {
 			async onStart() {
 				sessionsAtLaunch = await fs.promises.readdir(sessionsDir).catch(() => []);
 			},
@@ -347,33 +344,33 @@ describe("shared Chromium session-restore state", () => {
 			// cannot prepare the profile and must not launch Chrome on it.
 			await Bun.write(path.join(sessionsDir, "Session_13435785841408923"), "previous chrome");
 			holdClaimElsewhere();
-			expect(await ensureSharedBrowser({ projectDir, headless: true })).toBeNull();
+			expect(await ensureSharedBrowser({ profileDir, headless: true })).toBeNull();
 			expect(broker.starts).toBe(0);
 			releaseClaim();
 
-			expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+			expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 			expect(sessionsAtLaunch).toEqual([]);
 			holdClaimElsewhere();
-			expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+			expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 			expect(broker.starts).toBe(1);
 		} finally {
 			releaseClaim();
 			warnSpy.mockRestore();
 			broker.restore();
-			await fs.promises.rm(daemonRuntimeDir(projectDir), { recursive: true, force: true });
-			await fs.promises.rm(projectDir, { recursive: true, force: true });
+			await fs.promises.rm(runtimeDir, { recursive: true, force: true });
 		}
 	});
 
 	it("restarts the shared browser without restoring the stopped Chrome's pages", async () => {
-		const projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-restart-"));
+		const runtimeDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-shared-profile-restart-"));
 		const name = sharedBrowserDaemonName(true);
-		const sessionsDir = path.join(daemonRuntimeDir(projectDir), `${name}.profile`, "Default", "Sessions");
+		const profileDir = path.join(runtimeDir, "agent-profile");
+		const sessionsDir = path.join(profileDir, "Default", "Sessions");
 		const wsEndpoint = "ws://127.0.0.1:9222/devtools/browser/restart";
 		let sessionsAtStop: string[] | undefined;
 		let sessionsAtLaunch: string[] | undefined;
 		let stopLeaves: DaemonState = "exited";
-		const broker = fakeSharedBroker(projectDir, wsEndpoint, {
+		const broker = fakeSharedBroker(runtimeDir, wsEndpoint, {
 			async onStop() {
 				sessionsAtStop = await fs.promises.readdir(sessionsDir).catch(() => []);
 				return stopLeaves;
@@ -383,12 +380,12 @@ describe("shared Chromium session-restore state", () => {
 			},
 		});
 		try {
-			expect((await ensureSharedBrowser({ projectDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
+			expect((await ensureSharedBrowser({ profileDir, headless: true }))?.wsEndpoint).toBe(wsEndpoint);
 
 			// The running Chrome records the pages it has open. They stay until the
 			// stop is confirmed and are gone when Chrome relaunches.
 			await Bun.write(path.join(sessionsDir, "Session_13436291949708538"), "live chrome");
-			expect((await restartSharedBrowser(broker.client, name)).state).toBe("ready");
+			expect((await restartSharedBrowser(broker.client, name, { profileDir })).state).toBe("ready");
 			expect(sessionsAtStop).toEqual(["Session_13436291949708538"]);
 			expect(sessionsAtLaunch).toEqual([]);
 			expect(broker.starts).toBe(2);
@@ -396,13 +393,12 @@ describe("shared Chromium session-restore state", () => {
 			// A stop that leaves Chrome running must neither touch its profile nor relaunch it.
 			await Bun.write(path.join(sessionsDir, "Session_13436325114290429"), "live chrome");
 			stopLeaves = "stopping";
-			await expect(restartSharedBrowser(broker.client, name)).rejects.toThrow("still stopping");
+			await expect(restartSharedBrowser(broker.client, name, { profileDir })).rejects.toThrow("still stopping");
 			expect(await fs.promises.readdir(sessionsDir)).toEqual(["Session_13436325114290429"]);
 			expect(broker.starts).toBe(2);
 		} finally {
 			broker.restore();
-			await fs.promises.rm(daemonRuntimeDir(projectDir), { recursive: true, force: true });
-			await fs.promises.rm(projectDir, { recursive: true, force: true });
+			await fs.promises.rm(runtimeDir, { recursive: true, force: true });
 		}
 	});
 });
