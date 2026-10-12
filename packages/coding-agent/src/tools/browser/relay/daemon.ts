@@ -11,21 +11,34 @@
  *
  * A manually started relay may already own the port; consumers adopt that
  * external server without attempting another bind (and hold no lease).
+ *
+ * Pinned deployments replace the daemon unit with a launchd job
+ * (`OMP_BROWSER_RELAY_SUPERVISOR=launchd:<label>`): when nothing serves the
+ * port the consumer kickstarts that job and waits, and never spawns its own
+ * build. Before the cutover gate the launcher sets `=none` (adopt-only): an
+ * already-serving relay is adopted, nothing is ever started. Independently,
+ * `OMP_BROWSER_RELAY_REQUIRE_PROTOCOL` refuses to adopt a relay speaking a
+ * lower protocol (stock/legacy relays are protocol 1), so a downgrade is a
+ * clear error instead of a silently different feature set.
  */
 import * as os from "node:os";
 import type { UnitPolicy, UnitSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { logger } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { $ } from "bun";
 import { daemonClient } from "../../../daemon/client";
 import { type DaemonClient, GLOBAL_SCOPE, type OpenRequest } from "../../../daemon/protocol";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../../../subprocess/worker-client";
 import { throwIfAborted } from "../../tool-errors";
 import { probeCdpResponse, probeCdpStatus } from "../attach";
 import { describeUnit, isLiveUnit, type UnitIdentity, UnitLease } from "../unit-lease";
-import { DEFAULT_RELAY_URL } from "./kind";
-import { relayCdpClientsOf, relayVersionOf } from "./probe";
+import { DEFAULT_RELAY_URL, RELAY_SUPERVISOR_ENV, type RelaySupervisor } from "./kind";
+import { relayCdpClientsOf, relayProtocolOf, relayVersionOf } from "./probe";
 import { isOlderOmpVersion } from "./protocol";
 
+/** Unit key of the relay on the default port; other ports get a port suffix (see {@link relayUnitIdentity}). */
+export const RELAY_DAEMON_NAME = "omp.browser.relay";
 const DEFAULT_RELAY_PORT = new URL(DEFAULT_RELAY_URL).port;
 
 /** Unit key of the relay on `port`; one per port, so relays on different ports never replace each other. */
@@ -33,7 +46,7 @@ function relayUnitIdentity(port: string): UnitIdentity {
 	return {
 		kind: "proc",
 		scope: GLOBAL_SCOPE,
-		key: port === DEFAULT_RELAY_PORT ? "omp.browser.relay" : `omp.browser.relay.${port}`,
+		key: port === DEFAULT_RELAY_PORT ? RELAY_DAEMON_NAME : `${RELAY_DAEMON_NAME}.${port}`,
 	};
 }
 
@@ -50,6 +63,7 @@ const READY_LOG_PATTERN = String.raw`browser relay listening on http://\S+`;
 const READY_TIMEOUT_MS = 15_000;
 const PROBE_TIMEOUT_MS = 1_500;
 const STOP_TIMEOUT_MS = 5_000;
+const SUPERVISED_POLL_INTERVAL_MS = 150;
 /**
  * The relay dies shortly after its last consumer lets go (`hold: "leases"`).
  * It runs in its own session with output to its unit log (`survive:
@@ -71,6 +85,11 @@ export async function probeRelayServer(cdpUrl: string): Promise<boolean> {
 	return status === 503 || (status !== null && status >= 200 && status < 300);
 }
 
+/** Protocol of the relay serving `cdpUrl` (1 for a relay without a protocol field), or null when nothing relay-like answers. */
+export async function probeRelayProtocol(cdpUrl: string, signal?: AbortSignal): Promise<number | null> {
+	return relayProtocolOf(await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal }));
+}
+
 /** Auto-start is only safe for endpoints this machine can own. */
 export function isLoopbackRelayUrl(cdpUrl: string): boolean {
 	try {
@@ -79,6 +98,51 @@ export function isLoopbackRelayUrl(cdpUrl: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/** `launchctl` domain target of the calling user's GUI session. */
+function launchdDomain(): string {
+	return `gui/${process.getuid?.() ?? 0}`;
+}
+
+/** Message for a relay that speaks a lower protocol than the consumer requires, with the fixes. */
+export function relayProtocolTooOldMessage(
+	cdpUrl: string,
+	found: number,
+	required: number,
+	supervisor?: RelaySupervisor,
+): string {
+	const restart =
+		supervisor?.kind === "launchd"
+			? ` and start the pinned relay with \`launchctl kickstart -k ${launchdDomain()}/${supervisor.label}\``
+			: "";
+	const port = relayPort(cdpUrl);
+	const name = port === null ? RELAY_DAEMON_NAME : relayUnitIdentity(port).key;
+	return `omp browser relay at ${cdpUrl} is a legacy/stock relay (protocol ${found}); this omp requires protocol ${required}. Stop it with \`omp ps stop ${name}\`${restart}, then retry.`;
+}
+
+/** Default `kickstart`: `launchctl kickstart gui/<uid>/<label>`; true when launchctl exited 0. */
+async function launchctlKickstart(label: string): Promise<boolean> {
+	const result = await $`launchctl kickstart ${launchdDomain()}/${label}`.quiet().nothrow();
+	if (result.exitCode !== 0) {
+		logger.warn("launchctl kickstart failed", {
+			label,
+			exitCode: result.exitCode,
+			stderr: result.stderr.toString().trim(),
+		});
+	}
+	return result.exitCode === 0;
+}
+
+export interface EnsureRelayDaemonOptions {
+	cdpUrl: string;
+	signal?: AbortSignal;
+	/** Refuse (throw) any relay whose protocol is lower. */
+	requireProtocol?: number;
+	/** Start the relay through this supervisor; never spawn this build. */
+	supervisor?: RelaySupervisor;
+	/** Test seam replacing `launchctl kickstart`; resolves true when the job was kicked. */
+	kickstart?: (label: string) => Promise<boolean>;
 }
 
 function relayOpenRequest(port: string): OpenRequest {
@@ -98,11 +162,14 @@ function relayOpenRequest(port: string): OpenRequest {
 	};
 }
 
-/** Open the relay unit and keep its lease when it serves `cdpUrl`; otherwise drop the lease and resolve null. */
+/**
+ * Open the relay unit and keep its lease when `adopt` accepts what serves `cdpUrl`; otherwise drop the
+ * lease and resolve null. A protocol refusal from `adopt` drops the lease before it propagates.
+ */
 async function openRelay(
 	client: DaemonClient,
 	request: OpenRequest,
-	cdpUrl: string,
+	adopt: () => Promise<boolean>,
 	replace: boolean,
 	signal?: AbortSignal,
 ): Promise<UnitLease | null> {
@@ -117,37 +184,93 @@ async function openRelay(
 		});
 		return null;
 	}
-	if (await probeRelayServer(cdpUrl)) return lease;
+	try {
+		if (await adopt()) return lease;
+	} catch (error) {
+		await lease.release();
+		throw error;
+	}
 	await lease.release();
 	return null;
 }
 
 /**
  * Ensure a relay server answers at `cdpUrl`, starting the daemon-supervised
- * relay when nothing is serving, and lease it. The extension handshake
- * (503 → 200) is the caller's wait. Resolves the lease the caller holds while
- * it uses the relay, or null when a relay the daemon does not run serves
- * there, or when the relay could not be started (the caller's wait then
- * reports it unreachable). A live relay unit that does not answer is
- * replaced once.
+ * relay (or kickstarting the supervisor's job) when nothing is serving, and
+ * lease it. The extension handshake (503 → 200) is the caller's wait. Resolves
+ * the lease the caller holds while it uses the relay, or null when a relay the
+ * daemon does not run serves there, or when the relay could not be started
+ * (the caller's wait then reports it unreachable). A live relay unit that does
+ * not answer is replaced once. Throws a {@link ToolError} when the serving
+ * relay is older than `requireProtocol` or the supervised job cannot be
+ * started (fail closed).
  */
-export async function ensureRelayDaemon(opts: { cdpUrl: string; signal?: AbortSignal }): Promise<UnitLease | null> {
+export async function ensureRelayDaemon(opts: EnsureRelayDaemonOptions): Promise<UnitLease | null> {
 	const port = relayPort(opts.cdpUrl);
 	if (port === null) return null;
+	let warned = false;
+	/** Probe and apply the protocol policy; true when a relay is adopted. */
+	const adopt = async (): Promise<boolean> => {
+		const found = await probeRelayProtocol(opts.cdpUrl, opts.signal);
+		if (found === null) return false;
+		if (opts.requireProtocol !== undefined && found < opts.requireProtocol) {
+			throw new ToolError(relayProtocolTooOldMessage(opts.cdpUrl, found, opts.requireProtocol, opts.supervisor));
+		}
+		if (found === 1 && !warned) {
+			warned = true;
+			logger.warn("Adopting a legacy/stock browser relay (protocol 1)", { cdpUrl: opts.cdpUrl });
+		}
+		return true;
+	};
+	// Fail closed on a downgrade before touching the daemon.
+	const serving = await adopt();
+	if (opts.supervisor) {
+		if (!serving) await ensureSupervisedRelay(opts, opts.supervisor, adopt);
+		// The supervisor owns the relay; the daemon holds no lease on it.
+		return null;
+	}
 	const client = await daemonClient();
 	throwIfAborted(opts.signal);
 	const request = relayOpenRequest(port);
-	if (await probeRelayServer(opts.cdpUrl)) {
+	if (serving) {
 		// Serving: lease our own unit, but never start one against a manual relay.
 		const existing = await describeUnit(client, relayUnitIdentity(port), opts.signal);
-		return isLiveUnit(existing) ? openRelay(client, request, opts.cdpUrl, false, opts.signal) : null;
+		return isLiveUnit(existing) ? openRelay(client, request, adopt, false, opts.signal) : null;
 	}
-	const opened = await openRelay(client, request, opts.cdpUrl, false, opts.signal);
+	const opened = await openRelay(client, request, adopt, false, opts.signal);
 	if (opened) return opened;
 	// A manual serve may have won the port meanwhile (ours then failed to bind); adopt it.
-	if (await probeRelayServer(opts.cdpUrl)) return null;
+	if (await adopt()) return null;
 	// Live unit but nothing listening: replace the wedged relay.
-	return openRelay(client, request, opts.cdpUrl, true, opts.signal);
+	return openRelay(client, request, adopt, true, opts.signal);
+}
+
+/** Kickstart the supervisor's job and wait for the relay it owns; never spawns this build. */
+async function ensureSupervisedRelay(
+	opts: EnsureRelayDaemonOptions,
+	supervisor: RelaySupervisor,
+	adopt: () => Promise<boolean>,
+): Promise<void> {
+	if (supervisor.kind === "none") {
+		throw new ToolError(
+			`no omp browser relay is serving ${opts.cdpUrl} and this channel is adopt-only (${RELAY_SUPERVISOR_ENV}=none); start the legacy relay or run the launcher cutover.`,
+		);
+	}
+	const notLoaded = () =>
+		new ToolError(
+			`pinned browser relay service ${supervisor.label} is not loaded or did not start; run \`launchctl bootstrap ${launchdDomain()} ~/Library/LaunchAgents/${supervisor.label}.plist\` (see the launcher runbook) and retry.`,
+		);
+	throwIfAborted(opts.signal);
+	const kicked = await (opts.kickstart ?? launchctlKickstart)(supervisor.label);
+	throwIfAborted(opts.signal);
+	if (!kicked) throw notLoaded();
+	const deadline = Date.now() + READY_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		if (await adopt()) return;
+		throwIfAborted(opts.signal);
+		await Bun.sleep(SUPERVISED_POLL_INTERVAL_MS);
+	}
+	throw notLoaded();
 }
 
 /** Outcome of {@link restartRelayDaemon}. */
