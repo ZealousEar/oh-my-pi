@@ -208,6 +208,24 @@ const waitPredicateOptionsKeys: Record<keyof WaitPredicateOptions, true> = { tim
 const controlAcquireOptionsKeys: Record<keyof ControlAcquireOptions, true> = { reason: true };
 
 type ObservationResult = ScreenshotResult & { ax: string; nodeCount: number; truncated: boolean };
+type InspectOptions = { maxNodes?: number };
+
+/** Structured accessibility inspection of one window: live geometry plus queried nodes. */
+interface WindowInspection {
+	/** Null once the window is gone from the live roster. */
+	window: {
+		id: string;
+		app: string;
+		title: string;
+		pid?: number;
+		bounds: { x: number; y: number; width: number; height: number };
+		focused: boolean;
+	} | null;
+	nodes: AxNode[];
+	nodeCount: number;
+	/** The query hit `maxNodes`, so the node list is partial. */
+	truncated: boolean;
+}
 
 type PendingTool = { resolve(value: unknown): void; reject(reason?: unknown): void };
 interface ActiveRun {
@@ -1619,6 +1637,37 @@ class Win extends WindowAccess {
 			`window ${this.id}`,
 		);
 		await nativeCall(context.signal, () => this.#session.raiseWindow(this.id));
+	}
+
+	/**
+	 * One structured inspection of this window: refreshed geometry from the live
+	 * window roster plus every accessibility node the query returns, with value,
+	 * frame, and action names intact. Unlike `ax()`/`observe()` this returns data
+	 * instead of a text tree, and unlike `find()` it reports how many nodes were
+	 * seen and whether the node cap truncated them. Reads only; refs stay valid
+	 * because a query does not begin a new snapshot generation.
+	 */
+	async inspect(options?: InspectOptions): Promise<WindowInspection> {
+		const { signal } = this.#getContext();
+		const limit = Math.max(1, Math.min(1_000, Math.trunc(options?.maxNodes ?? 400)));
+		const live = (await nativeCall(signal, () => this.#session.listWindows())).find(
+			candidate => candidate.id === this.id,
+		);
+		if (!live) return { window: null, nodes: [], nodeCount: 0, truncated: false };
+		const nodes = await nativeCall(signal, () => this.#session.axQuery(this.id, { limit }));
+		return {
+			window: {
+				id: live.id,
+				app: live.app,
+				title: live.title,
+				pid: live.pid,
+				bounds: { x: live.x, y: live.y, width: live.width, height: live.height },
+				focused: live.focused,
+			},
+			nodes,
+			nodeCount: nodes.length,
+			truncated: nodes.length >= limit,
+		};
 	}
 
 	ref(ref: string): ElRef {

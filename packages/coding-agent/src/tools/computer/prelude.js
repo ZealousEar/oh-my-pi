@@ -70,6 +70,7 @@
 		"holdKeys",
 		"holdMouse",
 		"bringToCurrentSpace",
+		"inspect",
 	];
 	const elementFields = ["ref", "role", "nativeRole", "title", "description", "enabled", "focused", "childCount"];
 	const elementValueMethods = [
@@ -270,6 +271,19 @@
 			parameters.code = fnOrCode;
 		}
 		const details = await invoke("run", parameters);
+		return details.value;
+	};
+	const taskFields = ["goal", "app", "window", "values", "expect", "maxActions", "maxCalls", "timeout", "allowConsequential"];
+	computer.task = async options => {
+		const opts = validateOptions("computer.task", options);
+		if (typeof opts.goal !== "string" || opts.goal.trim().length === 0) {
+			throw new TypeError("computer.task() requires a non-empty goal");
+		}
+		const parameters = {};
+		for (const field of taskFields) {
+			if (opts[field] !== undefined) parameters[field] = opts[field];
+		}
+		const details = await invoke("task", parameters);
 		return details.value;
 	};
 	computer.capabilities = async () => {
