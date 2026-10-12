@@ -9,6 +9,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { deleteModelPreset, saveModelPreset } from "@oh-my-pi/pi-coding-agent/config/model-presets";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -21,7 +22,7 @@ import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme"
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
-import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgCycleOrder, cfgModelPresets, type ModelPresetV1 } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 function normalize(lines: readonly string[]): string {
@@ -105,6 +106,9 @@ interface HubHarness {
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
 	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
+	onSavePreset: Mock<(name: string) => void>;
+	onDeletePreset: Mock<(name: string) => void>;
+	onApplyPreset: Mock<NonNullable<ModelHubCallbacks["onApplyPreset"]>>;
 }
 
 const openHubs: ModelHubComponent[] = [];
@@ -137,25 +141,52 @@ function createHub(options: {
 		}
 		cfgRetryFallbackChains.override(settings, chains);
 	});
+	// Mirror the controller: presets persist through the host helpers so the hub's re-read lists them.
+	const onSavePreset = vi.fn((name: string) => {
+		saveModelPreset(settings, name);
+	});
+	const onDeletePreset = vi.fn((name: string) => {
+		deleteModelPreset(settings, name);
+	});
+	const onApplyPreset = vi.fn<NonNullable<ModelHubCallbacks["onApplyPreset"]>>(() => ({ applied: true }));
+	// An explicit `undefined` in `callbacks` removes the default (a host without that capability).
+	const callback = <K extends keyof ModelHubCallbacks>(
+		key: K,
+		fallback: ModelHubCallbacks[K],
+	): ModelHubCallbacks[K] =>
+		options.callbacks && Object.hasOwn(options.callbacks, key)
+			? (options.callbacks[key] as ModelHubCallbacks[K])
+			: fallback;
 	const hub = new ModelHubComponent(
 		ui,
 		createModelBrowserSource(settings),
 		registry,
 		options.scoped ? modelsFn().map(model => ({ model })) : [],
 		{
-			onAssign: options.callbacks?.onAssign ?? onAssign,
-			onUnassign: options.callbacks?.onUnassign ?? onUnassign,
-			onLoginRequest: options.callbacks?.onLoginRequest ?? onLoginRequest,
-			onCycleOrderChange: options.callbacks?.onCycleOrderChange,
-			onSavePreset: options.callbacks?.onSavePreset,
-			onSwitchPreset: options.callbacks?.onSwitchPreset,
-			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
-			onCancel: options.callbacks?.onCancel ?? onCancel,
+			onAssign: callback("onAssign", onAssign),
+			onUnassign: callback("onUnassign", onUnassign),
+			onLoginRequest: callback("onLoginRequest", onLoginRequest),
+			onCycleOrderChange: callback("onCycleOrderChange", undefined),
+			onSavePreset: callback("onSavePreset", onSavePreset),
+			onDeletePreset: callback("onDeletePreset", onDeletePreset),
+			onApplyPreset: callback("onApplyPreset", onApplyPreset),
+			onFallbackChainChange: callback("onFallbackChainChange", onFallbackChainChange),
+			onCancel: callback("onCancel", onCancel),
 		},
 		options.hub,
 	);
 	openHubs.push(hub);
-	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange };
+	return {
+		hub,
+		onAssign,
+		onUnassign,
+		onLoginRequest,
+		onCancel,
+		onFallbackChainChange,
+		onSavePreset,
+		onDeletePreset,
+		onApplyPreset,
+	};
 }
 
 const DOWN = "\x1b[B";
@@ -484,7 +515,7 @@ describe("ModelHub", () => {
 				});
 				installTestTheme();
 
-				// Sidebar order: Roles, All models, [sep], alpha, beta, delta-local, gamma.
+				// Sidebar order: Presets, Roles, All models, [sep], alpha, beta, delta-local, gamma.
 				// Hop down onto the keyless provider, which schedules its refresh.
 				hub.handleInput(DOWN); // all → alpha
 				hub.handleInput(DOWN); // alpha → beta
@@ -661,9 +692,11 @@ describe("ModelHub", () => {
 			for (const ch of "1bad") hub.handleInput(ch);
 			hub.handleInput("\n");
 			expect(onSavePreset).toHaveBeenCalledTimes(1);
+			// The invalid name keeps the input open and names the rule in place of the hint.
 			expect(footerLine(hub.render(220))).toContain("Preset name:");
+			expect(footerLine(hub.render(220))).toContain("Name must start with a letter");
 
-			const { hub: bareHub } = createHub({ models: [model], scoped: true });
+			const { hub: bareHub } = createHub({ models: [model], scoped: true, callbacks: { onSavePreset: undefined } });
 			bareHub.handleInput(UP); // All models → Roles (since Recent is removed)
 			bareHub.handleInput("\n"); // dive into rows
 			expect(footerLine(bareHub.render(220))).not.toContain("save preset");
@@ -677,47 +710,52 @@ describe("ModelHub", () => {
 			const b = makeModel("test", "model-b");
 			const c = makeModel("test", "model-c");
 			const settings = Settings.isolated({ modelRoles: { default: "test/model-a" } });
-			cfgModelPresets.setEntry(settings, "alpha", { modelRoles: { default: "test/model-a" } });
-			cfgModelPresets.setEntry(settings, "beta", { modelRoles: { default: "test/model-b" } });
-			cfgModelPresets.setEntry(settings, "gamma", { modelRoles: { default: "test/model-c" } });
+			// Capture each preset from a live routing so "alpha" matches the opening setup exactly.
+			saveModelPreset(settings, "alpha");
+			settings.setModelRole("default", "test/model-b");
+			saveModelPreset(settings, "beta");
+			settings.setModelRole("default", "test/model-c");
+			saveModelPreset(settings, "gamma");
+			settings.setModelRole("default", "test/model-a");
 			// Mirror the controller: applying a preset writes its roles; "beta" is refused and writes nothing.
-			const onSwitchPreset = vi.fn((name: string) => {
-				if (name === "beta") return;
+			const onApplyPreset = vi.fn<NonNullable<ModelHubCallbacks["onApplyPreset"]>>(name => {
+				if (name === "beta") return { applied: false, error: "refused" };
 				settings.setModelRole("default", name === "alpha" ? "test/model-a" : "test/model-c");
+				return { applied: true };
 			});
-			const { hub } = createHub({ models: [a, b, c], scoped: true, settings, callbacks: { onSwitchPreset } });
+			const { hub } = createHub({ models: [a, b, c], scoped: true, settings, callbacks: { onApplyPreset } });
+			const applied = () => onApplyPreset.mock.calls.map(call => call[0]);
 
 			hub.handleInput(UP); // All models → Roles
 			expect(normalize(hub.render(220))).toContain("Preset: alpha");
 
 			hub.handleInput(CTRL_RIGHT); // alpha → beta (refused: nothing written)
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("beta");
+			expect(applied()).toEqual(["beta"]);
 			expect(normalize(hub.render(220))).toContain("Preset: alpha");
 
 			hub.handleInput(CTRL_RIGHT); // steps past the refused preset
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("gamma");
+			expect(applied()).toEqual(["beta", "gamma"]);
 			expect(normalize(hub.render(220))).toContain("Preset: gamma");
 			expect(settings.getModelRole("default")).toBe("test/model-c");
 
 			hub.handleInput(CTRL_RIGHT); // wraps to the first preset
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("alpha");
+			expect(applied()).toEqual(["beta", "gamma", "alpha"]);
 			expect(normalize(hub.render(220))).toContain("Preset: alpha");
 
 			hub.handleInput(CTRL_LEFT); // wraps back to the last preset
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("gamma");
+			expect(applied()).toEqual(["beta", "gamma", "alpha", "gamma"]);
 
 			// The letter twins (macOS reserves ctrl+←/→) work on the role rows.
 			hub.handleInput("\n"); // dive into the rows
 			hub.handleInput("p"); // gamma → alpha
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("alpha");
 			hub.handleInput("P"); // alpha → gamma
-			expect(onSwitchPreset).toHaveBeenLastCalledWith("gamma");
+			expect(applied()).toEqual(["beta", "gamma", "alpha", "gamma", "alpha", "gamma"]);
 
 			// Outside the Roles view the keys never switch presets.
 			hub.handleInput(LEFT); // back to the sidebar
 			hub.handleInput(DOWN); // Roles → All models
 			hub.handleInput(CTRL_RIGHT);
-			expect(onSwitchPreset).toHaveBeenCalledTimes(6);
+			expect(onApplyPreset).toHaveBeenCalledTimes(6);
 		});
 
 		test("picking a role lands the arrows on the model rows, keeping the assignment flow", () => {
@@ -1858,6 +1896,127 @@ describe("ModelHub", () => {
 
 			hub.handleInput("\n");
 			expect(onLoginRequest).toHaveBeenCalledWith("anthropic");
+		});
+	});
+
+	describe("presets view", () => {
+		const rawPreset: ModelPresetV1 = {
+			version: 1,
+			roles: { default: "test/worker-model" },
+			fallbackChains: {},
+			cycleOrder: [],
+			defaultThinkingLevel: ThinkingLevel.Medium,
+		};
+
+		/** Settings whose GLOBAL layer defines `presets` — the layer the hub's delete targets. */
+		function withGlobalPresets(presets: Record<string, ModelPresetV1>): Settings {
+			const settings = Settings.isolated({});
+			for (const [name, entry] of Object.entries(presets)) cfgModelPresets.setEntry(settings, name, entry);
+			return settings;
+		}
+
+		/** Hop All models → Roles → Presets and dive into the rows. */
+		function openPresets(hub: ModelHubComponent): void {
+			hub.handleInput(UP);
+			hub.handleInput(UP);
+			hub.handleInput("\n");
+		}
+
+		test("saves a named snapshot and marks the round-trip as matching current", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = Settings.isolated({ modelRoles: { default: "test/worker-model" } });
+			const { hub, onSavePreset } = createHub({ models: [model], scoped: true, settings });
+
+			openPresets(hub);
+			expect(normalize(hub.render(220))).toContain("No presets yet");
+			hub.handleInput("\n"); // The only row is "+ Save current as preset…": open the name input.
+			for (const ch of "Codex Only") hub.handleInput(ch);
+			hub.handleInput("\n");
+
+			expect(onSavePreset).toHaveBeenCalledWith("Codex Only");
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("Codex Only");
+			expect(rendered).toContain("matches current");
+			expect(rendered).not.toContain("No presets yet");
+			// The cursor landed on the saved row, so Enter loads it rather than opening the input again.
+			expect(footerLine(hub.render(220))).toContain("load");
+		});
+
+		test("freezes keyboard, mouse, mutations, and cancellation while a preset apply is pending", async () => {
+			const model = makeModel("test", "worker-model");
+			const settings = withGlobalPresets({ alpha: rawPreset, beta: rawPreset });
+			const apply = Promise.withResolvers<{ applied: boolean; error?: string }>();
+			let applyCount = 0;
+			const onApplyPreset = vi.fn<NonNullable<ModelHubCallbacks["onApplyPreset"]>>(() =>
+				++applyCount === 1 ? apply.promise : { applied: true },
+			);
+			const { hub, onCancel, onDeletePreset } = createHub({
+				models: [model],
+				scoped: true,
+				settings,
+				callbacks: { onApplyPreset },
+			});
+
+			openPresets(hub);
+			hub.handleInput("\n"); // Load "alpha".
+			expect(onApplyPreset.mock.calls.map(call => call[0])).toEqual(["alpha"]);
+			expect(normalize(hub.render(220))).toContain("applying…");
+
+			hub.render(220); // Establish mouse geometry before the pending inputs.
+			hub.handleInput("x");
+			hub.handleInput("x");
+			hub.handleInput(DOWN);
+			hub.handleInput("\x1b[<65;100;10M");
+			hub.handleInput(ESC);
+			expect(onCancel).not.toHaveBeenCalled();
+			expect(onDeletePreset).not.toHaveBeenCalled();
+
+			apply.resolve({ applied: false, error: "expected rejection" });
+			await apply.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			// Settled (refused or not): the cursor never moved, so Enter retries the same preset.
+			hub.handleInput("\n");
+			expect(onApplyPreset.mock.calls.map(call => call[0])).toEqual(["alpha", "alpha"]);
+		});
+
+		test("requires an armed second delete and rejects invalid names without closing the input", () => {
+			const model = makeModel("test", "worker-model");
+			const settings = withGlobalPresets({ alpha: rawPreset });
+			const { hub, onDeletePreset, onSavePreset } = createHub({ models: [model], scoped: true, settings });
+
+			openPresets(hub);
+			hub.handleInput("x");
+			expect(onDeletePreset).not.toHaveBeenCalled();
+			expect(normalize(hub.render(220))).toContain("press x again to delete alpha");
+			expect(footerLine(hub.render(220))).toContain('again to delete "alpha"');
+			hub.handleInput(DOWN); // Disarm and move to "+ Save current…".
+			expect(normalize(hub.render(220))).not.toContain("press x again");
+			hub.handleInput("\n");
+			for (const ch of "1bad") hub.handleInput(ch);
+			hub.handleInput("\n");
+			expect(onSavePreset).not.toHaveBeenCalled();
+			expect(footerLine(hub.render(220))).toContain("Name must start with a letter");
+			hub.handleInput(ESC);
+			hub.handleInput(UP);
+			hub.handleInput("x");
+			hub.handleInput("x");
+			expect(onDeletePreset).toHaveBeenCalledWith("alpha");
+			expect(normalize(hub.render(220))).toContain("No presets yet");
+		});
+
+		test("keeps armed delete confirmation visible at narrow widths with a long preset name", () => {
+			const model = makeModel("test", "worker-model");
+			const name = "extraordinarily-long-preset-name-for-narrow-layouts";
+			const settings = withGlobalPresets({ [name]: rawPreset });
+			const { hub } = createHub({ models: [model], scoped: true, settings });
+
+			openPresets(hub);
+			hub.handleInput("x");
+
+			const rendered = hub.render(44);
+			expect(normalize(rendered)).toContain("press x again to delete");
+			expect(footerLine(rendered)).toContain("press x again to delete");
 		});
 	});
 });

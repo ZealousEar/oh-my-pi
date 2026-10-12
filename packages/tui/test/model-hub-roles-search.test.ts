@@ -48,6 +48,7 @@ const source: ModelHubSource = {
 	getProjectModelRole: () => undefined,
 	getGlobalModelRole: () => undefined,
 	getModelRoleSource: () => "default",
+	getModelPresets: () => ({ names: [], active: undefined, summaries: {} }),
 	defaultThinkingLevel: "high",
 	modelProviderOrder: [],
 	knownRoleIds: ["default"],
