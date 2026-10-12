@@ -29,6 +29,8 @@ interface ChromeTabChangeInfo {
 	url?: string;
 	title?: string;
 	status?: string;
+	/** Present when the tab entered or left a tab group (-1 = ungrouped). */
+	groupId?: number;
 }
 
 /** Debuggee with the Chrome 125+ flat-session extension. */
@@ -100,6 +102,7 @@ declare const chrome: {
 		onClicked: ChromeEvent<(tab: ChromeTab) => void>;
 	};
 	runtime: {
+		getManifest(): { version: string };
 		openOptionsPage(): Promise<void>;
 		onInstalled: ChromeEvent<() => void>;
 		onStartup: ChromeEvent<() => void>;
