@@ -3435,11 +3435,12 @@ func (v *AutoCompactionReason) UnmarshalJSON(data []byte) error {
 type AutoCompactionAction string
 
 const (
-	AutoCompactionActionContextFull AutoCompactionAction = "context-full"
-	AutoCompactionActionRemote      AutoCompactionAction = "remote"
-	AutoCompactionActionHandoff     AutoCompactionAction = "handoff"
-	AutoCompactionActionShake       AutoCompactionAction = "shake"
-	AutoCompactionActionSnapcompact AutoCompactionAction = "snapcompact"
+	AutoCompactionActionContextFull   AutoCompactionAction = "context-full"
+	AutoCompactionActionRemote        AutoCompactionAction = "remote"
+	AutoCompactionActionHandoff       AutoCompactionAction = "handoff"
+	AutoCompactionActionShake         AutoCompactionAction = "shake"
+	AutoCompactionActionSemanticShake AutoCompactionAction = "semantic-shake"
+	AutoCompactionActionSnapcompact   AutoCompactionAction = "snapcompact"
 )
 
 func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
@@ -3448,7 +3449,7 @@ func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := AutoCompactionAction(s); value {
-	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact:
+	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSemanticShake, AutoCompactionActionSnapcompact:
 		*v = value
 		return nil
 	}
