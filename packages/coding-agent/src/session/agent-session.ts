@@ -53,7 +53,6 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
-	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AnthropicFallbackCreditHandle,
@@ -342,10 +341,13 @@ import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@
 import { truncateMiddle } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
+	ASYNC_NOTICE_MESSAGE_TYPE,
 	ASYNC_PREVIEW_MAX_CHARS,
 	ASYNC_PREVIEW_TAIL_CHARS,
 	ASYNC_RESULT_MESSAGE_TYPE,
+	type AsyncNoticeEntry,
 	type AsyncResultEntry,
+	buildAsyncNoticeBatchMessage,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
 import { type BashExecuteOptions, BashRunner, type BashRunnerHost } from "./bash-runner";
@@ -493,6 +495,7 @@ import {
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
+	type ShakeOptions,
 } from "./session-maintenance";
 import { classifyTitleDrift } from "./title-drift-classifier";
 import {
@@ -591,6 +594,7 @@ import {
 } from "../utils/title-settings";
 import {
 	cfgArchiveEnabled,
+	cfgAsyncNoProgressWarnMs,
 	cfgCommitEnabled,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
@@ -1216,6 +1220,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	readonly #asyncJobManager: AsyncJobManagerApi | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/** Clears this session's owner notice sink registration (no-progress warnings); set with the delivery sink. */
+	#unregisterAsyncNoticeSink: (() => void) | undefined;
 	/**
 	 * Async-delivery generation, bumped on every session transition that evicts
 	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
@@ -2626,7 +2632,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// are dropped by the drain, so they must not cut a wait short.
 		this.agent.hasBackgroundCompletions = () =>
 			this.yieldQueue.hasDeliverable(LAUNCH_COMPLETION_MESSAGE_TYPE) ||
-			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE);
+			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE) ||
+			this.yieldQueue.hasDeliverable(ASYNC_NOTICE_MESSAGE_TYPE);
 		// Passive asides (`deliverAs: "aside"`) also end an interruptible `wait`
 		// instead of sitting behind it. Deferred wakes are not peeked: no
 		// boundary injection would drain them. Foreground tools are unaffected.
@@ -2797,6 +2804,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
 				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
+			});
+			// One-shot no-progress warnings ride the same queue: a non-interrupting
+			// aside at the next step boundary while streaming, an idle-flush turn
+			// otherwise. A notice whose job has since settled is dropped at flush.
+			this.#unregisterAsyncNoticeSink = manager.registerNoticeSink(
+				this.#agentId,
+				(jobId, text, job) => this.#deliverAsyncJobNotice(jobId, text, job),
+				{ noProgressWarnMs: Math.max(0, cfgAsyncNoProgressWarnMs.get(this.settings)) },
+			);
+			this.yieldQueue.register<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || entry.job.status !== "running",
+				build: buildAsyncNoticeBatchMessage,
 			});
 		}
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
@@ -3646,6 +3665,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// prior session's background result cannot inject into the next transcript.
 		this.#asyncDeliveryEpoch += 1;
 		this.yieldQueue.clear("async-result");
+		this.yieldQueue.clear(ASYNC_NOTICE_MESSAGE_TYPE);
 	}
 
 	/**
@@ -3672,7 +3692,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// (idle-flush delay / step-boundary) handoff window would read as
 			// quiescent and the run driver would drop the queued result. An
 			// entry suppressed after it queued never injects, so it is no wake.
-			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE)
+			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE) ||
+			this.yieldQueue.hasDeliverable(ASYNC_NOTICE_MESSAGE_TYPE)
 		);
 	}
 
@@ -3806,6 +3827,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			job,
 			durationMs,
 			epoch,
+		});
+	}
+
+	/**
+	 * Notice sink for running jobs owned by this agent (no-progress warning):
+	 * enqueue on the yield queue so delivery is non-interrupting while streaming
+	 * and wakes an idle session the same way an async-result does.
+	 */
+	#deliverAsyncJobNotice(jobId: string, text: string, job: AsyncJob): void {
+		if (this.#isDisposed) return;
+		this.yieldQueue.enqueue<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
+			jobId,
+			text,
+			job,
+			epoch: this.#asyncDeliveryEpoch,
 		});
 	}
 
@@ -6714,6 +6750,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
+		this.#unregisterAsyncNoticeSink?.();
+		this.#unregisterAsyncNoticeSink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The shutdown reason is reserved for the top-level session that OWNS the
 		// manager — the genuine process/handled-shutdown path — so the task
@@ -7852,7 +7890,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/** Reduce stored context with the selected shake strategy. */
-	shake(mode: ShakeMode, opts: { config?: ShakeConfig; signal?: AbortSignal } = {}): Promise<ShakeResult> {
+	shake(mode: ShakeMode, opts: ShakeOptions = {}): Promise<ShakeResult> {
 		return this.#inLogContext(() => this.#maintenance.shake(mode, opts));
 	}
 
