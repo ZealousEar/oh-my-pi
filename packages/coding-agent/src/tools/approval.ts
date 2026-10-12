@@ -56,7 +56,9 @@ function asPolicyMap(value: unknown): Record<string, unknown> {
  * Missing context (or context with no settings and no `--auto-approve`) is
  * fail-closed: `always-ask` with an empty policy map — no user grant. When
  * settings are present, the configured `tools.approvalMode` is used (schema
- * default remains `yolo`). `--auto-approve` still forces `yolo`.
+ * default remains `yolo`). `--auto-approve` still selects `yolo`, but browser
+ * and computer exec calls remain prompts until their automation capability is
+ * resolved at the host dispatch boundary.
  *
  * Shared by `ExtensionToolWrapper.execute`, `refuseByWritePolicy`,
  * `mcpApprovalPreflight`, and eval prelude host calls so those sites cannot
@@ -195,10 +197,14 @@ function modeApprovesTier(mode: ApprovalMode, tier: ToolTier): boolean {
  *     the keyed sub-tool (e.g. an `xd://` device dispatch without a device
  *     policy still honors `tools.approval.write`).
  *  2. User per-tool override, if set and valid.
- *  3. Active mode tier comparison.
+ *  3. Browser/computer exec calls remain prompts: only the separate exact
+ *     automation-scope policy (`tools/automation-policy.ts`) can authorize
+ *     their mutation.
+ *  4. Active mode tier comparison.
  *
  * In yolo mode, override-based tool prompts are ignored; user `tools.approval`
- * settings remain authoritative.
+ * settings remain authoritative except that neither can grant browser/computer
+ * mutation scope.
  */
 export function resolveApproval(
 	tool: ApprovalSubject,
@@ -249,6 +255,18 @@ export function resolveApproval(
 			override: decision.override,
 			source: "user",
 			...(combinedUserPolicyKey ? { policyKey: combinedUserPolicyKey } : {}),
+		};
+	}
+
+	const exactAutomationScopeRequired =
+		decision.tier === "exec" && (tool.name === "browser" || tool.name === "computer");
+	if (exactAutomationScopeRequired) {
+		return {
+			policy: "prompt",
+			tier: decision.tier,
+			override: false,
+			source: "tool",
+			reason: "Browser/computer mutations require an explicit user-granted automation capability.",
 		};
 	}
 

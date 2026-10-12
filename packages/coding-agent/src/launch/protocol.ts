@@ -204,6 +204,8 @@ function readySpec(value: unknown): DaemonReadySpec {
 export function parseDaemonSpec(value: unknown): DaemonSpec {
 	const source = record(value, "daemon spec");
 	const detached = source.detached === undefined ? false : booleanValue(source.detached, "spec.detached");
+	const lifetimeMs = optionalNumber(source.lifetimeMs, "spec.lifetimeMs");
+	if (lifetimeMs !== undefined && !(lifetimeMs > 0)) throw new Error("spec.lifetimeMs must be > 0");
 	return {
 		name: stringValue(source.name, "spec.name"),
 		application: stringValue(source.application, "spec.application"),
@@ -215,6 +217,7 @@ export function parseDaemonSpec(value: unknown): DaemonSpec {
 		restart: restartPolicy(source.restart),
 		persist: booleanValue(source.persist, "spec.persist") || detached,
 		detached,
+		lifetimeMs,
 	};
 }
 
@@ -239,6 +242,7 @@ export function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
 		readyPending: source.readyPending === undefined ? undefined : readyPendingList(source.readyPending),
 		persist: booleanValue(source.persist, "daemon.persist"),
 		detached: source.detached === undefined ? false : booleanValue(source.detached, "daemon.detached"),
+		deadlineAt: optionalNumber(source.deadlineAt, "daemon.deadlineAt"),
 	};
 }
 

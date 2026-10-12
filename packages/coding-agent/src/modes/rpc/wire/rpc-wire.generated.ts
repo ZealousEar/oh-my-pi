@@ -670,7 +670,7 @@ export interface PromptAck {
 
 export type AutoCompactionReason = "threshold" | "overflow" | "idle" | "incomplete";
 
-export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "semantic-shake" | "snapcompact";
 
 export type CacheWarmingPhase = "streaming" | "idle";
 

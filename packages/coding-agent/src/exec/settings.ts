@@ -246,6 +246,53 @@ export const cfgShellMinimizer = combine({
 /** Shell output minimizer configuration ({@link cfgShellMinimizer}). */
 export type ShellMinimizerSettings = SettingValueOf<typeof cfgShellMinimizer>;
 
+// Bash output pruning (after the shell minimizer; semantic mode also needs reduction.egress = selected)
+export const cfgBashOutputPruningMode = register({
+	id: "bash.outputPruning.mode",
+	type: "enum",
+	values: ["off", "deterministic", "semantic"] as const,
+	default: "off",
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Output Pruning",
+		description:
+			"Reduce a completed command's model-visible output after the shell minimizer: deterministic keeps recognised diagnostics, counts, exit status, and structured content and drops recognised build/install/test noise; semantic additionally asks a bounded judgment which remaining noisy spans can be omitted (requires reduction.egress = selected). The lossless original is always saved first and linked once",
+	},
+});
+
+export const cfgBashOutputPruningMinTokens = register({
+	id: "bash.outputPruning.minTokens",
+	type: "number",
+	default: 1_500,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Output Pruning Threshold",
+		description: "Model-visible output tokens (markers and footers included) below which pruning is skipped",
+	},
+});
+
+export const cfgBashOutputPruningMaxSegments = register({
+	id: "bash.outputPruning.maxSegments",
+	type: "number",
+	default: 40,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Output Pruning Segments per Call",
+		description:
+			"Candidate spans offered to one judgment request; larger outputs are judged in bounded batches or left untouched",
+	},
+});
+
+/** Bash output pruning configuration (`bash.outputPruning.*`). */
+export const cfgBashOutputPruning = combine({
+	mode: cfgBashOutputPruningMode,
+	minTokens: cfgBashOutputPruningMinTokens,
+	maxSegments: cfgBashOutputPruningMaxSegments,
+});
+
 export const cfgBashAutoBackgroundThresholdMs = register({
 	id: "bash.autoBackground.thresholdMs",
 	protocolDefault: ["rpc"],

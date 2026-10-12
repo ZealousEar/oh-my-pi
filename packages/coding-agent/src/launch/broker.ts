@@ -100,6 +100,10 @@ interface ManagedDaemon {
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
+	/** Armed once per record for `spec.lifetimeMs`; relaunches never rearm it. */
+	lifetimeTimer?: NodeJS.Timeout;
+	/** Set when the lifetime deadline fired; #settle records it as the exit reason. */
+	lifetimeExpired: boolean;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -172,6 +176,11 @@ function reapRecoveredSnapshot(snapshot: DaemonSnapshot, now: number): boolean {
 	snapshot.exitedAt = now;
 	snapshot.exitReason = "previous broker exited";
 	return true;
+}
+
+/** Exit reason recorded on the snapshot and in output.log when a finite run outlives `spec.lifetimeMs`. */
+function lifetimeExpiredReason(spec: DaemonSpec): string {
+	return `lifetime of ${Math.round((spec.lifetimeMs ?? 0) / 1_000)}s expired`;
 }
 
 /** Mirror per-condition readiness progress into the snapshot so clients can see which condition is unmet. */
@@ -494,6 +503,7 @@ class DaemonBroker {
 			// callback cannot settle the stale record over the new owner's metadata.
 			if (detached) record.generation++;
 			clearTimeout(record.restartTimer);
+			clearTimeout(record.lifetimeTimer);
 			await record.log?.close();
 			await record.persistQueue;
 		}
@@ -736,11 +746,13 @@ class DaemonBroker {
 					owner,
 					persist: spec.persist,
 					detached: spec.detached,
+					deadlineAt: spec.lifetimeMs === undefined ? undefined : now + spec.lifetimeMs,
 				},
 				dir,
 				log: await DaemonLog.create(dir),
 				generation: 0,
 				stopRequested: false,
+				lifetimeExpired: false,
 				logReady: !spec.ready?.log,
 				portReady: spec.ready?.port === undefined,
 				readinessBuffer: "",
@@ -754,6 +766,7 @@ class DaemonBroker {
 			};
 			syncReadyPending(record);
 			this.#records.set(spec.name, record);
+			this.#armLifetime(record);
 		} finally {
 			this.#startingNames.delete(spec.name);
 		}
@@ -1061,7 +1074,7 @@ class DaemonBroker {
 		record.snapshot.pid = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
-		record.snapshot.exitReason = error;
+		record.snapshot.exitReason = error ?? (record.lifetimeExpired ? lifetimeExpiredReason(record.spec) : undefined);
 		record.snapshot.readyPending = undefined;
 		const failed = error !== undefined || (exitCode !== undefined && exitCode !== 0);
 		const shouldRestart =
@@ -1092,9 +1105,13 @@ class DaemonBroker {
 			return;
 		}
 		record.snapshot.state = failed && !record.stopRequested ? "failed" : "exited";
+		clearTimeout(record.lifetimeTimer);
+		record.lifetimeTimer = undefined;
+		// A lifetime expiry is a harness-initiated finish the owner never asked for,
+		// so it is delivered like a natural exit rather than swallowed like a stop.
 		const completion =
 			record.snapshot.owner !== undefined &&
-			!record.stopRequested &&
+			(!record.stopRequested || record.lifetimeExpired) &&
 			this.#completionSubscriptions.has(record.snapshot.owner)
 				? ({
 						event: "daemon-completed",
@@ -1261,8 +1278,11 @@ class DaemonBroker {
 		if (record.restartTimer) {
 			clearTimeout(record.restartTimer);
 			record.restartTimer = undefined;
+			clearTimeout(record.lifetimeTimer);
+			record.lifetimeTimer = undefined;
 			record.snapshot.state = "exited";
 			record.snapshot.exitedAt = Date.now();
+			if (record.lifetimeExpired) record.snapshot.exitReason = lifetimeExpiredReason(record.spec);
 			this.#persist(record);
 			await record.log?.close();
 			record.log = undefined;
@@ -1277,8 +1297,40 @@ class DaemonBroker {
 		if (!settled && record.pty) record.pty.kill();
 	}
 
+	/**
+	 * Arm the one-shot lifetime deadline from `snapshot.deadlineAt`. Automatic
+	 * relaunches keep the original deadline, so this runs once per record (and
+	 * again on broker recovery / explicit restart, from the same absolute time).
+	 * Expiry goes through the ordinary stop path so process-tree termination
+	 * semantics stay in one place.
+	 */
+	#armLifetime(record: ManagedDaemon): void {
+		const deadlineAt = record.snapshot.deadlineAt;
+		if (deadlineAt === undefined) return;
+		clearTimeout(record.lifetimeTimer);
+		record.lifetimeTimer = setTimeout(
+			() => {
+				record.lifetimeTimer = undefined;
+				if (terminalState(record.snapshot.state)) return;
+				record.lifetimeExpired = true;
+				record.log?.append(`\n[${lifetimeExpiredReason(record.spec)}; stopping]\n`);
+				void this.#stopRecord(record, 2_000).catch(error => {
+					logger.warn("Failed to stop daemon whose lifetime expired", {
+						name: record.snapshot.name,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			},
+			Math.max(0, deadlineAt - Date.now()),
+		);
+	}
+
 	async #restart(name: string): Promise<DaemonRpcResult> {
 		const record = this.#record(name);
+		await this.#refreshDetached(record);
+		// Restarting a live finite run keeps its original deadline (total lifetime
+		// across restarts); re-running one that already finished is a fresh run.
+		const freshRun = terminalState(record.snapshot.state);
 		await this.#stopRecord(record, 2_000);
 		await record.log?.close();
 		record.log = await DaemonLog.open(record.dir);
@@ -1288,7 +1340,12 @@ class DaemonBroker {
 		const owner = record.snapshot.owner;
 		record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
 		record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
+		record.lifetimeExpired = false;
+		if (freshRun && record.spec.lifetimeMs !== undefined) {
+			record.snapshot.deadlineAt = Date.now() + record.spec.lifetimeMs;
+		}
 		await this.#launch(record);
+		this.#armLifetime(record);
 		await record.persistQueue;
 		return { op: "restart", daemon: record.snapshot };
 	}
@@ -1437,6 +1494,7 @@ class DaemonBroker {
 					dir,
 					generation: 0,
 					stopRequested: !detached || snapshot.state === "stopping",
+					lifetimeExpired: false,
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),
 					portReady: detached && (spec.ready?.port === undefined || snapshot.state === "ready"),
 					readinessBuffer: "",
@@ -1498,6 +1556,9 @@ class DaemonBroker {
 					void this.#pollPort(record, record.generation, spec.ready);
 				}
 				if (detached) {
+					// The deadline is absolute, so a broker restart neither extends nor
+					// forgets a recovered finite run.
+					this.#armLifetime(record);
 					void this.#monitorRecoveredDetached(record, record.generation).catch(error => {
 						logger.warn("Failed to monitor recovered detached daemon", {
 							name: record.snapshot.name,
