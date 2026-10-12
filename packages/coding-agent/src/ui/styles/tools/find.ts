@@ -71,6 +71,25 @@ function hitItem(cx: PaintContext, hit: UiNode, cwd: string | undefined): TreeIt
 	return rows;
 }
 
+/** A bounded result (`omp.tool.find.result` col) as a tree item: score bar, the linked `source:lines`, its first excerpt line. */
+function resultItem(cx: PaintContext, result: UiNode, cwd: string | undefined): TreeItem {
+	const theme = cx.theme;
+	const [row, excerpt] = result.children();
+	const [gauge, file] = row?.children() ?? [];
+	const progress = (gauge?.props() ?? { value: 0 }) as TspProgressProps & { tone?: TspTone };
+	const rel = (file?.props() as { title?: string } | undefined)?.title ?? "";
+	const code = (excerpt?.props() ?? {}) as { start?: number; text?: string; path?: string };
+	const tone = progress.tone ?? "muted";
+	const isUrl = splitUrlScheme(rel) !== undefined;
+	const label = `${pathText(theme, rel)}${theme.fg("muted", `:${excerpt?.key() ?? ""}`)}`;
+	const link = isUrl
+		? uriLink(cx, label, `${rel}:${code.start}`)
+		: fileLink(cx, label, cwd === undefined ? undefined : path.join(cwd, rel), code.start);
+	return [
+		`${bar(theme, progress.value ?? 0, tone)} ${theme.style(tone, (progress.value ?? 0).toFixed(2))} ${link} ${snippet(theme, code.text ?? "", code.path ?? rel)}`,
+	];
+}
+
 function paintFind(node: UiNode, cx: PaintContext): Block {
 	const props = toolProps(node);
 	const term = (props.term ?? { look: "find" }) as FindTerm;
@@ -100,6 +119,7 @@ function paintFind(node: UiNode, cx: PaintContext): Block {
 	const failures = (term.failures ?? []).map(failure => truncate(theme.fg("warning", failure), cx.width, ""));
 	if (term.empty !== undefined) {
 		rows.push(...wrap(`${searchGlyph(theme, "warning")} ${theme.fg("muted", term.empty)}`, cx.width));
+		for (const note of term.notes ?? []) rows.push(truncate(theme.fg("dim", note), cx.width, ""));
 		for (const match of term.lexical ?? [])
 			rows.push(
 				truncate(
@@ -112,12 +132,17 @@ function paintFind(node: UiNode, cx: PaintContext): Block {
 	}
 	const items = node
 		.children()
-		.filter(child => (child.props() as { role?: string }).role === "omp.tool.find.hit")
-		.map(hit => hitItem(cx, hit, term.cwd));
-	if (term.more) items.push(moreItem(theme, term.more, "hits"));
+		.flatMap(child => {
+			const role = (child.props() as { role?: string }).role;
+			if (role === "omp.tool.find.hit") return [hitItem(cx, child, term.cwd)];
+			if (role === "omp.tool.find.result") return [resultItem(cx, child, term.cwd)];
+			return [];
+		});
+	if (term.more) items.push(moreItem(theme, term.more, term.notes ? "results" : "hits"));
 	rows.push(...treeRows(theme, items, cx.width));
 	if (props.collapsed === false) {
 		if (term.keywords) rows.push(truncate(theme.fg("dim", term.keywords), cx.width, ""));
+		for (const note of term.notes ?? []) rows.push(truncate(theme.fg("dim", note), cx.width, ""));
 		rows.push(...failures);
 	}
 	return { rows };

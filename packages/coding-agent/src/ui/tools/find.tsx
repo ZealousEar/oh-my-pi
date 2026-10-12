@@ -11,6 +11,7 @@ import * as nodePath from "node:path";
 import type { TspText, TspTone } from "@oh-my-pi/pi-wire";
 import type { JSXNode } from "@oh-my-pi/pi-tui";
 import { replaceTabs } from "@oh-my-pi/pi-tui/text/width";
+import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
 import { splitUrlScheme } from "../../internal-urls/url-scheme";
 import type { ToolHead, ToolPresenter, ToolView } from "./contract";
 import { resultText } from "./default";
@@ -23,6 +24,8 @@ export interface FindArgs {
 	readonly query?: string;
 	readonly grep_keywords?: readonly string[];
 	readonly path?: string;
+	/** Bounded mode: the only sources read. */
+	readonly paths?: readonly string[];
 }
 
 /** One judged passage. */
@@ -53,8 +56,43 @@ export interface FindStats {
 	readonly failures?: readonly string[];
 }
 
-/** Result details find reports. */
-export interface FindDetails {
+/** One ranked excerpt of a bounded find. */
+export interface FindBoundedResult {
+	/** The source as the caller named it: cwd-relative file, or an internal URL. */
+	readonly path: string;
+	readonly startLine: number;
+	readonly endLine: number;
+	readonly score: number;
+	readonly snippet: string;
+}
+
+/** Bounded (`paths`) result details: the ranking plus the independent presence verdict. */
+export interface FindBoundedDetails {
+	readonly mode: "bounded";
+	readonly query?: string;
+	readonly answerPresent: number;
+	readonly verdict: string;
+	readonly results: readonly FindBoundedResult[];
+	readonly coverage: {
+		readonly files: number;
+		readonly skipped: readonly { readonly path: string; readonly reason: string }[];
+	};
+	readonly verification: { readonly verified: boolean | "unknown"; readonly detail?: string };
+	readonly provenance: readonly {
+		readonly backend: string;
+		readonly provider: string;
+		readonly model: string;
+		readonly distribution: string;
+		readonly error?: string;
+	}[];
+	readonly usage: { readonly input: number; readonly costUsd: number | "unknown" };
+	readonly elapsedMs?: number;
+	readonly cwd?: string;
+}
+
+/** Cascade (`path`) result details find reports. */
+export interface FindCascadeDetails {
+	readonly mode?: "cascade";
 	readonly query?: string;
 	readonly keywords?: readonly string[];
 	readonly threshold?: number;
@@ -71,6 +109,9 @@ export interface FindDetails {
 		readonly snippet: string;
 	}[];
 }
+
+/** Result details find reports. */
+export type FindDetails = FindCascadeDetails | FindBoundedDetails;
 
 /** Hits listed while collapsed. */
 const COLLAPSED_HITS = 5;
@@ -94,6 +135,8 @@ export type FindTerm = {
 	readonly more?: number;
 	readonly keywords?: string;
 	readonly failures?: readonly string[];
+	/** Bounded mode: judge provenance and verification, shown expanded. */
+	readonly notes?: readonly string[];
 	/** Why there are no hits. */
 	readonly empty?: string;
 	/** Unranked literal matches. */
@@ -129,6 +172,7 @@ function callView(args: FindArgs | undefined, meta?: readonly TspText[]): ToolVi
 	const facts: string[] = [];
 	if (keywords.length > 0) facts.push(keywords.join(" "));
 	if (args?.path) facts.push(`in ${args.path}`);
+	else if (args?.paths) facts.push(`in ${countText(args.paths.length, "path", "paths")}`);
 	return {
 		head: findHead(args?.query, meta ?? facts),
 		term: { look: "find", query: args?.query, facts } satisfies FindTerm,
@@ -177,6 +221,126 @@ function Hit(props: { readonly hit: FindHit; readonly cwd?: string; readonly ran
 	);
 }
 
+/** `13`, `13-17`. */
+function lineSpan(result: FindBoundedResult): string {
+	return result.startLine === result.endLine ? String(result.startLine) : `${result.startLine}-${result.endLine}`;
+}
+
+/** One bounded result: score bar, the source, `score · :lines`, then the excerpt's first line. */
+function BoundedRow(props: { readonly result: FindBoundedResult }): JSXNode {
+	const { result } = props;
+	const tone = scoreTone(result.score);
+	const score = result.score.toFixed(2);
+	const span = lineSpan(result);
+	return (
+		<col key={`${result.path}:${span}`} role="omp.tool.find.result" gap="xs">
+			<row key="result" role="omp.tool.file">
+				<progress value={result.score} tone={tone} title={`score ${score}`} max={{ w: 40 }} />
+				<text spans={pathSpans(result.path)} title={result.path} truncate="middle" lines={1} shrink={1} />
+				<text
+					spans={[
+						{ s: tone, t: score },
+						{ s: "muted", t: ` · :${span}` },
+					]}
+					truncate="end"
+					lines={1}
+					shrink={1}
+				/>
+			</row>
+			<code key={span} text={result.snippet.trimEnd()} path={result.path} start={result.startLine} numbers />
+		</col>
+	);
+}
+
+function boundedView(details: FindBoundedDetails, args: FindArgs | undefined, expanded: boolean): ToolView {
+	const { results, coverage, usage } = details;
+	const query = details.query ?? args?.query;
+	const cost = usage.costUsd === "unknown" ? "cost unknown" : `$${usage.costUsd.toFixed(4)}`;
+	const tone = scoreTone(details.answerPresent);
+	const answer = details.answerPresent.toFixed(2);
+	const accounting = [
+		`${formatNumber(usage.input)} tokens`,
+		cost,
+		...(details.elapsedMs !== undefined ? [formatDuration(details.elapsedMs)] : []),
+	];
+	const warnings: string[] = [];
+	if (coverage.skipped.length > 0) warnings.push(`${coverage.skipped.length} skipped`);
+	if (details.verification.verified === false) warnings.push("source changed");
+	const warningMeta = warnings.map((text): TspText => [{ s: "warning", t: text }]);
+	const verdictMeta: TspText = [
+		{ s: "muted", t: "answerPresent " },
+		{ s: tone, t: answer },
+		{ s: "muted", t: ` ${details.verdict}` },
+	];
+	const notes: string[] = [];
+	const last = details.provenance.at(-1);
+	if (last) {
+		const outcome = last.error ? `failed: ${last.error}` : `${last.distribution} distribution`;
+		notes.push(`${last.backend} judge ${last.provider}/${last.model}, ${outcome}`);
+	}
+	if (details.verification.detail) notes.push(details.verification.detail);
+	const skipped = coverage.skipped.map(skip => `skipped ${skip.path}: ${skip.reason}`);
+	const noticeNodes = [
+		notes.map((note, i) => <text key={`note${i}`} role="omp.tool.notice" spans={[{ s: "muted", t: note }]} wrap="word" />),
+		skipped.map((note, i) => <text key={`skip${i}`} role="omp.tool.notice" spans={[{ s: "warning", t: note }]} wrap="word" />),
+	];
+	const base = {
+		look: "find" as const,
+		result: true,
+		query,
+		warnings,
+		notes,
+		failures: skipped,
+		...(details.cwd !== undefined ? { cwd: details.cwd } : {}),
+	};
+	if (results.length === 0) {
+		return {
+			head: findHead(args?.query, [countText(0, "result"), verdictMeta, ...warningMeta]),
+			tone: "warning",
+			body: noticeNodes,
+			term: {
+				...base,
+				facts: [countText(0, "result"), `answerPresent ${answer} ${details.verdict}`],
+				empty: "No passages ranked",
+			} satisfies FindTerm,
+		};
+	}
+	const shown = expanded ? results : results.slice(0, COLLAPSED_HITS);
+	const more = results.length - shown.length;
+	const foot = [more > 0 ? countText(more, "more result", "more results") : undefined, ...accounting]
+		.filter(Boolean)
+		.join(" · ");
+	return {
+		head: findHead(args?.query, [
+			`${countText(results.length, "result")} · ${countText(coverage.files, "file")}`,
+			verdictMeta,
+			...warningMeta,
+		]),
+		preview: { lines: PREVIEW_LINES },
+		body: [
+			shown.map(result => <BoundedRow result={result} />),
+			noticeNodes,
+			<text
+				key="foot"
+				role="omp.tool.stats"
+				spans={[{ s: "muted", t: foot }]}
+				title={accounting.join(" · ")}
+				wrap="word"
+			/>,
+		],
+		term: {
+			...base,
+			facts: [
+				countText(results.length, "result"),
+				countText(coverage.files, "file"),
+				`answerPresent ${answer} ${details.verdict}`,
+				...accounting,
+			],
+			more,
+		} satisfies FindTerm,
+	};
+}
+
 export const findPresenter: ToolPresenter<FindArgs, FindDetails> = {
 	inline: true,
 	merge: true,
@@ -188,6 +352,9 @@ export const findPresenter: ToolPresenter<FindArgs, FindDetails> = {
 			return inlineErrorView(findHead(args?.query, []), message, {
 				term: { look: "find", result: true, error: message } satisfies FindTerm,
 			});
+		}
+		if (details?.mode === "bounded") {
+			return state.isPartial ? callView(args, []) : boundedView(details, args, state.expanded);
 		}
 		if (!details?.hits) {
 			const progress = resultText(result);

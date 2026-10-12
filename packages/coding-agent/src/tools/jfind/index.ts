@@ -1,18 +1,22 @@
 /**
  * `find`: semantic grep over the workspace, driven by the session's judge
- * role. The exploration (lexical prior, filename ranking, sketch routing,
- * passage verification) lives in {@link runCascade}; this file is the tool
- * contract and the model-facing report.
+ * role. A cascade search (`path`) explores a directory or file — lexical
+ * prior, filename ranking, sketch routing, passage verification — in
+ * {@link runCascade}. A bounded search (`paths`) ranks excerpts of exactly the
+ * named files, globs, and internal URLs and reports the independent
+ * `answerPresent` probability beside the ranking, in {@link runBounded}. This
+ * file is the tool contract and the model-facing report.
  */
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { FindToolDetails } from "../details/find";
+import type { FindCascadeDetails, FindToolDetails } from "../details/find";
 import { ToolError } from "../tool-errors";
-import { formatBytes, formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
+import { formatBytes, formatDuration, formatNumber, prompt } from "@oh-my-pi/pi-utils";
 import { sessionResolveContext } from "../../internal-urls/context";
 import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import {
+	type ChainJudge,
 	hasNativeJudge,
 	type JudgeDeps,
 	journalJudgmentUsage,
@@ -27,22 +31,34 @@ import { resolveToolTier } from "../approval";
 import {
 	formatPathRelativeToCwd,
 	normalizePathLikeInput,
+	parseFindPattern,
 	resolveSearchResultPath,
 	searchPathTier,
 } from "../path-utils";
 import { searchApprovalCacheTargets } from "../search-approval-targets";
 import { cfgFindVerifyModel } from "../settings";
 import { toolResult } from "../tool-result";
+import { runBounded } from "./bounded";
 import { type CascadeResult, runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
-import { cfgFindEnabled, cfgFindHitThreshold } from "../settings";
+import {
+	cfgFindEnabled,
+	cfgFindHitThreshold,
+	cfgSemanticFindMaxBytesPerFile,
+	cfgSemanticFindMaxFiles,
+	cfgSemanticFindMaxPassages,
+} from "../settings";
 
 const findSchema = type({
 	query: "string",
 	grep_keywords: "string[]",
 	"path?": "string",
+	"paths?": "string[]",
+	"unit?": '"line" | "paragraph" | "auto"',
+	"limit?": "number",
+	"context?": "number",
 });
 
 export type FindToolInput = typeof findSchema.infer;
@@ -81,47 +97,44 @@ export function findHintVisible(session: ToolSession): boolean {
 export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 	readonly name = "find";
 	readonly approval = searchPathTier;
-	/** `always-ask-cached` keys: the tree (or file) it searches, as `grep` reports one. */
+	/**
+	 * `always-ask-cached` keys: the tree (or file) a cascade searches, as `grep` reports one, or
+	 * each source a bounded search reads (a glob source keys the folder it walks).
+	 */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
-		const root = (args as { path?: string } | null | undefined)?.path;
+		const input = args as { path?: string; paths?: unknown } | null | undefined;
+		if (Array.isArray(input?.paths)) {
+			const sources = input.paths.filter((entry): entry is string => typeof entry === "string");
+			return searchApprovalCacheTargets(sources, this.session.cwd, entry => parseFindPattern(entry).basePath);
+		}
+		const root = input?.path;
 		return searchApprovalCacheTargets(root ? [root] : [], this.session.cwd, entry => entry);
 	};
 	readonly loadMode = "essential";
 	readonly label = "Find";
 	readonly summary = "Semantic grep: find files and line ranges by describing what they do";
-	readonly description = findDescription;
 	readonly parameters = findSchema;
 	readonly strict = true;
 
 	constructor(private readonly session: ToolSession) {}
 
-	async execute(
-		toolCallId: string,
-		params: FindToolInput,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<FindToolDetails>,
-	): Promise<AgentToolResult<FindToolDetails>> {
-		const query = params.query.trim();
-		if (query.length === 0) throw new ToolError("`query` must be a non-empty description");
-		const cwd = this.session.cwd;
-		const rawScopeInput = params.path === undefined ? "" : normalizePathLikeInput(params.path);
-		// Host paths stay native; internal URLs (`local://`, `omp://`, …) are
-		// listed, scanned, and read in place through the URL filesystem.
-		const filesystem = new InternalUrlFilesystem({
-			context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
-			tier: resolveToolTier(this, params),
+	get description(): string {
+		const settings = this.session.settings;
+		return prompt.render(findDescription, {
+			maxFiles: cfgSemanticFindMaxFiles.get(settings),
+			maxBytesPerFile: cfgSemanticFindMaxBytesPerFile.get(settings),
+			maxPassages: cfgSemanticFindMaxPassages.get(settings),
 		});
-		const root = await resolveSearchRoot(filesystem, rawScopeInput, cwd);
-		const scopePath =
-			root.path === path.resolve(cwd)
-				? undefined
-				: formatPathRelativeToCwd(root.path, cwd, { trailingSlash: root.type === "directory" });
+	}
+
+	/** The session's judge-role chain; its usage journals under `find` when a ledger is reachable. */
+	#judge(): { judge: ChainJudge; deps: JudgeDeps; usageRecorded: boolean } {
 		const registry = this.session.modelRegistry;
 		if (!registry) throw new ToolError("find has no model registry to resolve a judge from");
 		const sessionModel = this.session.getActiveModel?.();
 		const rejected = nativeJudgeRejection(this.session.settings, registry, sessionModel);
 		if (rejected) throw new ToolError(`find is disabled for this session: judge ${rejected}. Use grep.`);
-		const judgeDeps: JudgeDeps = {
+		const deps: JudgeDeps = {
 			settings: this.session.settings,
 			registry,
 			sessionModel,
@@ -132,7 +145,55 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			cache: sharedJudgmentCache(),
 			costGate: this.session.costGate,
 		};
-		const judge = resolveJudge(judgeDeps);
+		return { judge: resolveJudge(deps), deps, usageRecorded: deps.onUsage !== undefined };
+	}
+
+	async execute(
+		toolCallId: string,
+		params: FindToolInput,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<FindToolDetails>,
+	): Promise<AgentToolResult<FindToolDetails>> {
+		const query = params.query.trim();
+		if (query.length === 0) throw new ToolError("`query` must be a non-empty description");
+		const cwd = this.session.cwd;
+		// Host paths stay native; internal URLs (`local://`, `omp://`, …) are
+		// listed, scanned, and read in place through the URL filesystem.
+		const filesystem = new InternalUrlFilesystem({
+			context: sessionResolveContext(this.session, { signal, containSkillPaths: true }),
+			tier: resolveToolTier(this, params),
+		});
+		if (params.paths !== undefined) {
+			if (params.path !== undefined) {
+				throw new ToolError("`path` scopes a cascade search and `paths` names a bounded set; pass one, not both");
+			}
+			const { judge, usageRecorded } = this.#judge();
+			return runBounded({
+				query,
+				paths: params.paths,
+				unit: params.unit,
+				limit: params.limit,
+				context: params.context,
+				cwd,
+				settings: this.session.settings,
+				filesystem,
+				judge,
+				usageRecorded,
+				signal,
+			});
+		}
+		if (params.unit !== undefined || params.limit !== undefined || params.context !== undefined) {
+			throw new ToolError(
+				"`unit`, `limit`, and `context` apply only to a bounded search; name its sources in `paths`",
+			);
+		}
+		const rawScopeInput = params.path === undefined ? "" : normalizePathLikeInput(params.path);
+		const root = await resolveSearchRoot(filesystem, rawScopeInput, cwd);
+		const scopePath =
+			root.path === path.resolve(cwd)
+				? undefined
+				: formatPathRelativeToCwd(root.path, cwd, { trailingSlash: root.type === "directory" });
+		const { judge, deps: judgeDeps } = this.#judge();
 		const verifyModel = cfgFindVerifyModel.get(this.session.settings)?.trim();
 		const verifyJudge = verifyModel ? resolveJudge({ ...judgeDeps, leadModel: verifyModel }) : undefined;
 		const experiment = this.session.spotlight;
@@ -196,7 +257,8 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			...match,
 			rel: formatPathRelativeToCwd(resolveSearchResultPath(root.path, match.rel), cwd),
 		}));
-		const details: FindToolDetails = {
+		const details: FindCascadeDetails = {
+			mode: "cascade",
 			query,
 			keywords,
 			threshold,
@@ -212,7 +274,9 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
 		const disabled =
-			coverage === "unavailable" ? nativeJudgeRejection(this.session.settings, registry, sessionModel) : undefined;
+			coverage === "unavailable"
+				? nativeJudgeRejection(this.session.settings, judgeDeps.registry, judgeDeps.sessionModel)
+				: undefined;
 		if (disabled) {
 			out.push(
 				`find is disabled for this session: judge ${disabled}. Nothing was judged for "${query}"${where}; use grep.`,

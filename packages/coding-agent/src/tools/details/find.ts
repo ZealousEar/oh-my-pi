@@ -10,7 +10,7 @@ export interface FindRange {
 
 /** A file whose verified passages cleared the threshold; `ranges` are merged positive spans, strongest first. */
 export interface FindHit {
-	/** Display path relative to {@link FindToolDetails.cwd}, or an internal URL under URL scopes. */
+	/** Display path relative to {@link FindCascadeDetails.cwd}, or an internal URL under URL scopes. */
 	rel: string;
 	/** Filename judgment, when the name batch answered. */
 	nameScore?: number;
@@ -24,7 +24,7 @@ export interface FindHit {
 
 /** One literal keyword line from a file the lexical pass already read; unranked and not semantically judged. */
 export interface FindLexicalMatch {
-	/** Display path relative to {@link FindToolDetails.cwd}, or an internal URL under URL scopes. */
+	/** Display path relative to {@link FindCascadeDetails.cwd}, or an internal URL under URL scopes. */
 	rel: string;
 	/** 1-based line number in the file. */
 	line: number;
@@ -71,8 +71,9 @@ export interface FindStats {
 	failures: string[];
 }
 
-/** Display metadata for find tool results. */
-export interface FindToolDetails {
+/** Display metadata for cascade (`path`) find results. */
+export interface FindCascadeDetails {
+	mode: "cascade";
 	query: string;
 	/** Lexical keywords actually used: derived from the query plus `grep_keywords`. */
 	keywords: string[];
@@ -92,3 +93,75 @@ export interface FindToolDetails {
 	scopePath?: string;
 	meta?: OutputMeta;
 }
+
+/** One ranked excerpt of a bounded find; `read path:startLine-endLine` re-reads it verbatim. */
+export interface FindBoundedResult {
+	/** Path as the caller named it: cwd-relative file, or an internal URL. */
+	path: string;
+	/** Absolute host path, or the internal URL of a rendered resource. */
+	resolved: string;
+	startLine: number;
+	endLine: number;
+	/** Share of the final ranking distribution; sums to 1 over the ranked pool. */
+	score: number;
+	/** First non-blank line of the excerpt, trimmed. */
+	snippet: string;
+}
+
+/** What a bounded find read and how many judgment requests it spent. */
+export interface FindBoundedCoverage {
+	files: number;
+	passages: number;
+	windows: number;
+	passes: number;
+	/** First-pass finalists `limit` admitted that the single finalist request could not seat. */
+	finalistsDropped: number;
+	/** Named inputs that were not read, each with its reason. */
+	skipped: Array<{ path: string; reason: string }>;
+}
+
+/** One judgment attempt behind a bounded find, as the transcript names it. */
+export interface FindJudgeAttempt {
+	backend: string;
+	provider: string;
+	model: string;
+	distribution: string;
+	fallback?: { from: string; reason?: string };
+	error?: string;
+}
+
+/** Aggregate of every judgment attempt made for one bounded find, failed ones included. */
+export interface FindBoundedUsage {
+	calls: number;
+	attempts: number;
+	input: number;
+	output: number;
+	costUsd: number | "unknown";
+}
+
+export type FindAnswerVerdict = "absent" | "partial" | "present";
+
+/** Display metadata for bounded (`paths`) find results. */
+export interface FindBoundedDetails {
+	mode: "bounded";
+	query: string;
+	/** Independent probability that the named sources answer the query; never derived from the ranking. */
+	answerPresent: number;
+	/** `unknown` only when {@link error} is set: ranking produced no verdict. */
+	verdict: FindAnswerVerdict | "unknown";
+	results: FindBoundedResult[];
+	coverage: FindBoundedCoverage;
+	/** Re-read check of every reported range against its source. */
+	verification: { verified: boolean | "unknown"; detail?: string };
+	/** Every judgment attempt in order; the last row names the judge that answered or was last asked. */
+	provenance: FindJudgeAttempt[];
+	usage: FindBoundedUsage;
+	elapsedMs: number;
+	/** Session cwd; result paths are relative to it. */
+	cwd: string;
+	/** Why ranking failed; `provenance`/`usage` still account for every attempt made before it did. */
+	error?: string;
+	meta?: OutputMeta;
+}
+
+export type FindToolDetails = FindCascadeDetails | FindBoundedDetails;
