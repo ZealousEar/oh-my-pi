@@ -34,6 +34,7 @@ def _make_browser():
             values.append(options)
         return values
 
+    # The host gates ordinary mutations by exact origin/action and raw code by an explicit whole-browser or exact-code capability.
     async def _invoke(action, options):
         response = await _omp_prelude(
             "browser",
@@ -563,6 +564,35 @@ def _make_browser():
                 raise TypeError("tab.ref() expects a non-empty reference id")
             return _Element(self._name, "ref", ref_id)
 
+        async def task(
+            self,
+            goal,
+            *,
+            values=None,
+            expect=None,
+            maxActions=None,
+            maxCalls=None,
+            timeout=None,
+            allowConsequential=None,
+        ):
+            """Run one bounded goal-directed task on this tab and return its result."""
+            if not isinstance(goal, str) or not goal.strip():
+                raise TypeError("tab.task() requires a non-empty goal string")
+            details = await _invoke(
+                "task",
+                {
+                    "name": self._name,
+                    "goal": goal,
+                    "values": values,
+                    "expect": expect,
+                    "maxActions": maxActions,
+                    "maxCalls": maxCalls,
+                    "timeout": timeout,
+                    "allowConsequential": allowConsequential,
+                },
+            )
+            return details.get("value")
+
         def frame(self, selector_or_name_or_url):
             """Return a synchronous proxy for a child frame."""
             if not isinstance(selector_or_name_or_url, str) or not selector_or_name_or_url:
@@ -600,6 +630,7 @@ def _make_browser():
             app=None,
             argv=None,
             target=None,
+            new_tab=None,
             viewport=None,
             wait_until=None,
             dialogs=None,
@@ -623,6 +654,7 @@ def _make_browser():
                     "app": app,
                     "argv": argv,
                     "target": target,
+                    "new_tab": new_tab,
                     "viewport": viewport,
                     "wait_until": wait_until,
                     "dialogs": dialogs,

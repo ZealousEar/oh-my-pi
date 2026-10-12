@@ -25,6 +25,7 @@
 		while (trimmed.length > 0 && trimmed[trimmed.length - 1] === undefined) trimmed.pop();
 		return trimmed.map(value => encodeArg(label, value));
 	};
+	// The host gates ordinary mutations by exact origin/action and raw code by an explicit whole-browser or exact-code capability.
 	const invoke = async (action, options) => {
 		const response = await globalThis.__omp_prelude__("browser", { ...options, action });
 		if (response && typeof response.text === "string" && response.text.length > 0) {
@@ -388,6 +389,14 @@
 		tab.frame = selector => makeFrame(name, selector);
 		tab.observe = (...args) =>
 			callValue(name, [{ method: "observe", args: encodeArgs("tab helper argument", args) }]).then(withPrintForm);
+		tab.task = async options => {
+			const opts = validateOptions("tab.task", options);
+			if (typeof opts.goal !== "string" || opts.goal.trim().length === 0) {
+				throw new TypeError("tab.task() requires a non-empty goal string");
+			}
+			const details = await invoke("task", { ...opts, name });
+			return details.value;
+		};
 		tab.run = async (fnOrCode, options) => {
 			if (typeof fnOrCode !== "function" && typeof fnOrCode !== "string") {
 				throw new TypeError("tab.run() expects a function or code string");
