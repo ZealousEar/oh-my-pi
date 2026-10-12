@@ -2485,9 +2485,11 @@ export class EventController {
 					? "Auto-handoff"
 					: event.action === "shake"
 						? "Auto-shake"
-						: event.action === "snapcompact"
-							? "Auto-snapcompact"
-							: "Auto context-full maintenance";
+						: event.action === "semantic-shake"
+							? "Auto-semantic-shake"
+							: event.action === "snapcompact"
+								? "Auto-snapcompact"
+								: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -2527,7 +2529,8 @@ export class EventController {
 		this.#syncComposerActivity();
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
-		const isShakeAction = event.action === "shake";
+		const isShakeAction = event.action === "shake" || event.action === "semantic-shake";
+		const shakeLabel = event.action === "semantic-shake" ? "Auto-semantic-shake" : "Auto-shake";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
@@ -2536,7 +2539,7 @@ export class EventController {
 					: isRemoteAction
 						? "Auto server compaction cancelled"
 						: isShakeAction
-							? "Auto-shake cancelled"
+							? `${shakeLabel} cancelled`
 							: isSnapcompactAction
 								? "Auto-snapcompact cancelled"
 								: "Auto context-full maintenance cancelled",
@@ -2558,7 +2561,7 @@ export class EventController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender(true, { clearScrollback: true });
-				this.ctx.showStatus("Auto-shake completed");
+				this.ctx.showStatus(`${shakeLabel} completed`);
 			}
 		} else if (event.result) {
 			this.ctx.lastAssistantUsage = undefined;
