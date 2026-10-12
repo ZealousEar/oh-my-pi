@@ -169,6 +169,16 @@ export interface CompactionSettings {
 	enabled: boolean;
 	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent?: number;
+	/**
+	 * Smallest policy window on which the absolute settings apply
+	 * ({@link thresholdPercent}, {@link reserveTokens}, {@link keepRecentTokens}).
+	 * Smaller windows are sized from the window instead: compaction at the
+	 * window minus 15% (unless {@link thresholdTokens} is set), a verbatim tail of
+	 * at most 25%, and a 15% summary reserve. The policy window is the context
+	 * window, or a smaller {@link baseWindowTokens}. `<= 0` (the default)
+	 * applies the configured values on every window.
+	 */
+	thresholdMinContextWindow?: number;
 	thresholdTokens?: number;
 	/**
 	 * Stands in for the context window when the percentage or reserve-based
@@ -384,6 +394,18 @@ export function promptBudgetTokens(contextWindow: number, settings: CompactionSe
 	return Math.max(0, Math.min(contextWindow - 1, contextWindow - resolveBudgetReserveTokens(contextWindow, settings)));
 }
 
+/**
+ * The window the percentage/reserve policies scale from: the context window,
+ * capped by a smaller positive {@link CompactionSettings.baseWindowTokens}.
+ */
+function policyWindowTokens(contextWindow: number, settings: CompactionSettings): number {
+	const baseWindowTokens = settings.baseWindowTokens;
+	if (typeof baseWindowTokens === "number" && Number.isFinite(baseWindowTokens) && baseWindowTokens > 0) {
+		return Math.min(contextWindow, baseWindowTokens);
+	}
+	return contextWindow;
+}
+
 export function resolveThresholdTokens(contextWindow: number, settings: CompactionSettings): number {
 	// Fixed token limit takes priority over percentage, and is checked against
 	// the real window: `baseWindowTokens` only rescales the policies below.
@@ -398,9 +420,12 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 		if (thresholdTokens >= contextWindow) return promptBudgetTokens(contextWindow, settings);
 		return Math.min(contextWindow - 1, Math.max(1, thresholdTokens));
 	}
-	const baseWindowTokens = settings.baseWindowTokens;
-	if (typeof baseWindowTokens === "number" && Number.isFinite(baseWindowTokens) && baseWindowTokens > 0) {
-		contextWindow = Math.min(contextWindow, baseWindowTokens);
+	contextWindow = policyWindowTokens(contextWindow, settings);
+	// Below the minimum window neither the percentage nor the absolute reserve
+	// applies: compact at the window minus the 15% proportional reserve (>= 1).
+	const minContextWindow = settings.thresholdMinContextWindow ?? 0;
+	if (minContextWindow > 0 && contextWindow < minContextWindow) {
+		return Math.max(0, contextWindow - Math.max(1, Math.floor(contextWindow * 0.15)));
 	}
 
 	// Percentage-based threshold. The default absolute reserve can exceed bundled
@@ -1374,10 +1399,23 @@ export function findReadableCompactionIndex(
  */
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
-	settings: CompactionSettings,
+	configuredSettings: CompactionSettings,
 	activeModel?: Model,
 	tokenizer: Tokenizer = new Tokenizer(activeModel),
 ): CompactionPreparation | undefined {
+	// Below `thresholdMinContextWindow` size the verbatim tail (25%) and the
+	// summary reserve (15%) from the policy window, like the threshold; the
+	// absolute defaults (20k tail, 16k reserve) are sized for 200k+ windows and
+	// alone would refill a 32k window.
+	const policyWindow = policyWindowTokens(activeModel?.contextWindow ?? 0, configuredSettings);
+	const settings =
+		policyWindow > 0 && policyWindow < (configuredSettings.thresholdMinContextWindow ?? 0)
+			? {
+					...configuredSettings,
+					keepRecentTokens: Math.min(configuredSettings.keepRecentTokens, Math.floor(policyWindow * 0.25)),
+					reserveTokens: Math.max(1, Math.floor(policyWindow * 0.15)),
+				}
+			: configuredSettings;
 	const lastEntry = pathEntries[pathEntries.length - 1];
 	// A speculative native record may leave uncovered messages before the record.
 	if (lastEntry?.type === "compaction" && !lastEntry.providerReplayThroughEntryId) {
