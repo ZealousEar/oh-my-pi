@@ -123,6 +123,7 @@ function createTaskSchema(options: {
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
 	structured: boolean;
+	visibleEnabled: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
@@ -130,55 +131,12 @@ function createTaskSchema(options: {
 		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
 		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
-	if (options.batchEnabled) {
-		if (options.isolationEnabled) {
-			const item = type.raw({
-				"name?": "string",
-				agent,
-				task: "string",
-				solutionSpace: "string",
-				...effortField,
-				...schemaFields,
-				...toolsField,
-				"isolated?": "boolean",
-				"+": "delete",
-			});
-			return type.raw({
-				context: "string",
-				tasks: item.array(),
-				"+": "delete",
-			});
-		}
-		const item = type.raw({
-			"name?": "string",
-			agent,
-			task: "string",
-			solutionSpace: "string",
-			...effortField,
-			...schemaFields,
-			...toolsField,
-			"+": "delete",
-		});
-		return type.raw({
-			context: "string",
-			tasks: item.array(),
-			"+": "delete",
-		});
-	}
-	if (options.isolationEnabled) {
-		return type.raw({
-			"name?": "string",
-			agent,
-			task: "string",
-			solutionSpace: "string",
-			...effortField,
-			...schemaFields,
-			...toolsField,
-			"isolated?": "boolean",
-			"+": "delete",
-		});
-	}
-	return type.raw({
+	// Only advertised when a pane backend is actually reachable
+	// (`task.paneBackend`), so the model never requests a visible pane on a
+	// session where every such spawn would fail preflight.
+	const visibleField = options.visibleEnabled ? { "visible?": "boolean" } : {};
+	const isolatedField = options.isolationEnabled ? { "isolated?": "boolean" } : {};
+	const item = type.raw({
 		"name?": "string",
 		agent,
 		task: "string",
@@ -186,6 +144,14 @@ function createTaskSchema(options: {
 		...effortField,
 		...schemaFields,
 		...toolsField,
+		...visibleField,
+		...isolatedField,
+		"+": "delete",
+	});
+	if (!options.batchEnabled) return item;
+	return type.raw({
+		context: "string",
+		tasks: item.array(),
 		"+": "delete",
 	});
 }
@@ -199,20 +165,23 @@ export function getTaskSchema(options: {
 	evalToolsEnabled?: boolean;
 	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
 	structured?: boolean;
+	/** Advertise the per-spawn `visible` field (a non-native `task.paneBackend`). */
+	visibleEnabled?: boolean;
 	defaultAgent?: string;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
 	const structured = options.structured ?? true;
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured) {
+	const visibleEnabled = options.visibleEnabled ?? false;
+	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured && !visibleEnabled) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${visibleEnabled ? "visible" : "hidden"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, structured, defaultAgent });
+	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, structured, visibleEnabled, defaultAgent });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
@@ -240,6 +209,8 @@ export interface AgentDefinition {
 	/** `true` = task spawns keep the `yield` tool and this agent's `output` schema even when `task.structured` is off. */
 	structured?: boolean;
 	autoloadSkills?: string[];
+	/** Skills listed in the spawned session's system prompt; `[]` lists none, absent lists all. Unlisted skills stay loadable via `skill://`. */
+	skills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
 	readSummarize?: boolean;
 	/** Prewalk hand-off for the spawned session: `true` = switch to the default prewalk target at the first edit/write, string = custom target model pattern. */
