@@ -1,0 +1,1 @@
+{{#if yes}}The described workflow of `skills[{{index}}]` would genuinely be used to accomplish `task`.{{else}}`skills[{{index}}]` is unrelated to `task`, or only shares a topic or keyword with it.{{/if}}
