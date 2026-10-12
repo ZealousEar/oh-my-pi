@@ -298,6 +298,11 @@ export interface ParsedAgentFields {
 	output?: unknown;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	autoloadSkills?: string[];
+	/**
+	 * Skills listed in the spawned session's system prompt. `[]` (`skills: none` or `skills: []`) lists none;
+	 * absent or `skills: all` lists every skill. Unlisted skills stay loadable via `skill://`.
+	 */
+	skills?: string[];
 	readSummarize?: boolean;
 	blocking?: boolean;
 	/** `true` = keep `yield` and the output schema when `task.structured` is off. */
@@ -390,6 +395,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
+	const skills = parseSkillsAllowlist(frontmatter.skills);
 	return {
 		name,
 		description,
@@ -401,10 +407,25 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		blocking,
 		structured,
 		autoloadSkills,
+		skills,
 		readSummarize,
 		prewalk,
 		advisor,
 	};
+}
+
+function parseSkillsAllowlist(value: unknown): string[] | undefined {
+	if (Array.isArray(value) && value.length === 0) return [];
+	const names = parseArrayOrCSV(value)
+		?.map(s => s.trim())
+		.filter(Boolean);
+	if (!names || names.length === 0) return undefined;
+	if (names.length === 1) {
+		const keyword = names[0].toLowerCase();
+		if (keyword === "none") return [];
+		if (keyword === "all") return undefined;
+	}
+	return names;
 }
 
 async function globIf(

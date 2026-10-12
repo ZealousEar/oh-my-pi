@@ -3478,6 +3478,7 @@
 				"remote",
 				"handoff",
 				"shake",
+				"semantic-shake",
 				"snapcompact"
 			],
 			"type": "string"
