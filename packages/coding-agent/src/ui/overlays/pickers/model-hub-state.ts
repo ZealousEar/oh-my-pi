@@ -1,8 +1,9 @@
 /**
- * The /models hub's state: a sidebar of scopes (Roles, All models, one entry
- * per provider — signed-out providers too, dimmed) beside either a model list
- * ({@link ModelBrowserState}) or the Roles view, which manages assignments,
- * retry fallback chains, the ctrl+p cycle and presets.
+ * The /models hub's state: a sidebar of scopes (Presets, Roles, All models, one
+ * entry per provider — signed-out providers too, dimmed) beside a model list
+ * ({@link ModelBrowserState}), the Roles view, which manages assignments,
+ * retry fallback chains and the ctrl+p cycle, or the Presets view, which
+ * loads, saves and deletes named routing setups.
  *
  * Arrow keys belong to one pane (`focus`): the sidebar hops scopes, the list
  * moves rows; Tab flips, ←/→ move between them, typing searches the catalog
@@ -38,6 +39,8 @@ import type {
 	ModelHubOptions,
 	ModelHubRegistry,
 	ModelHubSource,
+	ModelPresetApplyResult,
+	ModelPresetListing,
 	ModelRoleSelectionScope,
 	ScopedModelItem,
 } from "../../../modes/view-model/overlays/model-hub";
@@ -58,6 +61,9 @@ export type RolesRow =
 	| { kind: "newFallback" }
 	| { kind: "newRole" };
 
+/** A Presets-view row: a saved preset, or the trailing "+ Save current…" row. */
+export type PresetRow = { kind: "preset"; name: string } | { kind: "newPreset" };
+
 /** What the model list is picking for: a role's model, a fallback slot, or a new chain's protected model. */
 type AssignTarget =
 	| { kind: "role"; role: string }
@@ -67,7 +73,7 @@ type AssignTarget =
 /** A sidebar scope. */
 export interface SidebarEntry {
 	readonly id: string;
-	readonly kind: "recent" | "roles" | "all" | "separator" | "provider";
+	readonly kind: "recent" | "presets" | "roles" | "all" | "separator" | "provider";
 	readonly label: string;
 	readonly annotation?: string;
 	readonly providerId?: string;
@@ -101,7 +107,13 @@ export type StripState =
 			/** The thinking level already committed. */
 			initialThinkingLevel?: ConfiguredThinkingLevel;
 	  }
-	| { kind: "name"; purpose: "role" | "preset"; field: LineState }
+	| {
+			kind: "name";
+			purpose: "role" | "preset";
+			field: LineState;
+			/** Why the last Enter was refused (preset names only). */
+			error?: string;
+	  }
 	| {
 			kind: "name";
 			purpose: "compaction";
@@ -126,6 +138,9 @@ export type RolesAction =
 	| "save"
 	| "nextPreset"
 	| "prevPreset";
+
+/** A Presets-view command (keys and action buttons share it). */
+export type PresetsAction = "activate" | "save" | "delete";
 
 /** Letter keys of the Roles view. */
 const ROLES_ACTION_KEYS: Readonly<Record<string, RolesAction>> = {
@@ -166,6 +181,10 @@ export const MODEL_KIND_LABELS: Readonly<Record<"all" | ModelKind, string>> = {
 export const COMPACTION_INPUT_HINT = "400k base · f400k fixed · 80% · empty resets";
 const PROVIDER_REFRESH_DEBOUNCE_MS = 120;
 const RECENT_LIMIT = 15;
+/** Preset names: a letter, then letters, digits, spaces, `-` or `_` (the host's `isValidModelPresetName`). */
+const PRESET_NAME_PATTERN = /^[a-zA-Z][\w -]*$/;
+const PRESET_NAME_ERROR = "Name must start with a letter (letters, digits, space, - and _).";
+const NO_PRESETS: ModelPresetListing = { names: [], active: undefined, summaries: {} };
 /** Stable key of a Roles-view row (picker item id). */
 export function rolesRowKey(row: RolesRow, index: number): string {
 	switch (row.kind) {
@@ -181,6 +200,11 @@ export function rolesRowKey(row: RolesRow, index: number): string {
 		case "newFallback":
 			return row.kind;
 	}
+}
+
+/** Stable key of a Presets-view row (picker item id). */
+export function presetRowKey(row: PresetRow): string {
+	return row.kind === "preset" ? `preset:${row.name}` : row.kind;
 }
 
 /** Providers already auto-refreshed this process (selecting one fetches its list at most once; F5 forces). */
@@ -241,6 +265,16 @@ export class ModelHubState {
 	#roleIndex = 0;
 	#roleHover: number | null = null;
 	#roleScrollStart = 0;
+
+	#presetListing: ModelPresetListing = NO_PRESETS;
+	#presetsRows: PresetRow[] = [];
+	#presetIndex = 0;
+	#presetHover: number | null = null;
+	#presetScrollStart = 0;
+	/** Preset being applied through the host; every input is dropped until it settles. */
+	#applyingPreset: string | null = null;
+	/** Preset whose deletion `x` armed; the next `x` deletes it, any navigation disarms. */
+	#deleteArmed: string | null = null;
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
@@ -371,6 +405,26 @@ export class ModelHubState {
 		return this.#roleHover;
 	}
 
+	get presetsRows(): readonly PresetRow[] {
+		return this.#presetsRows;
+	}
+
+	get presetIndex(): number {
+		return this.#presetIndex;
+	}
+
+	get presetHover(): number | null {
+		return this.#presetHover;
+	}
+
+	get applyingPreset(): string | null {
+		return this.#applyingPreset;
+	}
+
+	get deleteArmed(): string | null {
+		return this.#deleteArmed;
+	}
+
 	get roleTab(): RoleTab {
 		return this.#roleTab;
 	}
@@ -432,6 +486,11 @@ export class ModelHubState {
 		return this.activeEntry().kind === "roles" && this.#assigning === null;
 	}
 
+	/** The Presets view is showing. */
+	presetsView(): boolean {
+		return this.activeEntry().kind === "presets" && this.#assigning === null;
+	}
+
 	/** A signed-out provider's pane is showing. */
 	lockedView(): boolean {
 		const entry = this.activeEntry();
@@ -469,6 +528,17 @@ export class ModelHubState {
 		return { start, end: Math.min(start + height, total), overflow };
 	}
 
+	/** Presets rows the view shows at once: the pane less its status row, spacer row and hint row. */
+	presetsWindow(): { start: number; end: number } {
+		const total = this.#presetsRows.length;
+		const capacity = Math.max(1, this.contentRows() - 1 - 2);
+		let start = this.#presetScrollStart;
+		if (this.#presetIndex < start) start = this.#presetIndex;
+		else if (this.#presetIndex >= start + capacity) start = this.#presetIndex - capacity + 1;
+		start = Math.max(0, Math.min(start, Math.max(0, total - capacity)));
+		return { start, end: Math.min(start + capacity, total) };
+	}
+
 	/** The fallback chains with malformed keys and entries dropped. */
 	fallbackChains(): Record<string, string[]> {
 		try {
@@ -493,10 +563,14 @@ export class ModelHubState {
 		}
 	}
 
-	/** Saved presets and the one the setup matches; empty unless the host can both list and switch. */
-	presets(): { names: readonly string[]; active: string | undefined } {
-		if (!this.callbacks.onSwitchPreset || !this.source.getModelPresets) return { names: [], active: undefined };
-		return this.source.getModelPresets();
+	/** Saved presets, the one the routing matches and a summary each, as of the last sync; hosts without presets have none. */
+	presets(): ModelPresetListing {
+		return this.#presetListing;
+	}
+
+	/** Whether the Roles view can step through presets (ctrl+←/→, p/⇧P): a host that applies, and something to apply. */
+	canSwitchPresets(): boolean {
+		return this.callbacks.onApplyPreset !== undefined && this.#presetListing.names.length > 0;
 	}
 
 	/** Rows the Roles view lists on the All tab (separators aside): the picker's `total`. */
@@ -649,6 +723,7 @@ export class ModelHubState {
 		this.#configError = scope.error;
 		this.#roles = scope.roles;
 		this.#buildRolesRows();
+		this.#buildPresetsRows();
 
 		const { mruOrder } = scope;
 		if (this.#availableItems !== scope.availableItems) {
@@ -731,11 +806,20 @@ export class ModelHubState {
 			const assignment = this.#roles[role];
 			if (assignment && !assignment.autoSelected) assigned++;
 		}
-		// Roles leads, so downward hops head into model scopes.
+		// Presets and Roles lead, so downward hops head into model scopes.
 		this.#fixedEntries = [
 			{ id: "roles", kind: "roles", label: "Roles", annotation: `${assigned}/${visibleRoles.length}` },
 			{ id: "all", kind: "all", label: "All models", annotation: String(availableItems.length) },
 		];
+		// A host that lists no presets (`getModelPresets` is optional) gets no Presets scope.
+		if (this.source.getModelPresets) {
+			this.#fixedEntries.unshift({
+				id: "presets",
+				kind: "presets",
+				label: "Presets",
+				annotation: String(this.#presetListing.names.length),
+			});
+		}
 		this.#unlockedProviders = [...unlocked].sort((a, b) => a.localeCompare(b)).map(id => providerEntryOf(id, false));
 		this.#lockedProviders = [...locked].sort((a, b) => a.localeCompare(b)).map(id => providerEntryOf(id, true));
 		this.#composeEntries();
@@ -793,6 +877,7 @@ export class ModelHubState {
 		if (!this.#entries.some(entry => entry.id === id)) return;
 		this.#activeEntryId = id;
 		this.#committed = null;
+		this.#deleteArmed = null;
 		this.#followSidebar();
 		this.#applyScope();
 		const entry = this.activeEntry();
@@ -819,6 +904,9 @@ export class ModelHubState {
 				break;
 			case "roles":
 				this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRows.length - 1));
+				break;
+			case "presets":
+				this.#presetIndex = Math.min(this.#presetIndex, Math.max(0, this.#presetsRows.length - 1));
 				break;
 			default:
 				this.browser.setShowProvider(true);
@@ -881,6 +969,18 @@ export class ModelHubState {
 		this.#rolesRows = rows;
 	}
 
+	/** Re-read the host's presets and rebuild the Presets rows: each saved preset, then the trailing "+ Save current…". */
+	#buildPresetsRows(): void {
+		const listing = this.source.getModelPresets?.() ?? NO_PRESETS;
+		this.#presetListing = listing;
+		this.#presetsRows = [
+			...listing.names.map((name): PresetRow => ({ kind: "preset", name })),
+			{ kind: "newPreset" },
+		];
+		this.#presetIndex = Math.min(this.#presetIndex, this.#presetsRows.length - 1);
+		if (this.#deleteArmed !== null && !listing.names.includes(this.#deleteArmed)) this.#deleteArmed = null;
+	}
+
 	/** Re-read everything after settings changed outside the hub. */
 	refreshAfterExternalMutation(): void {
 		this.#sync();
@@ -927,12 +1027,12 @@ export class ModelHubState {
 		this.#bump();
 	}
 
-	/** Entries the scope hop skips: separators; while searching also Roles, an empty Recent, locked and matchless providers. */
+	/** Entries the scope hop skips: separators; while searching also Presets, Roles, an empty Recent, locked and matchless providers. */
 	#isHopSkipped(entry: SidebarEntry): boolean {
 		if (entry.kind === "separator") return true;
 		const counts = this.#searchCounts;
 		if (!counts) return false;
-		if (entry.kind === "roles") return true;
+		if (entry.kind === "roles" || entry.kind === "presets") return true;
 		if (entry.kind === "recent") return this.#recentSearchCount === 0;
 		if (entry.kind === "provider") return entry.locked === true || (counts.get(entry.providerId ?? "") ?? 0) === 0;
 		return false;
@@ -1429,23 +1529,28 @@ export class ModelHubState {
 			return;
 		}
 		const name = strip.field.text.trim();
-		if (!/^[a-zA-Z][\w-]*$/.test(name)) return;
 		if (strip.purpose === "preset") {
+			// An invalid name keeps the field open and shows the rule in place of its hint until the next edit.
+			if (!PRESET_NAME_PATTERN.test(name)) {
+				strip.error = PRESET_NAME_ERROR;
+				return;
+			}
 			this.#strip = null;
-			this.callbacks.onSavePreset?.(name);
-			this.#sync();
+			this.#savePreset(name);
 			return;
 		}
+		if (!/^[a-zA-Z][\w-]*$/.test(name)) return;
 		if (this.visibleRoleIds().includes(name)) return;
 		this.#strip = null;
 		this.#startAssign(name);
 	}
 
-	/** Apply the previous/next saved preset (wrapping). */
+	// ─── Presets ────────────────────────────────────────────────────────────
+
+	/** Apply the previous/next saved preset (wrapping), as `/modelpreset switch` does. */
 	#switchPreset(delta: -1 | 1): void {
-		const onSwitchPreset = this.callbacks.onSwitchPreset;
-		const { names, active } = this.presets();
-		if (!onSwitchPreset || names.length === 0) return;
+		if (!this.canSwitchPresets()) return;
+		const { names, active } = this.#presetListing;
 		// Step from the last preset tried while nothing changed since (a refused switch writes nothing), else the active one.
 		const cursor = this.#presetCursor;
 		const base = cursor && (active === undefined || cursor.revision === this.source.revision) ? cursor.name : active;
@@ -1455,13 +1560,136 @@ export class ModelHubState {
 		if (name === undefined) return;
 		const settle = (): void => {
 			this.#presetCursor = { name, revision: this.source.revision };
+		};
+		// Stepping onto the preset already in effect has nothing to apply.
+		if (name === active) {
+			settle();
+			this.#sync();
+			return;
+		}
+		// The host reports refusals itself, so the cursor moves once the switch settles, refused or not.
+		this.#applyPreset(name, settle);
+	}
+
+	/**
+	 * Load saved preset `name` through the host. The hub freezes (every key, pointer and picker event
+	 * is dropped) until the host settles — resolved, rejected or thrown — then `onSettled` runs and the
+	 * view re-syncs. The host owns outcome reporting, so a refusal just leaves the hub retryable.
+	 */
+	#applyPreset(name: string, onSettled?: () => void): void {
+		const apply = this.callbacks.onApplyPreset;
+		if (this.#applyingPreset !== null || !apply || !this.#presetListing.names.includes(name)) return;
+		this.#applyingPreset = name;
+		this.#bump();
+		const settle = (): void => {
+			this.#applyingPreset = null;
+			onSettled?.();
+			if (this.#disposed) return;
 			this.#sync();
 		};
-		if (name === active) {
+		let pending: Promise<ModelPresetApplyResult> | ModelPresetApplyResult;
+		try {
+			pending = apply(name);
+		} catch {
 			settle();
 			return;
 		}
-		this.#finishAssignment(onSwitchPreset(name), settle);
+		if (pending instanceof Promise) void pending.then(settle, settle);
+		else settle();
+	}
+
+	/** Persist the current routing as `name` through the host, then land the Presets cursor on its row. */
+	#savePreset(name: string): void {
+		this.callbacks.onSavePreset?.(name);
+		this.#sync();
+		const at = this.#presetsRows.findIndex(row => row.kind === "preset" && row.name === name);
+		if (at >= 0) this.#selectPreset(at);
+	}
+
+	/** Delete `name` through the host; the cursor steps up onto the nearest surviving row. */
+	#deletePreset(name: string): void {
+		this.callbacks.onDeletePreset?.(name);
+		this.#sync();
+		this.#selectPreset(this.#stepPresetIndex(this.#presetIndex, -1, false));
+	}
+
+	/** `x` on a preset row: the first press arms deletion of `name`, the second deletes it. */
+	#armOrDeletePreset(name: string): void {
+		if (this.#deleteArmed !== name) {
+			this.#deleteArmed = name;
+			return;
+		}
+		this.#deleteArmed = null;
+		this.#deletePreset(name);
+	}
+
+	/** Step the presets cursor one row; wraps unless `wrap` is false (then the cursor stays put). */
+	#stepPresetIndex(from: number, delta: -1 | 1, wrap = true): number {
+		const count = this.#presetsRows.length;
+		if (count === 0) return 0;
+		const next = from + delta;
+		if (next < 0 || next >= count) return wrap ? (next + count) % count : from;
+		return next;
+	}
+
+	#selectPreset(index: number): void {
+		this.#presetIndex = index;
+		this.#presetScrollStart = this.presetsWindow().start;
+	}
+
+	#openPresetNameStrip(): void {
+		if (this.callbacks.onSavePreset)
+			this.#strip = { kind: "name", purpose: "preset", field: { text: "", cursor: 0 } };
+	}
+
+	/** Enter/click on a Presets row: load the preset, or name a new one. */
+	#activatePresetRow(row: PresetRow): void {
+		this.#deleteArmed = null;
+		if (row.kind === "newPreset") this.#openPresetNameStrip();
+		else this.#applyPreset(row.name);
+	}
+
+	#handlePresetsKey(key: KeyEvent): void {
+		const id = selectKeyId(key);
+		// The sidebar previews the Presets view: Enter/Space dive into the rows.
+		if (this.#focus === "scope") {
+			if (id === "enter" || id === "space") this.#focus = "list";
+			return;
+		}
+		switch (id) {
+			case "up":
+			case "down":
+				this.#deleteArmed = null;
+				this.#selectPreset(this.#stepPresetIndex(this.#presetIndex, id === "up" ? -1 : 1));
+				return;
+			case "enter":
+				this.runPresetsAction("activate");
+				return;
+			case "backspace":
+			case "delete":
+				this.runPresetsAction("delete");
+				return;
+		}
+		const typed = printable(key);
+		if (typed === "x") this.runPresetsAction("delete");
+		else if (typed === "s") this.runPresetsAction("save");
+	}
+
+	/** One Presets-view command on the selected row. */
+	runPresetsAction(action: PresetsAction): void {
+		const row = this.#presetsRows[this.#presetIndex];
+		switch (action) {
+			case "activate":
+				if (row) this.#activatePresetRow(row);
+				return;
+			case "delete":
+				if (row?.kind === "preset" && this.callbacks.onDeletePreset) this.#armOrDeletePreset(row.name);
+				return;
+			case "save":
+				this.#deleteArmed = null;
+				this.#openPresetNameStrip();
+				return;
+		}
 	}
 
 	// ─── Input ──────────────────────────────────────────────────────────────
@@ -1483,6 +1711,8 @@ export class ModelHubState {
 			if (cancelKey) this.callbacks.onCancel();
 			return;
 		}
+		// A preset apply owns the hub until the host settles: no key, not even cancel, gets through.
+		if (this.#applyingPreset !== null) return;
 		if (this.#strip) {
 			this.#handleStripKey(key);
 			return;
@@ -1493,6 +1723,7 @@ export class ModelHubState {
 		}
 		const entry = this.activeEntry();
 		const rolesView = this.rolesView();
+		const presetsView = this.presetsView();
 		const lockedView = this.lockedView();
 		if (id === "tab" || id === "shift+tab") {
 			this.#focus = this.#focus === "scope" ? "list" : "scope";
@@ -1520,7 +1751,7 @@ export class ModelHubState {
 			return;
 		}
 		if (id === "right") {
-			if (rolesView || this.isBrowserView(entry)) this.#focus = "list";
+			if (rolesView || presetsView || this.isBrowserView(entry)) this.#focus = "list";
 			return;
 		}
 		if (this.#focus === "scope" && (id === "up" || id === "down")) {
@@ -1538,6 +1769,17 @@ export class ModelHubState {
 				return;
 			}
 			this.#handleRolesKey(key);
+			return;
+		}
+		if (presetsView) {
+			// Typing searches from the sidebar; in the rows the letter commands own printable keys.
+			if (this.#focus === "scope" && typed !== undefined && typed.trim().length > 0) {
+				this.#setActiveEntry("all");
+				this.#focus = "list";
+				this.browser.handleKey(key);
+				return;
+			}
+			this.#handlePresetsKey(key);
 			return;
 		}
 		if (lockedView) {
@@ -1560,8 +1802,9 @@ export class ModelHubState {
 		if (typed !== undefined || this.browser.query !== before) this.#focus = "list";
 	}
 
-	/** The cancel ladder: close a strip, leave assign mode, clear the query, close the hub. */
+	/** The cancel ladder: close a strip, leave assign mode, clear the query, close the hub. Inert while a preset applies. */
 	cancel(): void {
+		if (this.#applyingPreset !== null) return;
 		if (this.#assignmentPending) {
 			this.callbacks.onCancel();
 			return;
@@ -1596,7 +1839,7 @@ export class ModelHubState {
 			const next = editLine(strip.field, key);
 			if (next) {
 				strip.field = next;
-				if (strip.purpose === "compaction") strip.error = undefined;
+				strip.error = undefined;
 			}
 			return;
 		}
@@ -1623,8 +1866,8 @@ export class ModelHubState {
 			index = (index + delta + count) % count;
 			const entry = this.#entries[index];
 			if (entry && !this.#isHopSkipped(entry)) {
-				// Landing on Roles cancels an assignment; other scopes keep it (scoping helps find the model).
-				if (entry.kind === "roles") this.#assigning = null;
+				// Landing on Roles or Presets cancels an assignment; other scopes keep it (scoping helps find the model).
+				if (entry.kind === "roles" || entry.kind === "presets") this.#assigning = null;
 				this.#setActiveEntry(entry.id);
 				return;
 			}
@@ -1797,8 +2040,7 @@ export class ModelHubState {
 				this.#strip = { kind: "name", purpose: "role", field: { text: "", cursor: 0 } };
 				return;
 			case "save":
-				if (this.callbacks.onSavePreset)
-					this.#strip = { kind: "name", purpose: "preset", field: { text: "", cursor: 0 } };
+				this.#openPresetNameStrip();
 				return;
 			case "nextPreset":
 			case "prevPreset":
@@ -1827,15 +2069,16 @@ export class ModelHubState {
 
 	// ─── Pointer and native events ──────────────────────────────────────────
 
-	/** A click on a sidebar entry: pick the scope (Roles dives into its rows; a second click on a locked provider logs in). */
+	/** A click on a sidebar entry: pick the scope (Roles and Presets dive into their rows; a second click on a locked provider logs in). */
 	clickSidebarEntry(id: string | undefined): void {
 		const clicked = this.#entries.find(entry => entry.id === id);
 		if (!clicked || clicked.kind === "separator") return;
 		batch(() => {
 			const already = clicked.id === this.#activeEntryId;
-			if (clicked.kind === "roles") this.#assigning = null;
+			const management = clicked.kind === "roles" || clicked.kind === "presets";
+			if (management) this.#assigning = null;
 			this.#setActiveEntry(clicked.id);
-			if (clicked.kind === "roles") this.#focus = "list";
+			if (management) this.#focus = "list";
 			if (already && clicked.kind === "provider" && clicked.locked) this.#requestLogin(clicked);
 			this.#bump();
 		});
@@ -1851,7 +2094,7 @@ export class ModelHubState {
 		width: number,
 		chipAt: (col: number) => number | undefined,
 	): void {
-		if (this.#assignmentPending) return;
+		if (this.#assignmentPending || this.#applyingPreset !== null) return;
 		const rows = this.contentRows();
 		const { sidebar } = hubGeometry(width, this.#entries);
 		const footerRow = rows + 2;
@@ -1864,6 +2107,7 @@ export class ModelHubState {
 		const click = event.button === "left" && event.action === "press";
 		const entry = this.activeEntry();
 		const rolesView = this.rolesView();
+		const presetsView = this.presetsView();
 		batch(() => {
 			if (event.row === footerRow && this.#strip) {
 				const strip = this.#strip;
@@ -1883,11 +2127,15 @@ export class ModelHubState {
 					this.#sidebarHover = this.#sidebarEntryAt(content);
 				} else if (overBody) {
 					if (rolesView) this.#selectRole(this.#stepRoleIndex(this.#roleIndex, wheel > 0 ? 1 : -1, false));
-					else if (this.isBrowserView(entry) && bodyLine > 0)
+					else if (presetsView) {
+						this.#deleteArmed = null;
+						this.#selectPreset(this.#stepPresetIndex(this.#presetIndex, wheel > 0 ? 1 : -1, false));
+					} else if (this.isBrowserView(entry) && bodyLine > 0)
 						this.browser.wheel(wheel, this.#browserRow(bodyLine));
 				}
 			} else if (event.action === "move") {
 				this.#sidebarHover = overSidebar ? this.#sidebarEntryAt(content) : null;
+				this.#presetHover = overBody && presetsView ? this.#presetRowAt(bodyLine) : null;
 				if (overBody && rolesView) {
 					const line = bodyLine - 1;
 					const window = this.rolesWindow();
@@ -1915,6 +2163,15 @@ export class ModelHubState {
 								else this.#selectRole(index);
 							}
 						}
+					} else if (presetsView) {
+						this.#focus = "list";
+						const index = this.#presetRowAt(bodyLine);
+						const row = index === null ? undefined : this.#presetsRows[index];
+						if (index !== null && row) {
+							this.#deleteArmed = null;
+							if (index === this.#presetIndex) this.#activatePresetRow(row);
+							else this.#selectPreset(index);
+						}
 					} else if (this.lockedView()) {
 						if (bodyLine === this.lockedLoginLine(entry)) this.#requestLogin(entry);
 					} else if (this.isBrowserView(entry) && bodyLine > 0) {
@@ -1939,6 +2196,13 @@ export class ModelHubState {
 		return line >= 0 && line < this.browser.maxVisible ? line : null;
 	}
 
+	/** The Presets row under body line `bodyLine` (the status row and a spacer row sit above the rows). */
+	#presetRowAt(bodyLine: number): number | null {
+		const window = this.presetsWindow();
+		const line = bodyLine - 1;
+		return line >= 0 && line < window.end - window.start ? line + window.start : null;
+	}
+
 	#sidebarEntryAt(content: number): number | null {
 		const index = this.sidebarScroll() + content;
 		return index >= 0 && index < this.#entries.length ? index : null;
@@ -1953,6 +2217,8 @@ export class ModelHubState {
 	}
 
 	#handleEvent(event: { type: "select" | "activate" | "action"; item?: string; act?: string; value?: string }): void {
+		// Same gate as the keys and the pointer: a preset apply owns the hub until it settles.
+		if (this.#applyingPreset !== null) return;
 		if (event.type === "action" && event.act === "close") {
 			this.cancel();
 			return;
@@ -1960,6 +2226,7 @@ export class ModelHubState {
 		if (this.#assignmentPending) return;
 		const entry = this.activeEntry();
 		const rolesView = this.rolesView();
+		const presetsView = this.presetsView();
 		if (event.type !== "action") {
 			if (this.#strip || event.item === undefined) return;
 			if (rolesView) {
@@ -1971,6 +2238,16 @@ export class ModelHubState {
 				if (event.type === "activate") this.#activateRolesRow(row);
 				return;
 			}
+			if (presetsView) {
+				const index = this.#presetsRows.findIndex(row => presetRowKey(row) === event.item);
+				const row = this.#presetsRows[index];
+				if (!row) return;
+				this.#focus = "list";
+				if (index !== this.#presetIndex) this.#deleteArmed = null;
+				this.#selectPreset(index);
+				if (event.type === "activate") this.#activatePresetRow(row);
+				return;
+			}
 			if (this.isBrowserView(entry) && this.browser.routePickerItem(event.item, event.type === "activate"))
 				this.#focus = "list";
 			return;
@@ -1980,6 +2257,12 @@ export class ModelHubState {
 			if (!rolesView || this.#strip) return;
 			this.#focus = "list";
 			this.runRolesAction(act.slice("roles:".length) as RolesAction);
+			return;
+		}
+		if (act.startsWith("presets:")) {
+			if (!presetsView || this.#strip) return;
+			this.#focus = "list";
+			this.runPresetsAction(act.slice("presets:".length) as PresetsAction);
 			return;
 		}
 		switch (act) {

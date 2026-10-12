@@ -11,8 +11,8 @@ export interface ModelHubSource extends ModelBrowserSource {
 	getProjectModelRole(role: string): string | undefined;
 	getGlobalModelRole(role: string): string | undefined;
 	getModelRoleSource(role: string): "global" | "project" | "default";
-	/** Saved model presets (in switch order) and the one the current role setup matches; absent hosts have none. */
-	getModelPresets?(): { names: readonly string[]; active: string | undefined };
+	/** Saved model presets, the one the current routing matches, and a row summary each; absent hosts have none. */
+	getModelPresets?(): ModelPresetListing;
 }
 
 /** Catalog capabilities the /models hub needs. */
@@ -44,6 +44,21 @@ export interface ScopedModelItem {
 
 export type ModelRoleSelectionScope = "global" | "project";
 
+/** Outcome of {@link ModelHubCallbacks.onApplyPreset}; the host has already reported it. */
+export interface ModelPresetApplyResult {
+	applied: boolean;
+	error?: string;
+}
+
+export interface ModelPresetListing {
+	/** Sorted saved preset names. */
+	names: readonly string[];
+	/** The preset whose captured routing equals the current effective routing, if any ("matches current"). */
+	active: string | undefined;
+	/** One-line row summary per name, e.g. `default → anthropic/claude-x`, `3 roles`, or `malformed: …`. */
+	summaries: Readonly<Record<string, string>>;
+}
+
 export interface ModelHubCallbacks {
 	/** Persist a role assignment. */
 	onAssign: (
@@ -63,14 +78,16 @@ export interface ModelHubCallbacks {
 	onCatalogRefreshed?: (
 		providerId?: string,
 	) => ReadonlyArray<ScopedModelItem> | undefined | Promise<ReadonlyArray<ScopedModelItem> | undefined>;
-	/** Save the current role assignments and default thinking level as a named model preset. */
-	onSavePreset?: (name: string) => void;
 	/**
-	 * Apply a saved model preset (ctrl+←/→ or p/⇧P in the Roles view) and report
-	 * the outcome itself. A switch that writes nothing (a refused preset) still
-	 * advances the hub's preset cursor, so the next press moves past it.
+	 * Apply saved preset `name` through the host's validated transaction (the Presets view, and
+	 * ctrl+←/→ or p/⇧P in the Roles view). The host reports the outcome (status/error) itself; the
+	 * hub freezes its input until the result settles.
 	 */
-	onSwitchPreset?: (name: string) => void | Promise<void>;
+	onApplyPreset?: (name: string) => Promise<ModelPresetApplyResult> | ModelPresetApplyResult;
+	/** Capture and persist the current routing under `name` (host validates/reports). */
+	onSavePreset?: (name: string) => void;
+	/** Delete the global definition named `name` (host reports). */
+	onDeletePreset?: (name: string) => void;
 	/** Persist a new quick-switch cycle order (the ctrl+p role cycle). */
 	onCycleOrderChange?: (order: string[]) => void;
 	/**

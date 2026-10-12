@@ -1,9 +1,10 @@
 /**
  * The /models hub's terminal look (`picker` with `term.role =
  * "omp.model-hub"`): the hub frame (`hub-frame`) with the scope sidebar, a
- * body showing a status row over the Roles view, a signed-out provider's
- * pane or the kind tabs and the model list, and a footer of key hints or the
- * open strip (role chips, thinking levels, a name field).
+ * body showing a status row over the Roles view, the Presets view, a
+ * signed-out provider's pane or the kind tabs and the model list, and a
+ * footer of key hints or the open strip (role chips, thinking levels, a name
+ * field).
  *
  * Its widget routes the pointer to {@link ModelHubState.routeMouse}.
  */
@@ -65,11 +66,12 @@ function sidebarStyle(theme: Theme, hub: ModelHubState, entry: SidebarEntry, ind
 		else if (entry.kind === "all") matches = hub.searchTotal;
 	}
 	// Entries a search cannot reach dim but keep their place.
-	const muted = entry.locked === true || matches === 0 || (counts !== null && entry.kind === "roles");
+	const management = entry.kind === "roles" || entry.kind === "presets";
+	const muted = entry.locked === true || matches === 0 || (counts !== null && management);
 	const icon =
 		entry.kind === "recent"
 			? symbol("icon.time")
-			: entry.kind === "roles"
+			: management
 				? symbol("icon.extensionSkill")
 				: entry.kind === "all"
 					? symbol("icon.model")
@@ -90,6 +92,7 @@ function sidebarStyle(theme: Theme, hub: ModelHubState, entry: SidebarEntry, ind
 function statusRow(theme: Theme, hub: ModelHubState, width: number): string {
 	const cut = (text: string): string => truncate(text, width, theme.symbols.ellipsis);
 	if (hub.assignmentPending) return cut(theme.style("accent", " Applying model…"));
+	if (hub.applyingPreset !== null) return cut(theme.style("accent", ` Applying preset ${hub.applyingPreset}…`));
 	const assigning = hub.assigning;
 	if (assigning !== null) {
 		const enter = keyLabel(theme, "enter");
@@ -121,6 +124,9 @@ function statusRow(theme: Theme, hub: ModelHubState, width: number): string {
 		case "roles":
 			text = "Model roles — f adds a retry fallback, cleared roles fall back to auto-selection";
 			break;
+		case "presets":
+			text = `Model presets — ${keyLabel(theme, "enter")} loads a preset · s saves current · x deletes`;
+			break;
 		case "provider":
 			text = entry.locked
 				? `${entry.label} · not configured`
@@ -144,15 +150,14 @@ function finishRow(theme: Theme, line: string, width: number, hovered: boolean):
 function rolesView(theme: Theme, hub: ModelHubState, width: number, rows: number): string[] {
 	const symbol = (key: string): string => theme.symbols.symbol(key);
 	const cut = (text: string): string => truncate(text, width, theme.symbols.ellipsis);
-	const { names, active } = hub.presets();
+	const presets = hub.canSwitchPresets() ? hub.presets() : undefined;
 	const presetKeys =
 		hub.browser.query.length > 0
 			? keyLabels(theme, ["ctrl+left", "ctrl+right"])
 			: `${keyLabels(theme, ["ctrl+left", "ctrl+right"])} · ${keyLabels(theme, ["p", "shift+p"])}`;
-	const preset =
-		names.length > 0
-			? `   ${theme.style("dim", "Preset:")} ${active ? theme.style("accent", active) : theme.style("muted", "custom")}  ${theme.style("dim", presetKeys)}`
-			: "";
+	const preset = presets
+		? `   ${theme.style("dim", "Preset:")} ${presets.active ? theme.style("accent", presets.active) : theme.style("muted", "custom")}  ${theme.style("dim", presetKeys)}`
+		: "";
 	const tabs = segmentTrack(
 		theme,
 		ROLE_TABS.map(tab => (tab === "kind" ? "kinds" : tab)),
@@ -263,6 +268,57 @@ function rolesView(theme: Theme, hub: ModelHubState, width: number, rows: number
 	return lines.slice(0, rows);
 }
 
+/** The Presets view under the status row: a spacer where the Roles tabs sit, the rows window, the empty hint. */
+function presetsView(theme: Theme, hub: ModelHubState, width: number, rows: number): string[] {
+	const symbol = (key: string): string => theme.symbols.symbol(key);
+	const { active, summaries } = hub.presets();
+	const listFocused = hub.focus === "list";
+	// The spacer keeps the first row on the body line the pointer router expects.
+	const lines = [""];
+	const window = hub.presetsWindow();
+	for (let i = window.start; i < window.end; i++) {
+		const row = hub.presetsRows[i]!;
+		const selected = i === hub.presetIndex;
+		const hovered = i === hub.presetHover;
+		const cursor = selected && listFocused ? theme.style("accent", symbol("nav.cursor")) : " ";
+		if (row.kind === "newPreset") {
+			const label = theme.style(selected ? "accent" : "dim", "+ Save current as preset…");
+			lines.push(finishRow(theme, ` ${cursor} ${label}`, width, hovered));
+			continue;
+		}
+		if (hub.deleteArmed === row.name) {
+			const warning = theme.style("warning", "press x again to delete");
+			lines.push(finishRow(theme, ` ${cursor} ${warning} ${row.name}`, width, hovered));
+			continue;
+		}
+		const matches = active === row.name;
+		const dot = matches
+			? theme.style("accent", symbol("status.enabled"))
+			: theme.style("dim", symbol("status.shadowed"));
+		const name = selected ? theme.style("accent", row.name) : row.name;
+		const summary = hub.applyingPreset === row.name ? "applying…" : (summaries[row.name] ?? "");
+		let line = ` ${cursor} ${dot} ${name}  ${theme.style("dim", summary)}`;
+		if (matches) {
+			// Right-align the badge; a narrow pane takes the short form, or none.
+			const lineWidth = visibleWidth(line);
+			for (const badge of ["matches current", "match"]) {
+				if (lineWidth + badge.length + 2 > width) continue;
+				line = `${line}${" ".repeat(width - lineWidth - badge.length - 1)}${theme.style("accent", badge)}`;
+				break;
+			}
+		}
+		lines.push(finishRow(theme, line, width, hovered));
+	}
+	while (lines.length < rows) lines.push("");
+	if (hub.presetsRows.length <= 1 && rows >= 2)
+		lines[rows - 1] = truncate(
+			theme.style("dim", "  No presets yet — press s to save the current models as one"),
+			width,
+			theme.symbols.ellipsis,
+		);
+	return lines.slice(0, rows);
+}
+
 /** A signed-out provider's pane: how to sign in, the login row, its catalog. */
 function lockedView(theme: Theme, hub: ModelHubState, entry: SidebarEntry, width: number, rows: number): string[] {
 	const cut = (text: string): string => truncate(text, width, theme.symbols.ellipsis);
@@ -305,6 +361,7 @@ function bodyRows(theme: Theme, hub: ModelHubState, width: number, rows: number)
 	const lines = [statusRow(theme, hub, width)];
 	const entry = hub.activeEntry();
 	if (hub.rolesView()) lines.push(...rolesView(theme, hub, width, rows - 1));
+	else if (hub.presetsView()) lines.push(...presetsView(theme, hub, width, rows - 1));
 	else if (hub.lockedView()) lines.push(...lockedView(theme, hub, entry, width, rows - 1));
 	else {
 		const kinds = segmentTrack(theme, MODEL_KIND_TABS, Math.max(0, MODEL_KIND_TABS.indexOf(hub.modelKindTab)));
@@ -363,7 +420,7 @@ export function footerHint(theme: Theme, hub: ModelHubState): string {
 	}
 	const entry = hub.activeEntry();
 	if (entry.kind === "roles") {
-		const presets = hub.presets().names.length > 0;
+		const presets = hub.canSwitchPresets();
 		if (hub.focus !== "list")
 			return `${upDown} providers · ${enterRight} roles · ${kind} tabs${presets ? ` · ${keyLabels(theme, ["ctrl+left", "ctrl+right"])} preset` : ""} · ${cancel} close`;
 		// A live query takes printable keys, so the letter commands rest.
@@ -383,6 +440,14 @@ export function footerHint(theme: Theme, hub: ModelHubState): string {
 		const save = hub.callbacks.onSavePreset ? " · s save preset" : "";
 		const switchPreset = presets ? ` · ${keyLabels(theme, ["p", "shift+p"])} preset` : "";
 		return `${upDown} rows · ${enter} pick · f fallback · x clear${thinking}${compaction} · c cycle · [/] reorder · n new${save}${switchPreset}`;
+	}
+	if (entry.kind === "presets") {
+		if (hub.focus !== "list") return `${upDown} providers · ${keyLabel(theme, "right")} presets · ${cancel} close`;
+		const row = hub.presetsRows[hub.presetIndex];
+		if (row?.kind === "preset" && hub.deleteArmed === row.name)
+			return `press x again to delete "${row.name}" · ${upDown} cancel`;
+		if (row?.kind === "newPreset") return `${upDown} rows · ${enter} save current as preset · ${left} providers`;
+		return `${upDown} presets · ${enter} load · s save current · x delete · ${left} providers`;
 	}
 	if (entry.kind === "provider" && entry.locked)
 		return entry.oauth
@@ -416,7 +481,11 @@ export function stripRow(
 		if (strip.purpose === "compaction") {
 			const notice = compactionNotice(hub, strip);
 			hint = theme.style(notice.style, notice.text);
-		} else hint = theme.style("dim", "(letters, digits, - and _)");
+		} else if (strip.purpose === "preset")
+			hint = strip.error
+				? theme.style("error", strip.error)
+				: theme.style("dim", "(start with a letter; letters, digits, space, - and _)");
+		else hint = theme.style("dim", "(letters, digits, - and _)");
 		return {
 			row: truncate(`${theme.style("accent", label)} ${field} ${hint}`, width, theme.symbols.ellipsis),
 			ranges: [],

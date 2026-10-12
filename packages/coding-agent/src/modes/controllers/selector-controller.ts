@@ -22,8 +22,8 @@ import { formatLoginIdentity } from "../../cli/oauth-terminal";
 import {
 	acquireModelRoleMutation,
 	applyModelPreset,
+	deleteModelPreset,
 	formatModelPresetSwitch,
-	isCleanModelPresetSwitch,
 	modelPresetSavedMessage,
 	roleModelCandidates,
 	saveModelPreset,
@@ -1221,20 +1221,38 @@ export class SelectorController {
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				}
 			},
-			onSwitchPreset: async name => {
+			onApplyPreset: async name => {
 				try {
 					const result = await applyModelPreset(this.ctx.settings, this.ctx.session, name);
 					const message = formatModelPresetSwitch(name, result);
-					if (result.kind === "switched") {
+					if (result.applied) {
 						this.ctx.statusLine.refresh();
 						this.ctx.updateEditorBorderColor();
+						this.ctx.showStatus(message);
+					} else {
+						this.ctx.showError(message);
 					}
-					if (isCleanModelPresetSwitch(result)) this.ctx.showStatus(message);
-					else this.ctx.showWarning(message);
+					return result;
 				} catch (error) {
-					this.ctx.showError(error instanceof Error ? error.message : String(error));
+					const message = error instanceof Error ? error.message : String(error);
+					this.ctx.showError(message);
+					return { applied: false, error: message };
 				} finally {
 					hub?.refreshAfterExternalMutation();
+				}
+			},
+			onDeletePreset: name => {
+				try {
+					const result = deleteModelPreset(this.ctx.settings, name);
+					if (result === "deleted") {
+						this.ctx.showStatus(`Preset "${name}" deleted`);
+					} else if (result === "project") {
+						this.ctx.showWarning(
+							`Preset "${name}" removed from global settings; a project or --config definition still applies`,
+						);
+					}
+				} catch (error) {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				}
 			},
 			onCancel: () => done(),

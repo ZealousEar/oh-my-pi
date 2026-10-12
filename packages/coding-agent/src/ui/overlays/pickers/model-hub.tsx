@@ -1,10 +1,10 @@
 /** @jsxImportSource @oh-my-pi/pi-tui */
 /**
  * The fullscreen /models hub as a `lg` picker sheet: the sidebar is the
- * picker's scopes (Roles, All models, providers), the model list or the
- * Roles view its rows, the open chip strip or name field its `strip`, the
- * selection's facts its side preview. State and behaviour live in
- * {@link ModelHubState}; the terminal look is `omp.model-hub`.
+ * picker's scopes (Presets, Roles, All models, providers), the model list,
+ * the Roles view or the Presets view its rows, the open chip strip or name
+ * field its `strip`, the selection's facts its side preview. State and
+ * behaviour live in {@link ModelHubState}; the terminal look is `omp.model-hub`.
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
@@ -41,6 +41,9 @@ import {
 	MODEL_KIND_LABELS,
 	MODEL_KIND_TABS,
 	ModelHubState,
+	type PresetRow,
+	type PresetsAction,
+	presetRowKey,
 	ROLE_TABS,
 	type RolesAction,
 	type RolesRow,
@@ -56,6 +59,11 @@ const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 	{ id: "thinking", head: "Thinking", format: "dim", priority: 1 },
 ];
 
+/** Fact columns of the Presets view. */
+const PRESET_PICKER_COLUMNS: readonly TspPickerColumn[] = [
+	{ id: "summary", head: "Routing", format: "dim", priority: 1 },
+];
+
 export interface ModelHubProps {
 	readonly source: ModelHubSource;
 	readonly registry: ModelHubRegistry;
@@ -68,7 +76,7 @@ export interface ModelHubProps {
 	readonly onState?: (hub: ModelHubState) => void;
 }
 
-/** The sidebar as picker scopes: Roles, All models, then signed-in and signed-out providers. */
+/** The sidebar as picker scopes: Presets, Roles, All models, then signed-in and signed-out providers. */
 function pickerScopes(hub: ModelHubState): TspPickerScope[] {
 	const counts = hub.searchCounts;
 	const oauth = new Set(getOAuthProviders().map(provider => provider.id));
@@ -76,6 +84,9 @@ function pickerScopes(hub: ModelHubState): TspPickerScope[] {
 	for (const entry of hub.entries) {
 		switch (entry.kind) {
 			case "separator":
+				break;
+			case "presets":
+				scopes.push({ id: entry.id, label: "Presets", icon: "bookmark", count: hub.presets().names.length });
 				break;
 			case "roles":
 				scopes.push({ id: entry.id, label: "Roles", icon: "sparkles", count: hub.visibleRoleIds().length });
@@ -154,6 +165,8 @@ function pickerActions(hub: ModelHubState): TspPickerAction[] {
 	const strip = hub.strip;
 	const cancel = (label: string): TspPickerAction => closeAction(label);
 	if (hub.assignmentPending) return [closeAction()];
+	// Nothing is interactive while a preset applies; the bar says why.
+	if (hub.applyingPreset !== null) return [{ ...closeAction(), disabled: "Applying preset…" }];
 	if (strip) {
 		const apply =
 			strip.kind === "name"
@@ -221,7 +234,7 @@ function pickerActions(hub: ModelHubState): TspPickerAction[] {
 					action("cycle", hub.cycleOrder().includes(row.role) ? "Leave cycle" : "Add to cycle", "c"),
 					action("new", "New role", "n"),
 					hub.callbacks.onSavePreset ? action("save", "Save preset", "s") : undefined,
-					hub.presets().names.length > 0 ? action("nextPreset", "Next preset", "p") : undefined,
+					hub.canSwitchPresets() ? action("nextPreset", "Next preset", "p") : undefined,
 				);
 				break;
 			}
@@ -245,6 +258,26 @@ function pickerActions(hub: ModelHubState): TspPickerAction[] {
 			case "newRole":
 				actions.push(action("pick", "New role", "enter", true));
 				break;
+		}
+		return [...actions, closeAction()].filter((value): value is TspPickerAction => value !== undefined);
+	}
+	if (hub.presetsView()) {
+		const row = hub.presetsRows[hub.presetIndex];
+		const action = (id: PresetsAction, label: string, key: string, extra?: { primary?: boolean; danger?: boolean }) =>
+			pickerAction(`presets:${id}`, label, key, extra);
+		const actions: (TspPickerAction | undefined)[] = [];
+		if (row?.kind === "preset") {
+			const armed = hub.deleteArmed === row.name;
+			actions.push(
+				hub.callbacks.onApplyPreset ? action("activate", "Load preset", "enter", { primary: true }) : undefined,
+				hub.callbacks.onSavePreset ? action("save", "Save current as preset", "s") : undefined,
+				hub.callbacks.onDeletePreset
+					? action("delete", armed ? "Confirm delete" : "Delete", "x", { danger: armed })
+					: undefined,
+			);
+		} else if (hub.callbacks.onSavePreset) {
+			// The trailing "Save current…" row: Enter is the save.
+			actions.push(action("save", "Save current as preset", "enter", { primary: true }));
 		}
 		return [...actions, closeAction()].filter((value): value is TspPickerAction => value !== undefined);
 	}
@@ -285,6 +318,7 @@ function pickerStrip(hub: ModelHubState, strip: StripState): NonNullable<TspPick
 				{ s: "muted", t: strip.purpose === "preset" ? "Preset name " : "New role name " },
 				{ s: "mono", t: strip.field.text },
 				{ s: "accent", t: "▏" },
+				...(strip.error ? [{ s: "error", t: `  ${strip.error}` }] : []),
 			],
 			items: [],
 		};
@@ -414,6 +448,43 @@ function itemOf(model: ModelBrowserItem["model"]): ModelBrowserItem {
 	return { provider: model.provider, id: model.id, model, selector: `${model.provider}/${model.id}` };
 }
 
+/** Presets-view rows as picker items: a dot for the matching preset, its routing summary as the fact column. */
+function presetPickerItems(hub: ModelHubState): TspPickerItem[] {
+	const { active, summaries } = hub.presets();
+	return hub.presetsRows.map((row): TspPickerItem => {
+		const id = presetRowKey(row);
+		if (row.kind === "newPreset") return { id, label: "Save current as preset…", icon: "plus", tone: "muted" };
+		if (hub.deleteArmed === row.name)
+			return { id, label: `press x again to delete ${row.name}`, dot: "warning", tone: "warning" };
+		const matches = active === row.name;
+		return {
+			id,
+			label: row.name,
+			dot: matches ? "accent" : "muted",
+			facts: { summary: hub.applyingPreset === row.name ? "applying…" : (summaries[row.name] ?? "") },
+			...(matches ? { badges: [{ text: "matches current", tone: "accent" as const }] } : { tone: "muted" as const }),
+		};
+	});
+}
+
+/** The selected Presets row's preview: the preset's routing summary, or how to save one. */
+function presetPreview(hub: ModelHubState, row: PresetRow | undefined): JSXNode[] {
+	if (row?.kind !== "preset")
+		return [
+			<text role="omp.picker.title" text="Save current as preset" />,
+			<text
+				spans={[{ s: "muted", t: "Capture the current role routing under a name to load it again later." }]}
+				wrap="word"
+			/>,
+		];
+	const { active, summaries } = hub.presets();
+	const children: JSXNode[] = [<text role="omp.picker.title" text={row.name} />];
+	if (active === row.name) children.push(<text spans={[{ s: "accent", t: "Matches the current routing" }]} />);
+	const summary = summaries[row.name];
+	if (summary) children.push(<text spans={[{ s: "muted", t: summary }]} wrap="word" />);
+	return children;
+}
+
 /** The selected Roles row's preview: its model's facts and its fallback chain. */
 function rolePreview(hub: ModelHubState, row: RolesRow | undefined): JSXNode[] {
 	const children: JSXNode[] = [];
@@ -506,9 +577,11 @@ function hubProps(hub: ModelHubState): TspPickerProps {
 	hub.version();
 	const entry = hub.activeEntry();
 	const rolesView = hub.rolesView();
+	const presetsView = hub.presetsView();
 	const strip = hub.strip;
 	const subtitle = (): TspPickerProps["subtitle"] => {
 		if (hub.assignmentPending) return "Applying model…";
+		if (hub.applyingPreset !== null) return [{ t: "Applying preset " }, { s: "strong", t: hub.applyingPreset }];
 		const assigning = hub.assigning;
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") return "New fallback chain — pick the model it protects";
@@ -524,8 +597,14 @@ function hubProps(hub: ModelHubState): TspPickerProps {
 		if (hub.configError && entry.kind !== "provider") return [{ s: "error", t: hub.configError }];
 		if (entry.kind === "provider" && hub.isRefreshing(entry.providerId))
 			return `${entry.label} · refreshing model list…`;
-		const presets = rolesView ? hub.presets() : undefined;
-		if (presets && presets.names.length > 0)
+		if (presetsView) {
+			const row = hub.presetsRows[hub.presetIndex];
+			if (row?.kind === "preset" && hub.deleteArmed === row.name)
+				return [{ t: "Press " }, { s: "key", t: "x" }, { t: " again to delete " }, { s: "strong", t: row.name }];
+			return "Saved role setups — load one, or save the current routing";
+		}
+		const presets = rolesView && hub.canSwitchPresets() ? hub.presets() : undefined;
+		if (presets)
 			return [
 				{ s: "muted", t: "Preset " },
 				presets.active ? { s: "strong", t: presets.active } : { s: "muted", t: "custom" },
@@ -539,12 +618,12 @@ function hubProps(hub: ModelHubState): TspPickerProps {
 		title: "Models",
 		subtitle: subtitle(),
 		icon: "cpu",
-		noun: rolesView ? "roles" : "models",
+		noun: rolesView ? "roles" : presetsView ? "presets" : "models",
 		size: "lg",
 		layout: "rows",
 		preview: "side",
-		// The Roles rows' letter commands own printable keys until a query is live.
-		query: rolesView && hub.browser.query.length === 0 ? null : hub.browser.query,
+		// The Roles rows' letter commands own printable keys until a query is live; the Presets rows' always.
+		query: (rolesView || presetsView) && hub.browser.query.length === 0 ? null : hub.browser.query,
 		cursor: hub.browser.cursor,
 		placeholder: "Search models…",
 		scopes: pickerScopes(hub),
@@ -569,6 +648,18 @@ function hubProps(hub: ModelHubState): TspPickerProps {
 			order: rolePickerOrder(hub),
 			selected: row && row.kind !== "separator" ? rolesRowKey(row, hub.roleIndex) : null,
 			total: hub.allRolesRowCount(),
+		};
+	}
+	if (presetsView) {
+		const row = hub.presetsRows[hub.presetIndex];
+		return {
+			...base,
+			columns: PRESET_PICKER_COLUMNS,
+			items: presetPickerItems(hub),
+			order: hub.presetsRows.map(presetRowKey),
+			selected: row ? presetRowKey(row) : null,
+			total: hub.presetsRows.length,
+			empty: "No presets yet — save the current models as one",
 		};
 	}
 	const catalogue = hub.browser.pickerItems(hub.availableItems);
@@ -625,6 +716,7 @@ function hubProps(hub: ModelHubState): TspPickerProps {
 function hubPreview(hub: ModelHubState): JSXNode[] {
 	hub.version();
 	if (hub.rolesView()) return rolePreview(hub, hub.rolesRows[hub.roleIndex]);
+	if (hub.presetsView()) return presetPreview(hub, hub.presetsRows[hub.presetIndex]);
 	if (hub.lockedView()) return lockedPreview(hub);
 	const selected = hub.browser.selected();
 	return selected ? modelPreview(hub.browser, selected, "full", hub.currentSelector) : [];
