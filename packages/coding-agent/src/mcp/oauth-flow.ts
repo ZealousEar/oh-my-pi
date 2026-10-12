@@ -29,8 +29,36 @@ const MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX = `${MCP_OAUTH_URL_CREDENTIAL_PREFIX}p
  * verbatim (query string included) because it can carry tenant selectors such
  * as `?project_ref=`.
  */
-export function mcpOAuthCredentialId(serverUrl: string, profile: string | undefined = getActiveProfile()): string {
-	return `${MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX}${profile ?? "default"}:${serverUrl}`;
+export function mcpOAuthCredentialId(serverUrl: string, profile?: string): string {
+	if (profile === undefined && sharedMcpCredentialProfiles() !== undefined)
+		return sharedMcpOAuthCredentialId(serverUrl);
+	return `${MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX}${profile ?? getActiveProfile() ?? "default"}:${serverUrl}`;
+}
+
+/**
+ * Profiles that share one managed MCP OAuth credential per server URL, from
+ * `OMP_SHARED_MCP_PROFILES` (comma-separated; the channel launchers pin it).
+ * Undefined = upstream behaviour (profile-scoped ids only).
+ *
+ * When set, new logins mint the url-keyed id `mcp_oauth:<serverUrl>` — the
+ * legacy form every build (including the immutable stock authority that
+ * refreshes it) parses back to the server URL — and lookups also accept the
+ * listed profiles' own `mcp_oauth:profile:<p>:<url>` rows so a login made by
+ * a build that still mints profile-scoped ids is usable by the others.
+ */
+export function sharedMcpCredentialProfiles(): readonly string[] | undefined {
+	const raw = process.env.OMP_SHARED_MCP_PROFILES;
+	if (raw === undefined) return undefined;
+	const profiles = raw
+		.split(",")
+		.map(entry => entry.trim())
+		.filter(entry => entry.length > 0);
+	return profiles.length > 0 ? profiles : undefined;
+}
+
+/** Url-keyed id shared by every profile in {@link sharedMcpCredentialProfiles}. */
+export function sharedMcpOAuthCredentialId(serverUrl: string): string {
+	return `${MCP_OAUTH_URL_CREDENTIAL_PREFIX}${serverUrl}`;
 }
 
 /** Whether a credential id was minted by OMP's MCP OAuth flows (either era). */
@@ -84,6 +112,8 @@ export interface MCPStoredOAuthCredential extends OAuthCredential {
 	clientId?: string;
 	clientSecret?: string;
 	resource?: string;
+	/** Granted OAuth scopes (space-separated), when recorded by the issuer or login flow. */
+	scopes?: string;
 	/**
 	 * Authorization-server URL (the issuer the grant was minted against). Used
 	 * to filter same-origin resource indicators on refresh: RFC 8414 lets the
@@ -111,7 +141,7 @@ function isGoogleAuthorizationHost(hostname: string): boolean {
 	return host === "accounts.google.com" || host.endsWith(".accounts.google.com");
 }
 
-function hasOAuthScope(scopes: string | null | undefined, scope: string): boolean {
+export function hasOAuthScope(scopes: string | null | undefined, scope: string): boolean {
 	return !!scopes && scopes.split(/\s+/).includes(scope);
 }
 
@@ -567,6 +597,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			refresh_token?: string;
 			expires_in?: number;
 			token_type?: string;
+			scope?: string;
 			error?: string;
 			error_description?: string;
 			scope?: string;
