@@ -1,0 +1,178 @@
+#!/usr/bin/python3
+"""fork-sync <tag>: replay the fork stack (base..branch) onto a new upstream tag.
+
+  fork-sync [--dry-run] [--no-auto-continue] [--no-native] <tag>
+
+Refuses a dirty tree or a branch other than the fork branch. Fetches <tag> from the upstream remote,
+records the current base tag, then `git rebase --onto <tag> <oldbase> <branch>` with rerere on
+(autoUpdate). A stop whose conflicts rerere fully replayed is continued automatically (unless
+--no-auto-continue); a real conflict stops with the commit being replayed and the conflicted files,
+exit 2. On success prints `git log --oneline <tag>..HEAD`, refreshes the gitignored native addon from
+npm when its version stamp no longer matches packages/natives (unless --no-native), and prints the
+next steps. --dry-run prints every step and the commits that would be replayed; no side effects."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import forklib as fl  # noqa: E402
+import forklib_native as native  # noqa: E402
+
+
+def usage(code: int = 2) -> None:
+    print(__doc__.strip(), file=sys.stderr if code else sys.stdout)
+    sys.exit(code)
+
+
+def conflict_markers(conf: dict) -> list:
+    staged = fl.git(conf, "diff", "--cached", "--name-only", "--diff-filter=AM").splitlines()
+    if not staged:
+        return []
+    cp = fl.run(
+        ["git", "grep", "--cached", "-l", "-E", "^(<<<<<<<|>>>>>>>) ", "--", *staged],
+        cwd=conf["CHECKOUT"],
+    )
+    return cp.stdout.split() if cp.returncode == 0 else []
+
+
+def report_conflict(conf: dict, tag: str, old: str, pre_head: str, output: str) -> None:
+    replaying = fl.git(conf, "log", "-1", "--format=%h %s", "REBASE_HEAD", check=False) or "(unknown)"
+    unmerged = fl.git(conf, "diff", "--name-only", "--diff-filter=U").splitlines()
+    markers = [] if unmerged else conflict_markers(conf)
+    done = fl.git(conf, "rev-list", "--count", f"{tag}..HEAD", check=False) or "?"
+    total = fl.git(conf, "rev-list", "--count", f"{old}..{pre_head}", check=False) or "?"
+    print(output.rstrip())
+    print()
+    print(f"CONFLICT while replaying: {replaying}   ({done}/{total} commits already applied on {tag})")
+    if unmerged:
+        print("Conflicted files:")
+        for f in unmerged:
+            print(f"  {f}")
+    elif markers:
+        print("rerere replayed a resolution that still contains conflict markers:")
+        for f in markers:
+            print(f"  {f}")
+    else:
+        print("Rebase stopped without unmerged files (see git output above).")
+    print()
+    print(f"Resolve in {conf['CHECKOUT']}, `git add` the files, then `git rebase --continue`")
+    print("(rerere records the resolution, so the next sync replays it). Afterwards run fork-check.")
+    print(f"Give up: `git rebase --abort` (branch returns to {pre_head[:10]}).")
+    sys.exit(2)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        usage(0)
+    dry = "--dry-run" in args
+    auto_continue = "--no-auto-continue" not in args
+    want_native = "--no-native" not in args
+    pos = [a for a in args if not a.startswith("--")]
+    unknown = [a for a in args if a.startswith("--") and a not in ("--dry-run", "--no-auto-continue", "--no-native")]
+    if unknown or len(pos) != 1:
+        usage()
+    tag = pos[0]
+    conf = fl.load_conf()
+    co = conf["CHECKOUT"]
+    if not os.path.isdir(co):
+        fl.die(f"checkout missing: {co}")
+    branch = fl.fork_branch(conf)
+    current = fl.current_branch(conf)
+    if current != branch:
+        fl.die(f"{co} has {current or 'detached HEAD'} checked out, fork branch is {branch}; refusing to switch branches")
+    fl.require_clean(conf)
+    old = fl.base_tag(conf, branch)
+    pre_head = fl.git(conf, "rev-parse", branch)
+    merges = fl.git(conf, "rev-list", "--merges", f"{old}..{branch}").splitlines()
+    if merges:
+        fl.die(
+            f"{old}..{branch} contains merge commit(s) {', '.join(m[:10] for m in merges)}; `rebase --onto` would linearize them\n"
+            "and replay the merged side's history (e.g. an older port) onto the new tag. Make the fork a linear stack\n"
+            "of per-feature commits on the base tag first (see launchers/fork/STACK.md), then rerun."
+        )
+    remote = conf["UPSTREAM_REMOTE"]
+    prefix = "[dry-run] " if dry else ""
+
+    print(f"checkout    {co}")
+    print(f"branch      {branch} @ {pre_head[:10]}")
+    print(f"old base    {old} ({fl.git(conf, 'rev-parse', '--short=10', old + '^{commit}')})")
+    print(f"new base    {tag}")
+
+    fetch = ["git", "fetch", "--no-tags", remote, "tag", tag]
+    print(f"{prefix}$ {' '.join(fetch)}")
+    if not dry:
+        fl.run(fetch, cwd=co, check=True, timeout=300)
+    new_sha = fl.git(conf, "rev-parse", "--verify", "--quiet", f"{tag}^{{commit}}", check=False)
+    if not new_sha:
+        if dry:
+            print(f"[dry-run] {tag} is not present locally; the real run fetches it first. Stopping preview.")
+            return
+        fl.die(f"tag {tag} not found after fetch")
+    if fl.run(["git", "merge-base", "--is-ancestor", old, tag], cwd=co).returncode != 0:
+        fl.warn(f"{old} is not an ancestor of {tag} (downgrade or diverged upstream); rebasing anyway")
+    commits = fl.git(conf, "log", "--oneline", "--reverse", f"{old}..{branch}").splitlines()
+    print(f"replaying   {len(commits)} commit(s) from {old}..{branch}:")
+    for c in commits:
+        print(f"  {c}")
+    if old == tag or fl.git(conf, "rev-parse", old + "^{commit}") == new_sha:
+        print(f"note: {branch} already sits on {tag}; the rebase is a no-op")
+
+    rebase = ["git", "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true", "rebase", "--onto", tag, old, branch]
+    print(f"{prefix}$ {' '.join(rebase)}")
+    print(f"undo after success: git -C {co} reset --keep {pre_head[:12]}   (reflog keeps it too)")
+    if dry:
+        if os.path.isfile(os.path.join(co, "packages", "natives", "package.json")):
+            ok, have, want = native.status(co)
+            if not ok:
+                print(f"[dry-run] native addon stamp {have or 'missing'} != natives {want} here; after the rebase the stamp is rechecked against {tag} and refreshed from npm")
+        print("[dry-run] no changes made")
+        return
+
+    cp = fl.run(rebase, cwd=co, timeout=1800)
+    output = (cp.stdout or "") + (cp.stderr or "")
+    while cp.returncode != 0:
+        if fl.operation_in_progress(conf) != "rebase":
+            print(output.rstrip())
+            fl.die(f"git rebase failed (exit {cp.returncode}) without leaving a rebase in progress")
+        unmerged = fl.git(conf, "diff", "--name-only", "--diff-filter=U").splitlines()
+        if unmerged or not auto_continue or conflict_markers(conf):
+            report_conflict(conf, tag, old, pre_head, output)
+        replaying = fl.git(conf, "log", "-1", "--format=%h %s", "REBASE_HEAD", check=False)
+        print(f"rerere resolved every conflict in {replaying}; continuing")
+        env = dict(os.environ, GIT_EDITOR="true")
+        cp = fl.run(["git", "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true", "rebase", "--continue"], cwd=co, env=env, timeout=1800)
+        output = (cp.stdout or "") + (cp.stderr or "")
+
+    head = fl.git(conf, "rev-parse", "HEAD")
+    print()
+    print(f"rebased {branch}: {pre_head[:10]} -> {head[:10]} on {tag}")
+    print(fl.git(conf, "log", "--oneline", f"{tag}..HEAD"))
+
+    has_natives = os.path.isfile(os.path.join(co, "packages", "natives", "package.json"))
+    ok, have, want = native.status(co) if has_natives else (True, "", "")
+    if not has_natives:
+        print("native addon: no packages/natives in this checkout; skipped")
+    elif ok:
+        print(f"native addon: stamp {have} matches packages/natives {want}")
+    elif want_native:
+        print(f"native addon: stamp {have or 'missing'} != packages/natives {want}; refreshing from npm")
+        try:
+            native.fetch(co, want)
+        except Exception as e:  # noqa: BLE001 - report and keep the rebased branch
+            fl.die(f"native addon refresh failed: {e}\nthe rebase itself succeeded; rerun `fork-sync {tag}` (no-op rebase) to retry the refresh")
+    else:
+        fl.warn(f"native addon stamp {have or 'missing'} != packages/natives {want} (--no-native); fork-release will refuse")
+
+    changed_lock = fl.git(conf, "diff", "--name-only", old, tag, "--", "bun.lock", "package.json", "packages/*/package.json", check=False)
+    print()
+    print("next:")
+    if changed_lock:
+        print(f"  cd {co} && PATH={os.path.dirname(conf['BUN'])}:$PATH bun install --frozen-lockfile   # deps changed between {old} and {tag}")
+    print("  fork-check")
+    print("  fork-release r<N>          # after fork-check passes; --dry-run first")
+    if head != pre_head:
+        print(f"  git -C {co} push --force-with-lease {conf['FORK_REMOTE']} {branch}   # history was rewritten")
+
+
+if __name__ == "__main__":
+    main()

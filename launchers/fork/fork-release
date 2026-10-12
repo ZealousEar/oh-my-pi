@@ -1,0 +1,482 @@
+#!/usr/bin/python3
+"""fork-release: build CHECKOUT HEAD into a new pinned ompd executable (rebuild runbook, scripted).
+
+  fork-release [--dry-run] [--skip-check] [--notes TEXT] <rN>
+  fork-release [--dry-run] --rollback
+
+Release: refuses a dirty tree, HEAD off the fork branch, a reused/older rN, or a native addon whose
+version stamp differs from packages/natives; runs fork-check (--skip-check skips it, loudly); builds
+with the pinned Bun (`bun run build` in packages/coding-agent); verifies `dist/omp --version` and
+`--smoke-test`; copies to FORK_DIR/omp-<ver>-next-<YYYY-MM-DD>-<rN> + .sha256 (unlocking only the
+uchg paths it writes); removes dist; points wrappers/ompd TARGET at it, regenerates the provider
+policy and commits both in the profile layer (local commit, not pushed); archives BUILD-MANIFEST.json
+and writes the new one; updates channels.json ompd (key order kept); runs install.sh and
+`omp-channels --verify`; probes the must-keep features through `ompd`.
+Rollback: swaps channels.json ompd executable/sha256 with ompd.previous, retargets wrappers/ompd,
+commits, install.sh + verify. Running it twice returns to the newer build.
+--dry-run prints every step with its values and changes nothing (preflight still runs)."""
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import forklib as fl  # noqa: E402
+import forklib_native as native  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LAYER_PATHS = ("launchers/wrappers/ompd", "launchers/profile-seed/disabled-providers.yml")
+BUILD_TIMEOUT = 1800
+
+
+def usage(code: int = 2) -> None:
+    print(__doc__.strip(), file=sys.stderr if code else sys.stdout)
+    sys.exit(code)
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def rnum(path: str) -> int:
+    m = re.search(r"-r(\d+)$", path or "")
+    return int(m.group(1)) if m else -1
+
+
+def semver(path: str) -> str:
+    m = re.search(r"omp-(\d+\.\d+\.\d+)", os.path.basename(path or ""))
+    return m.group(1) if m else ""
+
+
+def load_json(path: str):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_json_atomic(path: str, data, trailing_newline: bool) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        if trailing_newline:
+            f.write("\n")
+    os.replace(tmp, path)
+
+
+class Plan:
+    def __init__(self, dry: bool):
+        self.dry = dry
+        self.n = 0
+
+    def step(self, title: str, fn=None, *details: str):
+        self.n += 1
+        print(f"\n{'[dry-run] ' if self.dry else ''}step {self.n}: {title}")
+        for d in details:
+            print(f"    {d}")
+        if fn and not self.dry:
+            return fn()
+        return None
+
+
+def manifest_for(conf: dict, exe: str) -> tuple:
+    """(path, manifest) of the build manifest whose output is exe, else ('', {})."""
+    d = conf["FORK_DIR"]
+    for name in ["BUILD-MANIFEST.json"] + sorted(n for n in os.listdir(d) if re.fullmatch(r"BUILD-MANIFEST-r\d+\.json", n)):
+        p = os.path.join(d, name)
+        try:
+            m = load_json(p)
+        except (OSError, ValueError):
+            continue
+        if m.get("output") == exe:
+            return p, m
+    return "", {}
+
+
+def unlock(conf: dict, paths: list, dry: bool) -> list:
+    locked = [p for p in paths if fl.is_uchg(p)]
+    if locked:
+        cmd = ["chflags", "nouchg", *locked]
+        print(f"    {'would run' if dry else 'run'}: {' '.join(cmd)}")
+        if not dry:
+            fl.run(cmd, check=True)
+    else:
+        print("    nothing locked among: " + ", ".join(paths))
+    return locked
+
+
+def set_wrapper_target(conf: dict, exe: str) -> None:
+    path = conf["OMPD_WRAPPER"]
+    with open(path) as f:
+        body = f.read()
+    new, n = re.subn(r"^TARGET=.*$", f"TARGET={exe}", body, flags=re.M)
+    if n != 1:
+        fl.die(f"{path}: expected exactly one TARGET= line, found {n}")
+    with open(path, "w") as f:
+        f.write(new)
+
+
+def commit_layer(conf: dict, message: str) -> str:
+    layer = conf["LAYER"]
+    changed = [p for p in LAYER_PATHS if fl.git(conf, "status", "--porcelain", "--", p, cwd=layer)]
+    if not changed:
+        print("    profile layer: nothing to commit")
+        return fl.git(conf, "rev-parse", "--short", "HEAD", cwd=layer)
+    fl.run(["git", "-C", layer, "add", "--", *changed], check=True)
+    fl.run(["git", "-C", layer, "commit", "-q", "-m", message, "--", *changed], check=True)
+    sha = fl.git(conf, "rev-parse", "--short", "HEAD", cwd=layer)
+    print(f"    profile layer commit {sha}: {message} ({', '.join(changed)}); not pushed")
+    return sha
+
+
+def install_and_verify(conf: dict) -> None:
+    for cmd, timeout in (([conf["INSTALL"]], 600), ([conf["DOCTOR"], "--verify"], 300)):
+        print(f"    $ {' '.join(cmd)}")
+        cp = fl.run(cmd, timeout=timeout, env=fl.bun_env(conf))
+        out = ((cp.stdout or "") + (cp.stderr or "")).rstrip()
+        if out:
+            print("\n".join("      " + line for line in out.splitlines()[-30:]))
+        if cp.returncode != 0:
+            fl.die(f"{cmd[0]} failed (exit {cp.returncode}); rollback: fork-release --rollback")
+
+
+def shared_auth_warning(cm: dict) -> None:
+    auth = (cm.get("sharedAuth") or {}).get("authorityBinary", "")
+    stock = cm["channels"]["omp"]["executable"]
+    if auth and semver(auth) != semver(stock):
+        fl.warn(
+            f"sharedAuth.authorityBinary is {semver(auth) or auth} ({auth}) but channels.omp.executable is "
+            f"{semver(stock) or stock}; not changed here (shared-auth runbook owns it)"
+        )
+
+
+def repo_slug(conf: dict, remote: str, cwd: str) -> str:
+    url = fl.git(conf, "remote", "get-url", remote, check=False, cwd=cwd)
+    return re.sub(r"^.*github\.com[:/]|\.git$", "", url) or url
+
+
+def layer_desc(conf: dict, sha: str) -> str:
+    layer = conf["LAYER"]
+    repo = repo_slug(conf, "origin", layer)
+    branch = fl.git(conf, "symbolic-ref", "--short", "HEAD", check=False, cwd=layer)
+    pushed = fl.git(conf, "branch", "-r", "--contains", sha, check=False, cwd=layer) if sha else ""
+    return f"{repo} {branch} @ {sha}" + ("" if pushed else " (local commit; push pending)")
+
+
+# ---------------------------------------------------------------- rollback
+
+
+def rollback(conf: dict, dry: bool) -> None:
+    plan = Plan(dry)
+    cm = load_json(conf["CHANNELS_MAP"])
+    ompd = cm["channels"]["ompd"]
+    prev = ompd.get("previous") or {}
+    cur_exe, cur_sha = ompd["executable"], ompd["sha256"]
+    exe, sha = prev.get("executable"), prev.get("sha256")
+    if not exe or not sha:
+        fl.die("channels.json channels.ompd.previous has no executable/sha256; nothing to roll back to")
+    if not os.access(exe, os.X_OK):
+        fl.die(f"previous executable missing: {exe}")
+    have = sha256_file(exe)
+    if have != sha:
+        fl.die(f"previous executable sha256 {have} != recorded {sha}")
+    _, man = manifest_for(conf, exe)
+    print(f"rollback ompd: {os.path.basename(cur_exe)} -> {os.path.basename(exe)}")
+    plan.step("unlock channel paths written below")
+    unlock(conf, [conf["CHANNELS_ROOT"], conf["CHANNELS_MAP"]], dry)
+
+    def update_map():
+        m = load_json(conf["CHANNELS_MAP"])
+        o = m["channels"]["ompd"]
+        o["executable"], o["sha256"] = exe, sha
+        o["identity"] = f"ROLLBACK {datetime.date.today()} from {os.path.basename(cur_exe)}: " + (
+            f"fork build {os.path.basename(exe)} (sourceCommit {man.get('sourceCommit', '?')[:10]}, base {man.get('baseTag', '?')})"
+        )
+        if man.get("builtAt"):
+            o["builtAt"] = man["builtAt"]
+        if man.get("sourceCommit"):
+            o["sourceCommit"] = man["sourceCommit"]
+        o["previous"] = {"executable": cur_exe, "sha256": cur_sha}
+        write_json_atomic(conf["CHANNELS_MAP"], m, False)
+
+    plan.step("channels.json ompd := previous", update_map,
+              f"executable {cur_exe} -> {exe}", f"sha256 {cur_sha[:12]}… -> {sha[:12]}…", f"previous := {cur_exe}")
+    plan.step("wrappers/ompd TARGET + profile layer commit",
+              lambda: (set_wrapper_target(conf, exe), commit_layer(conf, f"chore(ompd): roll wrapper back to {os.path.basename(exe)}")),
+              f"{conf['OMPD_WRAPPER']}: TARGET={exe}")
+    plan.step("install.sh + omp-channels --verify", lambda: install_and_verify(conf), f"{conf['INSTALL']} && {conf['DOCTOR']} --verify")
+    print(f"\n{'[dry-run] no changes made' if dry else 'rolled back'}; BUILD-MANIFEST.json still describes the newer build "
+          f"(archives: {conf['FORK_DIR']}/BUILD-MANIFEST-r*.json). Undo: fork-release --rollback")
+
+
+# ---------------------------------------------------------------- release
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        usage(0)
+    flags = {"--dry-run", "--skip-check", "--rollback"}
+    dry = "--dry-run" in args
+    notes = ""
+    pos = []
+    it = iter(args)
+    for a in it:
+        if a == "--notes":
+            notes = next(it, None) or usage()
+        elif a in flags:
+            continue
+        elif a.startswith("--"):
+            usage()
+        else:
+            pos.append(a)
+    conf = fl.load_conf()
+    if "--rollback" in args:
+        if pos:
+            usage()
+        return rollback(conf, dry)
+    if len(pos) != 1 or not re.fullmatch(r"r\d+", pos[0]):
+        usage()
+    rn = pos[0]
+    skip_check = "--skip-check" in args
+    co = conf["CHECKOUT"]
+    agent_dir = os.path.join(co, "packages", "coding-agent")
+    dist = os.path.join(agent_dir, "dist")
+    dist_omp = os.path.join(dist, "omp")
+    fork_dir = conf["FORK_DIR"]
+
+    # ---- preflight (read-only; runs in --dry-run too)
+    if not os.path.isdir(co):
+        fl.die(f"checkout missing: {co}")
+    branch = fl.fork_branch(conf)
+    current = fl.current_branch(conf)
+    if current != branch:
+        fl.die(f"HEAD of {co} is {current or 'detached'}, not the fork branch {branch}")
+    fl.require_clean(conf)
+    problems = []
+    head = fl.git(conf, "rev-parse", "HEAD")
+    base = fl.base_tag(conf)
+    base_commit = fl.git(conf, "rev-parse", base + "^{commit}")
+    n_commits = int(fl.git(conf, "rev-list", "--count", "--first-parent", f"{base}..HEAD"))
+    pushed = fl.git(conf, "branch", "-r", "--contains", head, "--list", f"{conf['FORK_REMOTE']}/*", check=False).split()
+    with open(os.path.join(agent_dir, "package.json")) as f:
+        ver = json.load(f)["version"]
+    bun = conf["BUN"]
+    bun_ver = fl.run([bun, "--version"], check=True).stdout.strip() if os.access(bun, os.X_OK) else ""
+    if not bun_ver:
+        problems.append(f"pinned bun missing: {bun}")
+    addon_ok, addon_have, addon_want = native.status(co)
+    if not addon_ok:
+        problems.append(f"native addon stamp {addon_have or 'missing'} != packages/natives {addon_want} (`fork-sync {base}` refreshes it)")
+    cm = load_json(conf["CHANNELS_MAP"])
+    ompd = cm["channels"]["ompd"]
+    prev_exe, prev_sha = ompd["executable"], ompd["sha256"]
+    cur_manifest = load_json(conf["BUILD_MANIFEST"])
+    cur_out = cur_manifest.get("output", "")
+    cur_rn = rnum(cur_out)
+    archive = os.path.join(fork_dir, f"BUILD-MANIFEST-r{cur_rn}.json") if cur_rn >= 0 else ""
+    if not archive:
+        problems.append(f"cannot derive the rN of the current manifest output {cur_out!r}")
+    elif os.path.exists(archive):
+        with open(archive, "rb") as a, open(conf["BUILD_MANIFEST"], "rb") as b:
+            if a.read() != b.read():
+                problems.append(f"{archive} exists and differs from BUILD-MANIFEST.json; refusing to overwrite an archive")
+    used = max([rnum(n) for n in os.listdir(fork_dir)] + [cur_rn, rnum(prev_exe)])
+    if int(rn[1:]) <= used:
+        problems.append(f"{rn} is not newer than the highest existing build r{used}")
+    date = datetime.date.today().isoformat()
+    name = f"omp-{ver}-next-{date}-{rn}"
+    dest = os.path.join(fork_dir, name)
+    if os.path.exists(dest):
+        problems.append(f"{dest} already exists")
+    with open(conf["OMPD_WRAPPER"]) as f:
+        if len(re.findall(r"^TARGET=", f.read(), re.M)) != 1:
+            problems.append(f"{conf['OMPD_WRAPPER']}: expected exactly one TARGET= line")
+    layer_dirty = [line for line in fl.git(conf, "status", "--porcelain", "--", *LAYER_PATHS, cwd=conf["LAYER"]).splitlines() if line]
+    if layer_dirty:
+        problems.append(f"profile layer has uncommitted changes in {', '.join(LAYER_PATHS)}: {layer_dirty}")
+    prev_manifest_path, prev_manifest = manifest_for(conf, prev_exe)
+
+    print(f"fork-release {rn}{' (DRY RUN)' if dry else ''}")
+    print(f"  source     {co} {branch} @ {head[:10]} = {base} ({base_commit[:10]}) + {n_commits} commit(s)")
+    print(f"  pushed     {', '.join(pushed) if pushed else 'NO (not on any ' + conf['FORK_REMOTE'] + '/* branch)'}")
+    print(f"  bun        {bun_ver} ({bun})")
+    print(f"  native     stamp {addon_have or 'missing'} (packages/natives {addon_want})")
+    print(f"  output     {dest}")
+    print(f"  replaces   {prev_exe} (sha256 {prev_sha[:12]}…)")
+    print(f"  manifest   {conf['BUILD_MANIFEST']} -> archive {archive}")
+    if not pushed:
+        fl.warn(f"HEAD {head[:10]} is not pushed to {conf['FORK_REMOTE']}; the manifest records it as unpushed")
+    shared_auth_warning(cm)
+    if os.path.exists(dist):
+        fl.warn(f"{dist} exists; the build overwrites it")
+    if problems:
+        fl.die("preflight failed:\n  - " + "\n  - ".join(problems))
+
+    plan = Plan(dry)
+    st = {"sha": "<sha256 of dist/omp>", "size": 0, "version": f"omp/{ver}", "smoke": "<--smoke-test output>", "layer": "<layer commit>", "codesign": "adhoc (build script)"}
+    benv = fl.bun_env(conf)
+
+    # 1. fork-check
+    if skip_check:
+        bar = "!" * 78
+        print(f"\n{bar}\n!!! --skip-check: fork-check NOT run; must-keep features and tests are UNVERIFIED for {head[:10]}\n{bar}")
+    else:
+        def check():
+            cp = subprocess.run([os.path.join(HERE, "fork-check")], stdin=subprocess.DEVNULL, timeout=3600)
+            if cp.returncode != 0:
+                fl.die("fork-check failed; fix it or rerun with --skip-check (not recommended)")
+        plan.step("fork-check", check, f"$ {os.path.join(HERE, 'fork-check')}")
+
+    # 2. build
+    build_log = f"/tmp/fork-release-{rn}-build.log"
+
+    def build():
+        t0 = time.monotonic()
+        with open(build_log, "w") as out:
+            p = subprocess.run([bun, "run", "build"], cwd=agent_dir, env=benv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=BUILD_TIMEOUT)
+        if p.returncode != 0:
+            with open(build_log, errors="replace") as f:
+                tail = "".join(f.readlines()[-30:])
+            fl.die(f"build failed (exit {p.returncode}); log {build_log}\n{tail}")
+        print(f"    built in {time.monotonic() - t0:.0f}s; log {build_log}")
+
+    plan.step("build", build, f"$ (cd {agent_dir} && PATH={os.path.dirname(bun)}:$PATH bun run build)   # log {build_log}, timeout {BUILD_TIMEOUT}s")
+
+    # 3. verify binary
+    def verify():
+        if not os.access(dist_omp, os.X_OK):
+            fl.die(f"build produced no executable {dist_omp}")
+        v = fl.run([dist_omp, "--version"], cwd="/tmp", env=benv, timeout=60, check=True).stdout.strip()
+        if v != f"omp/{ver}":
+            fl.die(f"dist/omp --version = {v!r}, expected 'omp/{ver}'")
+        cp = fl.run([dist_omp, "--smoke-test"], cwd="/tmp", env=benv, timeout=120)
+        out = ((cp.stdout or "") + (cp.stderr or "")).strip()
+        if cp.returncode != 0:
+            fl.die(f"dist/omp --smoke-test failed (exit {cp.returncode}):\n{out}")
+        sig = fl.run(["codesign", "-dv", dist_omp], timeout=60)
+        sig_out = (sig.stderr or "").strip()
+        st["codesign"] = "adhoc (build script)" if "Signature=adhoc" in sig_out else (sig_out.splitlines()[-1] if sig_out else "unknown")
+        st["version"], st["smoke"] = v, (out.splitlines()[-1] if out else "ok")
+        print(f"    {v}; smoke-test: {st['smoke']}; codesign: {st['codesign']}")
+
+    plan.step("verify dist/omp", verify, f"{dist_omp} --version == omp/{ver}", f"{dist_omp} --smoke-test exits 0")
+
+    # 4. unlock + copy + sha256, then drop dist
+    targets = [conf["CHANNELS_ROOT"], fork_dir, conf["CHANNELS_MAP"], conf["BUILD_MANIFEST"]]
+    plan.step("unlock (chflags nouchg) only the uchg paths written below", None)
+    unlock(conf, targets, dry)
+
+    def copy():
+        shutil.copy2(dist_omp, dest)
+        os.chmod(dest, 0o755)
+        st["sha"], st["size"] = sha256_file(dest), os.path.getsize(dest)
+        if st["sha"] != sha256_file(dist_omp):
+            fl.die(f"copy mismatch: {dest}")
+        with open(dest + ".sha256", "w") as f:
+            f.write(f"{st['sha']}  {dest}\n")
+        print(f"    {dest}\n    sha256 {st['sha']}  size {st['size']}")
+        shutil.rmtree(dist)
+        print(f"    removed {dist}")
+
+    plan.step("copy + sha256, rm -rf dist", copy, f"cp -p {dist_omp} {dest}", f"shasum -a 256 {dest} > {dest}.sha256", f"rm -rf {dist}")
+
+    # 5. wrapper + policy + layer commit
+    def wrapper():
+        set_wrapper_target(conf, dest)
+        print(f"    $ {conf['GEN_POLICY']}")
+        fl.run([conf["GEN_POLICY"]], check=True, timeout=120)
+        st["layer"] = commit_layer(conf, f"chore(ompd): pin wrapper to {rn} ({ver}, {head[:10]})")
+
+    plan.step("wrappers/ompd TARGET, provider policy, profile layer commit", wrapper,
+              f"{conf['OMPD_WRAPPER']}: TARGET={dest}", f"$ {conf['GEN_POLICY']}",
+              f"git -C {conf['LAYER']} commit -- {' '.join(LAYER_PATHS)}   (local only)")
+
+    # 6. manifests
+    def manifests():
+        if not os.path.exists(archive):
+            shutil.copy2(conf["BUILD_MANIFEST"], archive)
+            print(f"    archived {archive}")
+        new = {
+            "builtAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "checkout": co,
+            "baseTag": base,
+            "baseCommit": base_commit,
+            "sourceCommit": head,
+            "pushedTo": f"{repo_slug(conf, conf['FORK_REMOTE'], co)} {branch} @ {head[:10]}" if pushed else f"not pushed ({branch} @ {head[:10]} local only)",
+            "worktreeDirtyAtBuild": False,
+            "bun": f"{bun_ver} ({bun})",
+            "command": "bun run build (packages/coding-agent/scripts/build-binary.ts)",
+            "nativeAddon": f"{native.ADDON_REL} stamp {addon_have} (npm {native.NPM_PACKAGE}@{addon_want}), sha256 {sha256_file(native.addon_path(co))[:16]}…",
+            "output": dest,
+            "sha256": st["sha"],
+            "size": st["size"],
+            "codesign": st["codesign"],
+            "version": st["version"],
+            "smokeTest": f"omp --smoke-test: {st['smoke']}",
+            "distRemovedFromCheckout": True,
+            "profileLayer": layer_desc(conf, st["layer"]),
+            "previousBuild": {
+                "output": prev_exe,
+                "sha256": prev_sha,
+                "sourceCommit": prev_manifest.get("sourceCommit", ""),
+                "manifest": archive if prev_manifest_path == conf["BUILD_MANIFEST"] else prev_manifest_path,
+            },
+            "portNotes": notes or f"{rn} = {base} + fork stack {branch} @ {head[:10]}: " + "; ".join(fl.git(conf, "log", "--first-parent", "--reverse", "--format=%s", f"{base}..HEAD").splitlines()),
+        }
+        write_json_atomic(conf["BUILD_MANIFEST"], new, True)
+        print(f"    wrote {conf['BUILD_MANIFEST']}")
+
+    plan.step("archive + write BUILD-MANIFEST.json", manifests, f"cp {conf['BUILD_MANIFEST']} {archive}",
+              f"new manifest: sourceCommit {head}, baseTag {base}, output {dest}, worktreeDirtyAtBuild false")
+
+    # 7. channels.json
+    identity = f"frozen fork build: upstream {base} ({base_commit[:10]}) + fork stack {branch} @ {head[:10]} ({n_commits} commits); Bun {bun_ver}"
+
+    def channels():
+        m = load_json(conf["CHANNELS_MAP"])
+        o = m["channels"]["ompd"]
+        o["identity"] = identity
+        o["executable"] = dest
+        o["sha256"] = st["sha"]
+        o["builtAt"] = load_json(conf["BUILD_MANIFEST"])["builtAt"]
+        o["previous"] = {"executable": prev_exe, "sha256": prev_sha}
+        o["sourceCommit"] = head
+        if o.get("provenance", {}).get("checkout") not in (None, co):
+            print(f"    provenance.checkout {o['provenance']['checkout']} -> {co}")
+            o["provenance"]["checkout"] = co
+        write_json_atomic(conf["CHANNELS_MAP"], m, False)
+        print(f"    updated {conf['CHANNELS_MAP']} channels.ompd")
+
+    plan.step("channels.json channels.ompd", channels, f"executable {dest}", f"identity {identity}",
+              f"sourceCommit {head}", f"previous {{executable: {prev_exe}, sha256: {prev_sha[:12]}…}}")
+
+    # 8. install + verify, 9. ompd probes
+    plan.step("install.sh (relocks) + omp-channels --verify", lambda: install_and_verify(conf), f"$ {conf['INSTALL']}", f"$ {conf['DOCTOR']} --verify")
+
+    def probes():
+        cp = subprocess.run([os.path.join(HERE, "fork-check"), "--sections", "probes", "--channel", "ompd"], stdin=subprocess.DEVNULL, timeout=600)
+        if cp.returncode != 0:
+            fl.die("must-keep probes failed against the new ompd; rollback: fork-release --rollback")
+
+    plan.step("must-keep probes through ompd", probes, f"$ fork-check --sections probes --channel ompd")
+
+    print()
+    if dry:
+        print(f"[dry-run] no changes made. A real run pins {dest}.")
+    else:
+        print(f"released {rn}: ompd -> {dest}")
+        print(f"  sha256 {st['sha']}  source {head[:10]} on {base}")
+        print(f"  profile layer commit {st['layer']} is local: git -C {conf['LAYER']} push origin HEAD")
+    print(f"rollback: fork-release --rollback   (ompd back to {os.path.basename(prev_exe)})")
+
+
+if __name__ == "__main__":
+    main()

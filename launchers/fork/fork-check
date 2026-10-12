@@ -1,0 +1,240 @@
+#!/usr/bin/python3
+"""fork-check: verify the fork checkout before pinning a build. Prints a PASS/FAIL table; exit 1 on any FAIL.
+
+  fork-check [--base <tag>] [--channel ompdev|ompd] [--sections types,tests,probes] [--log-dir DIR]
+
+Runs in CHECKOUT with PI_CONFIG_FILES / OMP_SHARED_SECRETS_FILE unset and the pinned Bun first on PATH.
+  types   root `bun run check:tools` (oxlint + oxfmt, as `bun check:ts` does), then `bun run check:types`
+          in every package changed vs the base tag plus every workspace package depending on one;
+          `bun run check:rs` only when crates/ differs from the base tag.
+  tests   every *.test.ts changed vs the base tag (deleted ones skipped), chunked per package,
+          plus the must-keep tests from must-keep.json (one row per feature).
+  probes  must-keep runtime probes from must-keep.json against `<channel>` (default ompdev), run from
+          /tmp with stdin closed and a timeout.
+Per-step logs land in --log-dir (default /tmp/fork-check-<timestamp>/)."""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import forklib as fl  # noqa: E402
+
+SECTIONS = ("types", "tests", "probes")
+TIMEOUT_TOOLS = 900
+TIMEOUT_TYPES = 900
+TIMEOUT_RS = 1800
+TIMEOUT_TEST_CHUNK = 1200
+TIMEOUT_PROBE = 60
+TEST_CHUNK = 20
+TEST_PER_TEST_TIMEOUT_MS = 60000
+
+
+def usage(code: int = 2) -> None:
+    print(__doc__.strip(), file=sys.stderr if code else sys.stdout)
+    sys.exit(code)
+
+
+def parse_args(argv: list) -> dict:
+    opts = {"base": "", "channel": "ompdev", "sections": list(SECTIONS), "log_dir": ""}
+    it = iter(argv)
+    for a in it:
+        if a in ("-h", "--help"):
+            usage(0)
+        elif a in ("--base", "--channel", "--sections", "--log-dir"):
+            v = next(it, None)
+            if v is None:
+                usage()
+            if a == "--sections":
+                opts["sections"] = [s for s in v.split(",") if s]
+                if not opts["sections"] or set(opts["sections"]) - set(SECTIONS):
+                    usage()
+            else:
+                opts[a[2:].replace("-", "_")] = v
+        else:
+            usage()
+    return opts
+
+
+class Runner:
+    def __init__(self, log_dir: str, env: dict):
+        self.log_dir = log_dir
+        self.env = env
+        self.rows = []
+        self.n = 0
+
+    def step(self, section: str, label: str, cmd: list, cwd: str, timeout: int, judge=None):
+        """Run cmd (stdin closed, own process group) into a log file; judge(rc, text) -> (ok, detail)."""
+        self.n += 1
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")[:60]
+        log = os.path.join(self.log_dir, f"{self.n:02d}-{section}-{slug}.log")
+        print(f"[{section}] {label} ... ", end="", flush=True)
+        t0 = time.monotonic()
+        with open(log, "w") as out:
+            out.write(f"$ (cd {cwd} && {' '.join(cmd)})\n")
+            out.flush()
+            p = subprocess.Popen(cmd, cwd=cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                rc = p.wait(timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                rc, timed_out = -9, True
+        dt = time.monotonic() - t0
+        with open(log, errors="replace") as f:
+            text = f.read()
+        if timed_out:
+            ok, detail = False, f"timeout after {timeout}s"
+        elif judge:
+            ok, detail = judge(rc, text)
+        else:
+            ok, detail = rc == 0, "" if rc == 0 else f"exit {rc}"
+        result = "PASS" if ok else "FAIL"
+        print(f"{result} ({dt:.0f}s)")
+        if not ok:
+            tail = "\n".join(text.rstrip().splitlines()[-25:])
+            print(f"    --- tail of {log} ---\n" + "\n".join("    " + line for line in tail.splitlines()))
+        self.rows.append([section, label, result, f"{dt:.0f}s", detail, log])
+
+    def add(self, section: str, label: str, ok: bool, detail: str):
+        self.rows.append([section, label, "PASS" if ok else "FAIL", "-", detail, ""])
+
+
+def workspace_packages(co: str) -> dict:
+    """dir name -> (package name, scripts, workspace deps)."""
+    pkgs = {}
+    for d in sorted(os.listdir(os.path.join(co, "packages"))):
+        pj = os.path.join(co, "packages", d, "package.json")
+        if not os.path.isfile(pj):
+            continue
+        with open(pj) as f:
+            data = json.load(f)
+        deps = {}
+        for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            deps.update(data.get(key) or {})
+        pkgs[d] = (data.get("name", d), data.get("scripts") or {}, set(deps))
+    return pkgs
+
+
+def type_targets(co: str, changed_dirs: set) -> list:
+    pkgs = workspace_packages(co)
+    by_name = {name: d for d, (name, _, _) in pkgs.items()}
+    targets = {d for d in changed_dirs if d in pkgs}
+    grew = True
+    while grew:  # reverse-dependency closure: a fork change in utils can break coding-agent's types
+        grew = False
+        for d, (_, _, deps) in pkgs.items():
+            if d not in targets and any(by_name.get(dep) in targets for dep in deps):
+                targets.add(d)
+                grew = True
+    return sorted(d for d in targets if "check:types" in pkgs[d][1])
+
+
+def bun_test_judge(rc: int, text: str):
+    passed = re.findall(r"^\s*(\d+) pass\b", text, re.M)
+    failed = re.findall(r"^\s*(\d+) fail\b", text, re.M)
+    detail = f"{passed[-1] if passed else '?'} pass, {failed[-1] if failed else '?'} fail"
+    return rc == 0 and (not failed or failed[-1] == "0"), detail
+
+
+def probe_judge(probe: dict):
+    def judge(rc: int, text: str):
+        body = text.split("\n", 1)[1] if "\n" in text else ""
+        missing = [r for r in probe.get("mustMatch", []) if not re.search(r, body, re.M)]
+        present = [r for r in probe.get("mustNotMatch", []) if re.search(r, body, re.M)]
+        first = body.strip().splitlines()[0] if body.strip() else "(no output)"
+        problems = ([f"exit {rc}"] if rc != 0 else []) + [f"missing /{r}/" for r in missing] + [f"unexpected /{r}/" for r in present]
+        return not problems, "; ".join(problems) if problems else first[:70]
+
+    return judge
+
+
+def run_tests(r: Runner, co: str, bun: str, label: str, files: list) -> None:
+    by_pkg = {}
+    for f in files:
+        parts = f.split("/")
+        root = "/".join(parts[:2]) if parts[0] == "packages" and len(parts) > 2 else "."
+        by_pkg.setdefault(root, []).append(os.path.relpath(f, root) if root != "." else f)
+    for root, rel in sorted(by_pkg.items()):
+        chunks = [rel[i : i + TEST_CHUNK] for i in range(0, len(rel), TEST_CHUNK)]
+        for i, chunk in enumerate(chunks, 1):
+            suffix = f" [{i}/{len(chunks)}]" if len(chunks) > 1 else ""
+            name = f"{label} {root.split('/')[-1]}{suffix} ({len(chunk)} files)"
+            cmd = [bun, "test", f"--timeout={TEST_PER_TEST_TIMEOUT_MS}", *[f"./{p}" for p in chunk]]
+            r.step("tests", name, cmd, os.path.join(co, root), TIMEOUT_TEST_CHUNK, bun_test_judge)
+
+
+def main() -> None:
+    opts = parse_args(sys.argv[1:])
+    conf = fl.load_conf()
+    co = conf["CHECKOUT"]
+    bun = conf["BUN"]
+    if not os.path.isdir(co):
+        fl.die(f"checkout missing: {co}")
+    if not os.access(bun, os.X_OK):
+        fl.die(f"pinned bun missing: {bun}")
+    with open(fl.MUST_KEEP_FILE) as f:
+        must_keep = json.load(f)["features"]
+    base = opts["base"] or fl.base_tag(conf)
+    head = fl.git(conf, "rev-parse", "--short=10", "HEAD")
+    log_dir = opts["log_dir"] or f"/tmp/fork-check-{time.strftime('%Y%m%d-%H%M%S')}"
+    os.makedirs(log_dir, exist_ok=True)
+    dirty = fl.dirty_lines(conf)
+    print(f"fork-check: {co} @ {head} ({fl.current_branch(conf) or 'detached'}) on {base}; logs {log_dir}")
+    if dirty:
+        fl.warn(f"working tree has {len(dirty)} uncommitted change(s); checking the tree as it is")
+    r = Runner(log_dir, fl.bun_env(conf))
+
+    if "types" in opts["sections"]:
+        changed = fl.git(conf, "diff", "--name-only", base, "--", "packages/").splitlines()
+        changed_dirs = {p.split("/")[1] for p in changed if p.count("/") >= 2}
+        r.step("types", "check:tools (oxlint+oxfmt)", [bun, "run", "check:tools"], co, TIMEOUT_TOOLS)
+        for d in type_targets(co, changed_dirs):
+            tag = "changed" if d in changed_dirs else "dependent"
+            r.step("types", f"check:types {d} ({tag})", [bun, "run", "check:types"], os.path.join(co, "packages", d), TIMEOUT_TYPES)
+        if fl.git(conf, "diff", "--name-only", base, "--", "crates/"):
+            r.step("types", "check:rs (crates/ differ from base)", [bun, "run", "check:rs"], co, TIMEOUT_RS)
+        else:
+            r.add("types", "check:rs", True, f"skipped: crates/ identical to {base}")
+
+    if "tests" in opts["sections"]:
+        keep_tests = {t for feat in must_keep for t in feat.get("tests", [])}
+        for feat in must_keep:
+            files = feat.get("tests", [])
+            if not files:
+                continue
+            absent = [t for t in files if not os.path.isfile(os.path.join(co, t))]
+            if absent:
+                r.add("tests", f"must-keep: {feat['name']}", False, "missing test file(s): " + ", ".join(absent))
+                continue
+            run_tests(r, co, bun, f"must-keep: {feat['name']}", files)
+        changed_tests = fl.git(conf, "diff", "--name-only", "--diff-filter=d", base, "--", "*.test.ts").splitlines()
+        rest = [t for t in changed_tests if t not in keep_tests and os.path.isfile(os.path.join(co, t))]
+        if rest:
+            run_tests(r, co, bun, "changed", rest)
+        else:
+            r.add("tests", "changed tests", True, f"none changed vs {base}")
+
+    if "probes" in opts["sections"]:
+        exe = os.path.join(conf["CHANNEL_BIN"], opts["channel"])
+        for feat in must_keep:
+            for probe in feat.get("probes", []):
+                label = f"{opts['channel']} {probe.get('label') or ' '.join(probe['args'])}"
+                r.step("probes", label, [exe, *probe["args"]], "/tmp", TIMEOUT_PROBE, probe_judge(probe))
+
+    print()
+    fl.print_table(["SECTION", "CHECK", "RESULT", "TIME", "DETAIL"], [row[:5] for row in r.rows])
+    failed = [row for row in r.rows if row[2] == "FAIL"]
+    print()
+    if failed:
+        print(f"fork-check: FAIL ({len(failed)} of {len(r.rows)} checks); logs in {log_dir}")
+        sys.exit(1)
+    print(f"fork-check: PASS ({len(r.rows)} checks) for {head} on {base}; logs in {log_dir}")
+
+
+if __name__ == "__main__":
+    main()

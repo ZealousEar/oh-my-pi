@@ -1,0 +1,33 @@
+{
+  "_doc": "Must-keep fork features (RUNBOOK 'Must-keep fork features'). fork-check runs every `tests` path (relative to CHECKOUT) and every `probes` entry. A probe runs `<channel> <args...>` from /tmp with stdin closed; it passes when the exit code is 0, every `mustMatch` regex matches the combined output and no `mustNotMatch` regex does (Python re, MULTILINE). Add a feature by appending an object.",
+  "features": [
+    {
+      "name": "/models Presets sidebar",
+      "tests": [
+        "packages/coding-agent/test/model-presets.test.ts",
+        "packages/coding-agent/test/model-hub.test.ts",
+        "packages/tui/test/model-picker-native.test.ts",
+        "packages/tui/test/model-hub-assign-scope.test.ts"
+      ],
+      "probes": []
+    },
+    {
+      "name": "opencode-go provider allowed",
+      "tests": [],
+      "probes": [
+        {
+          "label": "models opencode-go non-empty",
+          "args": ["models", "opencode-go"],
+          "mustMatch": ["^opencode-go \\([1-9][0-9]*\\)"],
+          "mustNotMatch": ["No models matching"]
+        },
+        {
+          "label": "models opencode-zen empty",
+          "args": ["models", "opencode-zen"],
+          "mustMatch": ["No models matching"],
+          "mustNotMatch": ["^opencode-zen \\([0-9]+\\)"]
+        }
+      ]
+    }
+  ]
+}
