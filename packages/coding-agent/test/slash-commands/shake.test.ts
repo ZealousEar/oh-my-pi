@@ -41,7 +41,7 @@ describe("/shake dispatch (ACP)", () => {
 	});
 
 	it("parses each explicit mode", async () => {
-		for (const mode of ["elide", "images", "thinking"] as const) {
+		for (const mode of ["elide", "images", "thinking", "semantic"] as const) {
 			const h = acpRuntime();
 			await executeAcpBuiltinSlashCommand(`/shake ${mode}`, h.runtime);
 			expect(h.shake).toHaveBeenCalledWith(mode);
