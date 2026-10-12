@@ -7,6 +7,7 @@ import { enqueueGroupOp, groupRelayTabs, isNonEmpty } from "./groups";
 import { relayOverlay } from "./overlay-host";
 import type { RelayLink } from "./relay";
 import { findDownload, relayInitiatedDetachTabs } from "./relay-events";
+import { markTab } from "./tab-marks";
 import { focusTab, removeTab, snapshot } from "./tabs";
 
 /** Run one relay RPC; `origin` is the link epoch it came in on, which alone can carry its answer. */
@@ -37,6 +38,8 @@ export async function runRelayRpc(request: RelayRpcRequest, origin: RelayLink): 
 		}
 		case "createTab": {
 			const tab = await chrome.tabs.create({ url: request.url, active: request.active ?? true });
+			// The marker is what later proves this tab is omp's: to the group reconcile and to an orphan reaper.
+			if (tab.id !== undefined) await markTab(tab.id);
 			const snap = snapshot(tab);
 			if (!snap) throw new Error("created tab has no id");
 			// The relay failed this call when its link ended, so nobody learns this tab's id to close it later.

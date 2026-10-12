@@ -964,10 +964,6 @@ export class RelayBridge {
 			this.#onHello(socket, msg);
 			return;
 		}
-		if (msg.t === "ping") {
-			socket.send(JSON.stringify({ t: "pong" } satisfies RelayToExtMessage));
-			return;
-		}
 		// Only an accepted extension drives tab state.
 		const instanceId = this.#socketInstance.get(socket);
 		if (instanceId === undefined) return;

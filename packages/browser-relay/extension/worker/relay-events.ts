@@ -4,7 +4,9 @@
 import type { FoundDownload } from "../../../coding-agent/src/tools/browser/relay/protocol";
 import { DownloadPairing } from "../download-pairing";
 import { onForeignFramesHidden } from "../foreign-frames";
+import { noteUserRegroup } from "./groups";
 import { broadcastRelayEvent } from "./relay";
+import { forgetTabMarker } from "./tab-marks";
 import { snapshot } from "./tabs";
 
 /** Tabs whose debugger detach the relay asked for, so their `detached` event says so. */
@@ -54,7 +56,8 @@ export function installRelayEvents(): void {
 		if (snap) broadcastRelayEvent({ t: "tabCreated", tab: snap });
 	});
 
-	chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
+	chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+		if (changeInfo.groupId !== undefined) noteUserRegroup(tab);
 		const snap = snapshot(tab);
 		if (snap) broadcastRelayEvent({ t: "tabUpdated", tab: snap });
 	});
@@ -72,6 +75,7 @@ export function installRelayEvents(): void {
 	});
 
 	chrome.tabs.onRemoved.addListener(tabId => {
+		forgetTabMarker(tabId);
 		broadcastRelayEvent({ t: "tabRemoved", tabId });
 	});
 }

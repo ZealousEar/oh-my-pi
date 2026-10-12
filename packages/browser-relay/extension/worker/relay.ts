@@ -32,6 +32,7 @@ import {
 } from "../messages";
 import { RelayCalls } from "./calls";
 import { ensureBrowserSession, ensureInstanceId } from "./identity";
+import { loadTabMarks, pruneTabMarkers } from "./tab-marks";
 import { snapshot } from "./tabs";
 
 /**
@@ -152,7 +153,11 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 	const [tabs, targets] = await Promise.all([
 		chrome.tabs.query({}),
 		chrome.debugger.getTargets(),
+		loadTabMarks(),
 	]);
+	const liveTabIds = new Set<number>();
+	for (const tab of tabs) if (tab.id !== undefined) liveTabIds.add(tab.id);
+	pruneTabMarkers(liveTabIds);
 	const snapshots: TabSnapshot[] = [];
 	for (const tab of tabs) {
 		const snap = snapshot(tab);

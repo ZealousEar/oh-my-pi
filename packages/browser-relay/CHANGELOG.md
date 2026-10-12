@@ -5,10 +5,12 @@
 ### Added
 
 - Added a relay profile binding (`~/.omp/browser-relay/binding.json`): once bound to one Chrome install (its `instanceId`), the relay serves only that install and closes any other with 4403; unbound relays accept installs but report `profile-unbound` until one is chosen
+- Added a per-tab marker for the tabs the relay creates, reported in tab snapshots, so omp can prove a tab is its own before a later session closes it as an orphan
 
 ### Changed
 
 - Changed the extension to keep its tab group when the relay disconnects, so the next connection reuses it
+- Changed the extension to identify its tab group by the relay-created tabs in it instead of by title: a user's group with the same title is left alone, and a relay-created tab the user drags out of the omp group stays out across relay and extension restarts
 
 ### Fixed
 

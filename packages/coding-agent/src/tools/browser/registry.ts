@@ -1,14 +1,22 @@
 import * as path from "node:path";
-import { isCompiledBinary, logger, untilAborted, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { isCompiledBinary, isRecord, logger, untilAborted, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError } from "../tool-errors";
 import { ToolError } from "../tool-errors";
-import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
+import {
+	findFreeCdpPort,
+	findReusableCdp,
+	gracefulKillTreeOnce,
+	probeCdpResponse,
+	resolveSpawnArgs,
+	waitForCdp,
+} from "./attach";
 import { type CmuxKind, CmuxUnavailableError } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
+	browserConnection,
 	closeLaunchedBrowser,
 	connectPuppeteer,
 	DEFAULT_VIEWPORT,
@@ -17,9 +25,17 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { reapOrphanSharedTargets, type SharedTargetScope } from "./orphan-registry";
+import type { SharedTargetScope } from "./orphan-registry";
 import type { RelayKind } from "./relay/kind";
-import { requestRelayRestart, UPDATE_RELAY_EXTENSION, waitForRelayExtension } from "./relay/probe";
+import {
+	LEGACY_RELAY_PROTOCOL,
+	relayProtocolOf,
+	relayUnavailableAt,
+	requestRelayRestart,
+	UPDATE_RELAY_EXTENSION,
+	waitForRelayExtension,
+} from "./relay/probe";
+import { parseRelayRevision } from "./relay/protocol";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
@@ -56,12 +72,14 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	cdpUrl?: string;
 	/** The browser's main process, which owns its windows on screen; unknown for connected endpoints and the relay. */
 	pid?: number;
-	/** OMP-owned temp Chromium profile directory removed on dispose (process-local headless launches). */
+	/** OMP-owned TEMP Chromium profile removed on dispose. Only the labeled test/SDK fallback sets this. */
 	userDataDir?: string;
 	/** Daemon unit backing this handle; dispose disconnects instead of closing, kill routes to the daemon. */
-	sharedDaemon?: { name: string; projectDir: string };
+	sharedDaemon?: { name: string; runtimeDir: string; profileDir: string; generation: string };
 	/** Lease on the shared Chromium daemon unit this handle uses; released on dispose. */
 	daemonLease?: UnitLease;
+	/** Relay: extension-reported per-Chrome-run generation; undefined on a legacy relay. */
+	generation?: string;
 	subprocess?: Subprocess;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -90,13 +108,13 @@ export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle | TernBro
 
 /**
  * Durable-ownership scope for a browser handle, or undefined when the handle is
- * not the project-shared daemon-supervised Chromium (the only browser whose targets
+ * not the machine-global daemon-supervised agent Chromium (the only browser whose targets
  * outlive their creating process and thus need cross-process orphan reaping).
  */
 export function sharedTargetScopeOf(handle: BrowserHandle): SharedTargetScope | undefined {
 	if (!("browser" in handle)) return undefined;
 	if (handle.kind.kind !== "headless" || !handle.sharedDaemon) return undefined;
-	return { projectDir: handle.sharedDaemon.projectDir, daemonName: handle.sharedDaemon.name };
+	return { runtimeDir: handle.sharedDaemon.runtimeDir, daemonName: handle.sharedDaemon.name };
 }
 
 /** Controls bounded browser-handle teardown and identifies the owning resource in timeout diagnostics. */
@@ -231,6 +249,11 @@ export function normalizeConnectedCdpUrl(rawCdpUrl: string): string {
 	return cdpUrl;
 }
 
+/** Refusal of a relay below the protocol `OMP_BROWSER_RELAY_REQUIRE_PROTOCOL` demands, naming how to replace it. */
+function relayProtocolTooOldMessage(cdpUrl: string, found: number, required: number): string {
+	return `omp browser relay at ${cdpUrl} is a legacy/stock relay (protocol ${found}); this omp requires protocol ${required}. Run \`omp browser-relay install\` with this omp and reload the omp extension in Chrome, then retry.`;
+}
+
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "cmux") {
 		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
@@ -263,13 +286,21 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 	}
 	if (kind.kind === "headless") {
 		// Every real omp process (session, subagent, worker — anything with a CLI
-		// worker host) MUST go through the project-shared daemon-supervised Chromium:
-		// per-process launches are what produced launch storms and orphaned
-		// process trees. The process-local launch survives only for hosts that
-		// cannot spawn the omp daemon (bun test, SDK embedding without a CLI entry).
+		// worker host) MUST go through the machine-global daemon-supervised Chromium
+		// on the stable agent profile: per-process launches produced launch
+		// storms, orphaned process trees and throwaway profiles whose logins
+		// evaporated. That path fails closed (`openSharedHeadlessHandle` throws)
+		// rather than creating a temp profile.
 		if (isCompiledBinary() || workerHostEntry() !== null) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
+		// TEST/SDK-ONLY FALLBACK: hosts without a CLI worker entry (bun test, SDK
+		// embedding) cannot start the omp daemon. They get a process-local Chromium
+		// on a temp profile that is deleted on dispose. Nothing durable lives
+		// here, and it is never reachable from a CLI-hosted run.
+		logger.warn("browser: process-local Chromium with a THROWAWAY profile (test/SDK host without a worker entry)", {
+			headless: kind.headless,
+		});
 		const { browser, wsEndpoint, userDataDir } = await launchHeadlessBrowser({
 			headless: kind.headless,
 			viewport: opts.viewport,
@@ -330,6 +361,39 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				`The omp browser relay at ${cdpUrl} is up, but its browser never said hello. Reload the omp extension in Chrome.`,
 			);
 		}
+		if (outcome === "profile-unbound" || outcome === "profile-mismatch" || outcome === "profile-invalid") {
+			// The relay refused the Chrome profile that dialed: its 503 names the install and the fix.
+			const refusal = await relayUnavailableAt(cdpUrl, opts.signal);
+			throw new ToolError(
+				`omp browser relay at ${cdpUrl}: ${refusal?.error || `the relay refused the connected Chrome profile (${outcome})`}`,
+			);
+		}
+		// The relay reports the extension's per-Chrome-run generation (`OMP-Browser-Generation`); it scopes durable
+		// relay tab records so a tab id recycled by a Chrome restart can never match an old record. The protocol is
+		// derived from this same answer (the last one before puppeteer connects) so a relay swapped in after the wait
+		// cannot slip under the requirement. The binding proof follows below, over the adopted connection itself.
+		const version = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: 2_000, signal: opts.signal });
+		if (kind.requireProtocol !== undefined) {
+			const found = relayProtocolOf(version) ?? LEGACY_RELAY_PROTOCOL;
+			if (found < kind.requireProtocol) {
+				throw new ToolError(relayProtocolTooOldMessage(cdpUrl, found, kind.requireProtocol));
+			}
+		}
+		let generation: string | undefined;
+		let expectedFingerprint: string | undefined;
+		try {
+			const parsed: unknown = version ? JSON.parse(version.body) : undefined;
+			if (isRecord(parsed)) {
+				if (typeof parsed["OMP-Browser-Generation"] === "string") generation = parsed["OMP-Browser-Generation"];
+				if (typeof parsed["OMP-Profile-Fingerprint"] === "string") {
+					expectedFingerprint = parsed["OMP-Profile-Fingerprint"];
+				}
+			}
+		} catch {
+			// Legacy relay (18.1.10): no generation; relay tab records stay unprovable and are never reaped.
+		}
+		// After the protocol requirement: a stock relay fails on the requirement it
+		// cannot meet, not on a capability it never advertised.
 		if (outcome === "outdated-relay") {
 			throw new ToolError(
 				`The browser relay at ${cdpUrl} comes from an older omp. Run \`omp browser-relay install\` with this omp, then reload the omp extension in Chrome.`,
@@ -344,12 +408,47 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		if (kind.requireProtocol !== undefined) {
+			// The proof that counts is bound to THIS connection: puppeteer's own
+			// discovery lookup and websocket may have reached a different process
+			// than the probes above. Only a protocol-2 relay stamps `revision`, and
+			// it must be the same bound install the pre-connect answer named.
+			let revision: unknown;
+			try {
+				revision = (await browserConnection(browser).send("Browser.getVersion")).revision;
+			} catch (err) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl} did not answer Browser.getVersion over the adopted connection: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			const proven = parseRelayRevision(revision);
+			if (proven === null || proven.protocol < kind.requireProtocol) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					relayProtocolTooOldMessage(cdpUrl, proven?.protocol ?? LEGACY_RELAY_PROTOCOL, kind.requireProtocol),
+				);
+			}
+			const mismatch =
+				proven.binding !== "bound"
+					? `it is ${proven.binding || "unbound"}, not bound`
+					: proven.fingerprint !== expectedFingerprint
+						? `it serves Chrome profile install ${proven.fingerprint || "(none)"}, not ${expectedFingerprint ?? "(none)"}`
+						: null;
+			if (mismatch) {
+				await browser.disconnect().catch(() => undefined);
+				throw new ToolError(
+					`omp browser relay at ${cdpUrl}: the relay puppeteer connected to is not the one that answered /json/version — ${mismatch}. Another relay took the port between the check and the connection; retry, and quit the browser serving the stray relay.`,
+				);
+			}
+		}
 		return {
 			key: browserKey(kind),
 			kind,
 			browser,
 			wsEndpoint: browser.wsEndpoint(),
 			cdpUrl,
+			generation,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
@@ -502,10 +601,10 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 }
 
 /**
- * Attach to the project-shared daemon-supervised Chromium. Failures surface as
- * `ToolError` — a CLI-host process never silently falls back to a private
- * Chromium, so a broken daemon cannot quietly recreate per-process launch
- * storms.
+ * Attach to the machine-global daemon-supervised agent Chromium. Failures
+ * surface as `ToolError` — a CLI-host process never silently falls back to a
+ * private Chromium, so a broken daemon cannot quietly recreate per-process
+ * launch storms or throwaway profiles.
  */
 async function openSharedHeadlessHandle(
 	kind: Extract<PuppeteerBrowserKind, { kind: "headless" }>,
@@ -515,7 +614,6 @@ async function openSharedHeadlessHandle(
 	let lease: UnitLease | undefined;
 	try {
 		const shared = await ensureSharedBrowser({
-			projectDir: opts.cwd,
 			headless: kind.headless,
 			viewport: vp,
 			signal: opts.signal,
@@ -533,18 +631,22 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
-		// Attaching to the shared daemon is the natural point to sweep targets
-		// left behind by omp processes that died without teardown — bounds
-		// accumulation without a background timer. Best-effort and detached so a
-		// slow reap never delays the open (issue #10022).
-		void reapOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
+		// Targets left behind by omp processes that died without teardown are
+		// swept by the tab supervisor on the first tab acquisition for this
+		// handle (issue #10022) — it knows the page-level protections and the
+		// browser generation; the registry only hands out the connection.
 		return {
 			key: browserKey(kind),
 			kind,
 			browser,
 			wsEndpoint: shared.wsEndpoint,
 			pid: shared.pid,
-			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir },
+			sharedDaemon: {
+				name: shared.daemonName,
+				runtimeDir: shared.runtimeDir,
+				profileDir: shared.profileDir,
+				generation: shared.generation,
+			},
 			daemonLease: shared.lease,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
@@ -553,7 +655,7 @@ async function openSharedHeadlessHandle(
 		await lease?.release();
 		if (err instanceof ToolAbortError || err instanceof ToolError) throw err;
 		if (opts.signal?.aborted) throw new ToolAbortError("Browser open aborted");
-		throw new ToolError(`Shared browser attach failed: ${err instanceof Error ? err.message : String(err)}`);
+		throw new ToolError(`Agent browser attach failed: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }
 

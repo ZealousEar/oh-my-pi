@@ -1,6 +1,9 @@
 /**
- * Tab groups: the relay's per-window omp group (found by title) and the panel's titled conversation groups.
+ * Tab groups: the relay's one omp group per window (identified by the marked tabs it holds, never by title alone)
+ * and the panel's titled conversation groups.
  */
+import type { GroupRpcResult } from "../../../coding-agent/src/tools/browser/relay/protocol";
+import { loadTabMarks, markerOf, ompGroupOf, ompGroups, optedOut, recordOptOut, setOmpGroups } from "./tab-marks";
 
 /** Title of the relay's omp tab group; mirrored to session storage so a restarted service worker can still dissolve it. */
 let relayGroupTitle: string | null = null;
@@ -10,6 +13,8 @@ let relayGroupTitle: string | null = null;
  * not-yet-titled group and mint duplicate "omp" groups in the same window.
  */
 let groupOps: Promise<unknown> = Promise.resolve();
+/** Above zero while a queued group mutation runs: the `onUpdated` it causes is not the user dragging a tab. */
+let groupOpsRunning = 0;
 
 /** Whether `ids` has an element, as `chrome.tabs.group`/`ungroup` require. */
 export function isNonEmpty<T>(ids: T[]): ids is [T, ...T[]] {
@@ -18,7 +23,15 @@ export function isNonEmpty<T>(ids: T[]): ids is [T, ...T[]] {
 
 /** Run `fn` after every group mutation queued before it. */
 export function enqueueGroupOp<T>(fn: () => Promise<T>): Promise<T> {
-	const result = groupOps.then(fn, fn);
+	const run = async () => {
+		groupOpsRunning++;
+		try {
+			return await fn();
+		} finally {
+			groupOpsRunning--;
+		}
+	};
+	const result = groupOps.then(run, run);
 	groupOps = result.catch(() => {});
 	return result;
 }
@@ -55,39 +68,174 @@ function isGroupColor(color: string): color is GroupColor {
 	return GROUP_COLORS.some(known => known === color);
 }
 
+interface ReconcileGroup {
+	id: number;
+	windowId: number;
+	title: string;
+}
+
+interface ReconcileTab {
+	tabId: number;
+	windowId: number;
+	/** -1 when ungrouped. */
+	groupId: number;
+	pinned: boolean;
+	/** Set on tabs the relay created. */
+	ompMarker?: string;
+	/** The user dragged this marked tab out of the omp group. */
+	optOut?: boolean;
+}
+
+export interface ReconcileInput {
+	title: string;
+	groups: ReconcileGroup[];
+	tabs: ReconcileTab[];
+	/** windowId → group id remembered from the last reconcile. */
+	storedGroups: Record<string, number>;
+	/** Adopted (unmarked) tabs the relay asked to group this time. */
+	requested: number[];
+}
+
+export interface ReconcilePlan {
+	/** windowId → the group every omp tab of that window belongs in (existing groups only). */
+	canonical: Record<string, number>;
+	moves: Array<{ groupId: number; tabIds: number[] }>;
+	/** Windows with omp tabs but no usable group yet. */
+	creates: Array<{ windowId: number; tabIds: number[] }>;
+}
+
 /**
- * Move tabs into the per-window relay group, creating or reusing it by title (relay `group` RPC). The group is
- * deliberately NOT dissolved when the relay disconnects: the next relay connection reuses it, and a tab the user
- * dragged out stays out.
+ * Choose ONE omp group per window: the stored id when it still exists in that window with the title, else the
+ * same-titled group holding the most marked tabs, never a same-titled group with no marked tab (that one is the
+ * user's). Marked tabs outside it and requested ungrouped adopted tabs move into it, which also merges duplicate
+ * omp groups; a window with none gets a new group.
  */
-export async function groupRelayTabs(
-	tabIds: number[],
-	title: string,
-	color: string,
-): Promise<{ grouped: Record<string, number> }> {
+export function planGroupReconcile(input: ReconcileInput): ReconcilePlan {
+	const requested = new Set(input.requested);
+	const groupById = new Map<number, ReconcileGroup>();
+	for (const group of input.groups) groupById.set(group.id, group);
+	const markedByGroup = new Map<number, number>();
+	const windows = new Set<number>();
+	for (const tab of input.tabs) {
+		windows.add(tab.windowId);
+		if (tab.ompMarker && tab.groupId !== -1 && groupById.has(tab.groupId)) {
+			markedByGroup.set(tab.groupId, (markedByGroup.get(tab.groupId) ?? 0) + 1);
+		}
+	}
+	const plan: ReconcilePlan = { canonical: {}, moves: [], creates: [] };
+	for (const windowId of windows) {
+		const key = String(windowId);
+		const stored = input.storedGroups[key];
+		const storedGroup = stored !== undefined ? groupById.get(stored) : undefined;
+		let canonical: number | undefined =
+			storedGroup && storedGroup.windowId === windowId && storedGroup.title === input.title
+				? storedGroup.id
+				: undefined;
+		if (canonical === undefined) {
+			let best = 0;
+			for (const group of input.groups) {
+				if (group.windowId !== windowId || group.title !== input.title) continue;
+				const marked = markedByGroup.get(group.id) ?? 0;
+				if (marked > best) {
+					best = marked;
+					canonical = group.id;
+				}
+			}
+		}
+		const movers: number[] = [];
+		const newcomers: number[] = [];
+		for (const tab of input.tabs) {
+			if (tab.windowId !== windowId || tab.pinned) continue;
+			const marked = tab.ompMarker !== undefined;
+			if (marked && tab.optOut) continue;
+			if (!marked && !requested.has(tab.tabId)) continue;
+			// An adopted tab already inside some other (user) group stays there.
+			if (!marked && tab.groupId !== -1 && tab.groupId !== canonical) continue;
+			if (canonical !== undefined) {
+				if (tab.groupId !== canonical) movers.push(tab.tabId);
+			} else {
+				newcomers.push(tab.tabId);
+			}
+		}
+		if (canonical !== undefined) {
+			plan.canonical[key] = canonical;
+			if (movers.length > 0) plan.moves.push({ groupId: canonical, tabIds: movers });
+		} else if (newcomers.length > 0) {
+			plan.creates.push({ windowId, tabIds: newcomers });
+		}
+	}
+	return plan;
+}
+
+/**
+ * Move the requested tabs, and every marked tab that strayed, into their window's one omp group (relay `group` RPC).
+ * The group is deliberately NOT dissolved when the relay disconnects: the next relay connection reuses it, and a tab
+ * the user dragged out stays out. The user's own groups are never touched, the same title or not.
+ */
+export async function groupRelayTabs(tabIds: number[], title: string, color: string): Promise<GroupRpcResult> {
 	if (!isGroupColor(color)) throw new Error(`unknown tab group color: ${color}`);
 	relayGroupTitle = title;
 	void chrome.storage.session.set({ ompGroupTitle: title });
-	const grouped: Record<string, number> = {};
-	for (const [windowId, ids] of await groupableByWindow(tabIds)) {
-		const existing = await chrome.tabGroups.query({ title, windowId });
-		let groupId: number;
-		if (existing[0]) {
-			groupId = existing[0].id;
-			// Heal duplicate same-title groups left behind by older races.
-			for (const dupe of existing.slice(1)) {
-				const dupeTabs = await chrome.tabs.query({ groupId: dupe.id });
-				const dupeIds = dupeTabs.map(tab => tab.id).filter(id => id !== undefined);
-				if (isNonEmpty(dupeIds)) await chrome.tabs.group({ tabIds: dupeIds, groupId });
-			}
-			await chrome.tabs.group({ tabIds: ids, groupId });
-		} else {
-			groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
-		}
-		await chrome.tabGroups.update(groupId, { title, color });
-		for (const id of ids) grouped[String(id)] = groupId;
+	await loadTabMarks();
+	const requested = [...(await groupableByWindow(tabIds)).values()].flat();
+	const [tabs, groups] = await Promise.all([chrome.tabs.query({}), chrome.tabGroups.query({})]);
+	const reconcileTabs: ReconcileTab[] = [];
+	for (const tab of tabs) {
+		if (tab.id === undefined) continue;
+		const marker = markerOf(tab.id);
+		reconcileTabs.push({
+			tabId: tab.id,
+			windowId: tab.windowId,
+			groupId: tab.groupId,
+			pinned: tab.pinned,
+			ompMarker: marker,
+			optOut: marker !== undefined && optedOut(marker),
+		});
 	}
+	const plan = planGroupReconcile({
+		title,
+		groups: groups.map(group => ({ id: group.id, windowId: group.windowId, title: group.title ?? "" })),
+		tabs: reconcileTabs,
+		storedGroups: ompGroups(),
+		requested,
+	});
+	const grouped: Record<string, number> = {};
+	// Requested tabs already sitting in their window's omp group count as grouped.
+	for (const tab of reconcileTabs) {
+		const canonical = plan.canonical[String(tab.windowId)];
+		if (canonical !== undefined && tab.groupId === canonical && requested.includes(tab.tabId)) {
+			grouped[String(tab.tabId)] = canonical;
+		}
+	}
+	for (const move of plan.moves) {
+		if (!isNonEmpty(move.tabIds)) continue;
+		await chrome.tabs.group({ tabIds: move.tabIds, groupId: move.groupId });
+		for (const tabId of move.tabIds) grouped[String(tabId)] = move.groupId;
+	}
+	for (const create of plan.creates) {
+		if (!isNonEmpty(create.tabIds)) continue;
+		const groupId = await chrome.tabs.group({
+			tabIds: create.tabIds,
+			createProperties: { windowId: create.windowId },
+		});
+		plan.canonical[String(create.windowId)] = groupId;
+		for (const tabId of create.tabIds) grouped[String(tabId)] = groupId;
+	}
+	setOmpGroups(plan.canonical);
+	for (const groupId of Object.values(plan.canonical)) await chrome.tabGroups.update(groupId, { title, color });
 	return { grouped };
+}
+
+/**
+ * A marked tab that left its window's omp group while no group mutation of ours ran was dragged out by the user:
+ * remember that, so no later reconcile moves it back.
+ */
+export function noteUserRegroup(tab: chrome.tabs.Tab): void {
+	if (tab.id === undefined || groupOpsRunning > 0) return;
+	const marker = markerOf(tab.id);
+	if (marker === undefined) return;
+	const canonical = ompGroupOf(tab.windowId);
+	if (canonical !== undefined && tab.groupId !== canonical) recordOptOut(marker);
 }
 
 /**

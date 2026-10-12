@@ -5,14 +5,18 @@ import type { TabSnapshot } from "../../../coding-agent/src/tools/browser/relay/
 import type { Size, TabContext } from "../messages";
 import { ungroupRelayTab } from "./groups";
 import { pageTargetId } from "./identity";
+import { markerOf, optedOut } from "./tab-marks";
 
 const REMOVE_TAB_ATTEMPTS = 3;
 const REMOVE_TAB_RETRY_MS = 500;
 
-/** The relay's view of a Chrome tab; null for a tab without an id (devtools windows). */
+/**
+ * The relay's view of a Chrome tab; null for a tab without an id (devtools windows). A tab the relay created carries
+ * its marker, and `optOut` once the user dragged it out of the omp group.
+ */
 export function snapshot(tab: chrome.tabs.Tab): TabSnapshot | null {
 	if (tab.id === undefined) return null;
-	return {
+	const snap: TabSnapshot = {
 		tabId: tab.id,
 		url: tab.url ?? tab.pendingUrl ?? "",
 		title: tab.title ?? "",
@@ -22,6 +26,12 @@ export function snapshot(tab: chrome.tabs.Tab): TabSnapshot | null {
 		pinned: tab.pinned,
 		groupId: tab.groupId,
 	};
+	const marker = markerOf(tab.id);
+	if (marker !== undefined) {
+		snap.ompMarker = marker;
+		if (optedOut(marker)) snap.optOut = true;
+	}
+	return snap;
 }
 
 /** The panel's view of a Chrome tab, with the relay target id the agent opens it by. */

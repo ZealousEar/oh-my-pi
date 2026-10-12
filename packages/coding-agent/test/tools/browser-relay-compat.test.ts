@@ -1,13 +1,16 @@
 /**
  * Chrome-profile binding, observed through the real relay server: what an
  * unbound or mismatched extension install gets, what `/json/version` and
- * `/omp/binding` say about it, and what the consumer wait returns.
+ * `/omp/binding` say about it, what the consumer wait returns, and how the
+ * registry holds a relay to `requireProtocol`.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBaseConfigRoot, getBrowserRelayDir } from "@oh-my-pi/pi-utils";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { readRelayBinding } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/binding";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import {
@@ -387,5 +390,141 @@ describe("relay profile binding", () => {
 		await dial(port, INSTALL_A).opened;
 		await until(async () => (await unavailable(port)).reason === "profile-invalid", "invalid verdict");
 		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("profile-invalid");
+	});
+});
+
+describe("relay protocol requirement in the registry", () => {
+	const stockVersion = (req: Request) => ({
+		Browser: "Chrome/151.0.0.0",
+		"Protocol-Version": "1.3",
+		"User-Agent": "stock",
+		"V8-Version": "",
+		"WebKit-Version": "",
+		webSocketDebuggerUrl: `ws://${new URL(req.url).host}/cdp`,
+	});
+
+	it("refuses a ready stock/legacy relay (200 without OMP-Relay-Protocol) when the kind requires protocol 2", async () => {
+		const stock = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: req => Response.json(stockVersion(req)) });
+		try {
+			const cdpUrl = `http://127.0.0.1:${stock.port}`;
+			await expect(
+				acquireBrowser(
+					{ kind: "relay", cdpUrl, requireProtocol: 2 },
+					{ cwd: process.cwd(), restartRelay: false },
+				),
+			).rejects.toThrow(
+				`omp browser relay at ${cdpUrl} is a legacy/stock relay (protocol 1); this omp requires protocol 2.`,
+			);
+		} finally {
+			stock.stop(true);
+		}
+	});
+
+	/**
+	 * A port whose HTTP probes answer as a ready protocol-2 relay bound to A
+	 * (what the registry checks before connecting) while the CDP websocket
+	 * puppeteer opens is served by whatever `revision` says — the relay that
+	 * took the port between preflight and connection.
+	 */
+	function swappedRelay(revision: string) {
+		let cdpSockets = 0;
+		let closedByClient = 0;
+		const server = Bun.serve<undefined>({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req, srv) {
+				if (new URL(req.url).pathname === "/cdp") {
+					cdpSockets++;
+					return srv.upgrade(req) ? undefined : new Response("upgrade required", { status: 426 });
+				}
+				return Response.json({
+					...stockVersion(req),
+					"OMP-Relay-Protocol": "2",
+					// A protocol-2 relay from this OMP version always carries the
+					// discarded-tab capability the registry's readiness wait requires.
+					ompRelayVersion: VERSION,
+					ompRelayDiscardedTabsProtocol: String(DISCARDED_TABS_PROTOCOL_VERSION),
+					ompExtensionDiscardedTabsProtocol: String(DISCARDED_TABS_PROTOCOL_VERSION),
+					"OMP-Profile-Binding": "bound",
+					"OMP-Profile-Fingerprint": FP_A,
+				});
+			},
+			websocket: {
+				message(ws, raw) {
+					// Enough of Chrome's browser session for puppeteer.connect to settle.
+					const msg = JSON.parse(String(raw)) as { id: number; method: string };
+					const results: Record<string, unknown> = {
+						"Browser.getVersion": {
+							protocolVersion: "1.3",
+							product: "Chrome/151",
+							revision,
+							userAgent: "stock",
+							jsVersion: "",
+						},
+						"Target.getBrowserContexts": { browserContextIds: [] },
+						"Target.getTargets": { targetInfos: [] },
+					};
+					ws.send(JSON.stringify({ id: msg.id, result: results[msg.method] ?? {} }));
+				},
+				close() {
+					closedByClient++;
+				},
+			},
+		});
+		return {
+			cdpUrl: `http://127.0.0.1:${server.port}`,
+			sockets: () => cdpSockets,
+			closed: () => closedByClient,
+			stop: () => server.stop(true),
+		};
+	}
+
+	it.each([
+		[
+			"a stock/legacy relay (Chrome-style revision)",
+			"@abc",
+			"is a legacy/stock relay (protocol 1); this omp requires protocol 2.",
+		],
+		["a protocol-2 relay that is unbound", `omp-relay/2;binding=unbound;fp=`, "it is unbound, not bound"],
+		[
+			"a protocol-2 relay bound to another Chrome profile",
+			`omp-relay/2;binding=bound;fp=${FP_B}`,
+			`it serves Chrome profile install ${FP_B}, not ${FP_A}`,
+		],
+	])(
+		"rejects and disconnects when puppeteer's connection lands on %s although the probes saw protocol 2 bound to A",
+		async (_label, revision, message) => {
+			const fake = swappedRelay(revision);
+			try {
+				await expect(
+					acquireBrowser(
+						{ kind: "relay", cdpUrl: fake.cdpUrl, requireProtocol: 2 },
+						{ cwd: process.cwd(), restartRelay: false },
+					),
+				).rejects.toThrow(message);
+				expect(fake.sockets()).toBe(1);
+				await until(async () => fake.closed() === 1, "browser disconnected");
+			} finally {
+				fake.stop();
+			}
+		},
+	);
+
+	it("accepts the connection when the revision proves protocol 2, bound, and the same fingerprint the probe reported", async () => {
+		const fake = swappedRelay(`omp-relay/2;binding=bound;fp=${FP_A}`);
+		try {
+			const handle = await acquireBrowser(
+				{ kind: "relay", cdpUrl: fake.cdpUrl, requireProtocol: 2 },
+				{ cwd: process.cwd(), restartRelay: false },
+			);
+			try {
+				expect(fake.sockets()).toBe(1);
+				expect(fake.closed()).toBe(0);
+			} finally {
+				await releaseBrowser(handle, { kill: false });
+			}
+		} finally {
+			fake.stop();
+		}
 	});
 });
