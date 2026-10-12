@@ -24,7 +24,13 @@ export default class BrowserRelay extends Command {
 		port: Flags.integer({ char: "p", description: "Port to listen on", default: DEFAULT_RELAY_PORT }),
 		token: Flags.string({ description: "Require the extension to present this token" }),
 		dir: Flags.string({
-			description: "Extension install directory (install; default ~/.omp/browser-relay/extension)",
+			description:
+				"Extension install directory (install; default ~/.omp/browser-relay/extension, shared by every profile)",
+		}),
+		supervised: Flags.boolean({
+			description:
+				"serve: keep retrying the bind every 2s while an older/foreign relay owns the port (for launchd KeepAlive jobs)",
+			default: false,
 		}),
 		"no-group": Flags.boolean({
 			description: "Don't gather controllable tabs into an 'omp' tab group",
@@ -37,6 +43,7 @@ export default class BrowserRelay extends Command {
 		"omp browser-relay install    # write the Chrome extension to disk + setup steps",
 		"omp browser-relay            # serve the relay on the default port",
 		"omp browser-relay -p 9333 --token s3cret",
+		"omp browser-relay serve --supervised   # launchd job: take the port over from an older relay",
 	];
 
 	async run(): Promise<void> {
@@ -47,6 +54,7 @@ export default class BrowserRelay extends Command {
 			token: flags.token,
 			dir: flags.dir,
 			group: !flags["no-group"],
+			supervised: flags.supervised,
 			verbose: flags.verbose,
 		});
 	}
