@@ -77,6 +77,7 @@ export const WINDOW_METHODS: MethodPolicies = {
 	press: "exec",
 	raise: "exec",
 	ax: "read",
+	inspect: "read",
 	find: "read",
 	ref: "read",
 };

@@ -1140,7 +1140,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						languages,
 						cells: cellResults,
 						jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-						statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
+						statusEvents: callStatus.statusEvents,
+						statusEventsElided: callStatus.statusEventsElided,
 						isError: true,
 					};
 					if (notice) details.notice = notice;

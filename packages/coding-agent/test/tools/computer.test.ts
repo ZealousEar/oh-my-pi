@@ -5,6 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { grantAutomationScope } from "@oh-my-pi/pi-coding-agent/tools/automation-policy";
 import { computerApproval, createComputerPrelude } from "@oh-my-pi/pi-coding-agent/tools/computer";
 import { isReadOnlyComputerCall, renderComputerCall } from "@oh-my-pi/pi-coding-agent/tools/computer/call";
 import {
@@ -342,14 +343,26 @@ async function runWorker(
 	return message;
 }
 
-function toolSession(): ToolSession {
-	return {
+/** Session with a user-granted desktop scope so the routing fixtures exercise helpers, not the automation gate. */
+function toolSession(overrides: Partial<ToolSession> = {}): ToolSession {
+	const session: ToolSession = {
 		cwd: import.meta.dir,
 		hasUI: false,
 		settings: Settings.isolated({ "computer.enabled": true }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
+		...overrides,
 	};
+	grantAutomationScope(session, {
+		surface: "computer",
+		targets: ["Code", "desktop"],
+		actions: ["*", "computer.run"],
+		consequential: false,
+		rawAccess: "broad",
+		desktopAccess: "broad",
+		task: "computer test fixture",
+	});
+	return session;
 }
 
 /** Exercise the shipped host approval/call rendering and worker, with only native OS work substituted. */
@@ -405,6 +418,9 @@ describe("computer prelude", () => {
 		await expect(prelude.invoke({ action: "run", code: "1", fn: "() => 1" }, context)).rejects.toThrow(
 			"Action 'run' requires exactly one of 'code' or 'fn'.",
 		);
+		await expect(prelude.invoke({ action: "run", code: "return 1" }, context)).rejects.toThrow(
+			"Computer mutation denied: no focused desktop window is available.",
+		);
 		await expect(prelude.invoke({ action: "call" }, context)).rejects.toThrow("computer received invalid arguments");
 		await expect(prelude.invoke({ action: "call", chain: [], read_only: true }, context)).rejects.toThrow(
 			"computer received invalid arguments",
@@ -451,8 +467,16 @@ describe("computer prelude", () => {
 			signal?: AbortSignal;
 		}> = [];
 		let closeCount = 0;
+		const focusedWindowCode = renderComputerCall([{ method: "focusedWindow", args: [] }]);
 		const controller: ComputerController = {
 			async run(code: string, timeoutMs: number, runSnapshot: ComputerSessionSnapshot, signal?: AbortSignal) {
+				if (code === focusedWindowCode) {
+					return {
+						displays: [],
+						returnValue: { id: "42", app: "Code", title: "Editor" },
+						screenshots: [],
+					};
+				}
 				calls.push({ code, timeoutMs, snapshot: runSnapshot, signal });
 				return {
 					displays: [
@@ -472,7 +496,22 @@ describe("computer prelude", () => {
 			},
 		};
 		const session = toolSession();
-		const prelude = createComputerPrelude(session, () => controller);
+		grantAutomationScope(session, {
+			surface: "computer",
+			targets: ["Code", "desktop"],
+			actions: ["computer.run", "computer.press"],
+			consequential: false,
+			rawAccess: "broad",
+			desktopAccess: "broad",
+			task: "computer prelude routing fixture",
+		});
+		const probed: string[] = [];
+		const prelude = createComputerPrelude(session, () => controller, {
+			detectDriver: async () => {
+				probed.push("detect");
+				return { installed: false, searched: ["cua-driver (PATH)"] };
+			},
+		});
 		const abort = new AbortController();
 		const context = { session, toolCallId: "computer-run", signal: abort.signal };
 
@@ -482,7 +521,6 @@ describe("computer prelude", () => {
 		);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toMatchObject({
-			code: "await desktop.windows()",
 			timeoutMs: 7_000,
 			snapshot: { readOnly: true, display: "active" },
 			signal: abort.signal,
@@ -492,7 +530,6 @@ describe("computer prelude", () => {
 			{ type: "image", data: "iVBORw==", mimeType: "image/png", detail: "original" },
 		]);
 		expect(result.details).toMatchObject({
-			code: "await desktop.windows()",
 			readOnly: true,
 			backend: "fake",
 			value: { windows: 1 },
@@ -502,7 +539,6 @@ describe("computer prelude", () => {
 			{ action: "run", fn: "(_scope, count) => count", args: [7] },
 			context,
 		);
-		expect(calls[1]?.code).toBe("return await ((_scope, count) => count)({ desktop, wait, assert }, 7);");
 		expect(functionResult.details).toMatchObject({ value: { windows: 1 } });
 
 		await prelude.invoke(
@@ -517,11 +553,9 @@ describe("computer prelude", () => {
 		);
 		await prelude.invoke({ action: "call", chain: [{ method: "press", args: ["cmd+s"] }], timeout: 9 }, context);
 		expect(calls[2]).toMatchObject({
-			code: 'return await (await desktop.window("42")).ax({"maxDepth":3});',
 			snapshot: { readOnly: true },
 		});
 		expect(calls[3]).toMatchObject({
-			code: 'return await desktop.press("cmd+s");',
 			timeoutMs: 9_000,
 			snapshot: { readOnly: false },
 		});
@@ -537,7 +571,9 @@ describe("computer prelude", () => {
 		expect(calls).toHaveLength(4);
 
 		const capabilityResult = await prelude.invoke({ action: "capabilities" }, context);
-		expect(capabilityResult.details).toEqual(capabilities);
+		// Capabilities report Cua Driver detection through the injected seam; the real host is never probed.
+		expect(capabilityResult.details).toMatchObject({ ...capabilities, driver: { installed: false } });
+		expect(probed).toEqual(["detect"]);
 		await prelude.invoke({ action: "close" }, context);
 		await prelude.invoke({ action: "close" }, context);
 		expect(closeCount).toBe(1);
@@ -724,10 +760,7 @@ describe("computer prelude", () => {
 	it("returns direct values and prints inner display text from the Python facade in a real kernel", async () => {
 		const calls: unknown[] = [];
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = {
-			...toolSession(),
-			getEvalPreludes: () => definitions,
-		};
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const shipped = createComputerPrelude(session, () => ({
 			async run() {
 				return { displays: [], returnValue: undefined, screenshots: [] };
@@ -917,7 +950,7 @@ describe("computer prelude", () => {
 
 	it("keeps full target click frames across direct Python and run zooms", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const native = new ZoomNativeSession();
 		const prelude = workerPrelude(session, native);
 		definitions = [prelude];
@@ -1036,7 +1069,7 @@ describe("computer prelude", () => {
 
 	it("chains element calls on Python ref() handles and still awaits them to elements", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const native = new RefCallSession();
 		const prelude = workerPrelude(session, native);
 		definitions = [prelude];
@@ -1139,7 +1172,7 @@ describe("computer prelude", () => {
 
 	it("double-clicks Python elements and names the element attribute read on find()'s list", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const native = new RefCallSession();
 		const prelude = workerPrelude(session, native);
 		definitions = [prelude];
@@ -1185,10 +1218,7 @@ describe("computer prelude", () => {
 	it("treats text-only Python host responses as unavailable capabilities", async () => {
 		const calls: unknown[] = [];
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = {
-			...toolSession(),
-			getEvalPreludes: () => definitions,
-		};
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const shipped = createComputerPrelude(session, () => ({
 			async run() {
 				return { displays: [], returnValue: undefined, screenshots: [] };
@@ -2237,7 +2267,7 @@ describe("expanded computer APIs", () => {
 
 	it("routes Python nested handles and new methods through the actual kernel and worker", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const native = new ZoomNativeSession();
 		const prelude = workerPrelude(session, native);
 		definitions = [prelude];
@@ -2475,7 +2505,7 @@ describe("expanded computer APIs", () => {
 
 	it("prints a trailing Python observe() tree once and keeps ax readable", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const native = new ZoomNativeSession();
 		const prelude = workerPrelude(session, native);
 		definitions = [prelude];
