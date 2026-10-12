@@ -11,17 +11,23 @@
  *  - a conservative grace window keeps a just-crashed owner's fresh records;
  *  - confirmed closures are removed, while transient failures remain durable
  *    and are retried on the next reap.
+ *
+ * Fork adaptation (21f280cd57): the registry is scoped by broker runtime dir
+ * (`runtimeDir`, machine-global agent browser) instead of `projectDir`, own
+ * records carry v2 lifecycle metadata, and scan results expose `targets:
+ * [{ targetId, record? }]`. Legacy id-only ownership files (what upstream
+ * wrote) still parse and reap exactly as before; every contract above holds.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import {
 	collectOrphanTargets,
 	forgetSharedTarget,
 	reapOrphanSharedTargets,
 	recordSharedTarget,
 	resetOrphanRegistryForTest,
+	type SharedTargetRecord,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import type { Browser } from "puppeteer-core";
@@ -30,12 +36,25 @@ const DAEMON_NAME = "omp.browser.headless";
 
 /** Unique per-test scope so registry dirs never collide across the suite. */
 function makeScope(): SharedTargetScope {
-	const projectDir = path.join("/tmp", `omp-orphan-test-${crypto.randomUUID()}`);
-	return { projectDir, daemonName: DAEMON_NAME };
+	const runtimeDir = path.join("/tmp", `omp-orphan-test-${crypto.randomUUID()}`);
+	return { runtimeDir, daemonName: DAEMON_NAME };
 }
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(scope.runtimeDir, `${scope.daemonName}.targets`);
+}
+
+/** A v2 record for a target this process created; only `targetId` matters to the ownership contract. */
+function ownRecord(targetId: string): SharedTargetRecord {
+	return {
+		targetId,
+		name: targetId,
+		channel: "test",
+		persist: false,
+		createdAt: 0,
+		lastMeaningfulActivityAt: 0,
+		generation: "gen-test",
+	};
 }
 
 async function writeOwnershipFile(
@@ -83,7 +102,7 @@ function trackedScope(): SharedTargetScope {
 afterEach(async () => {
 	resetOrphanRegistryForTest();
 	for (const scope of scopes.splice(0)) {
-		await fs.rm(daemonRuntimeDir(scope.projectDir), { recursive: true, force: true }).catch(() => undefined);
+		await fs.rm(scope.runtimeDir, { recursive: true, force: true }).catch(() => undefined);
 	}
 });
 
@@ -105,21 +124,21 @@ describe("orphan-registry — ownership scan", () => {
 				file: path.join(registryDir(scope), `${dead}.json`),
 				pid: dead,
 				updatedAt: 0,
-				targetIds: ["dead-a", "dead-b"],
+				targets: [{ targetId: "dead-a" }, { targetId: "dead-b" }],
 			},
 		]);
 	});
 
 	it("never reaps this process's own recorded targets", async () => {
 		const scope = trackedScope();
-		await recordSharedTarget(scope, "mine-1");
-		await recordSharedTarget(scope, "mine-2");
+		await recordSharedTarget(scope, ownRecord("mine-1"));
+		await recordSharedTarget(scope, ownRecord("mine-2"));
 
 		// Our own file is present on disk...
 		const own = (await Bun.file(path.join(registryDir(scope), `${process.pid}.json`)).json()) as {
-			targets: string[];
+			targets: SharedTargetRecord[];
 		};
-		expect(own.targets.sort()).toEqual(["mine-1", "mine-2"]);
+		expect(own.targets.map(target => target.targetId).sort()).toEqual(["mine-1", "mine-2"]);
 
 		// ...but a scan (even with everything else forced dead) skips it.
 		const scan = await collectOrphanTargets(scope, { now: () => 10_000_000, isAlive: () => false });
@@ -128,13 +147,13 @@ describe("orphan-registry — ownership scan", () => {
 
 	it("forgetSharedTarget drops one id and removes the file once empty", async () => {
 		const scope = trackedScope();
-		await recordSharedTarget(scope, "a");
-		await recordSharedTarget(scope, "b");
+		await recordSharedTarget(scope, ownRecord("a"));
+		await recordSharedTarget(scope, ownRecord("b"));
 		await forgetSharedTarget(scope, "a");
 		const after = (await Bun.file(path.join(registryDir(scope), `${process.pid}.json`)).json()) as {
-			targets: string[];
+			targets: SharedTargetRecord[];
 		};
-		expect(after.targets).toEqual(["b"]);
+		expect(after.targets.map(target => target.targetId)).toEqual(["b"]);
 
 		await forgetSharedTarget(scope, "b");
 		expect(await Bun.file(path.join(registryDir(scope), `${process.pid}.json`)).exists()).toBe(false);
@@ -162,7 +181,7 @@ describe("orphan-registry — ownership scan", () => {
 				file: path.join(registryDir(scope), `${dead}.json`),
 				pid: dead,
 				updatedAt: 100_000,
-				targetIds: ["fresh"],
+				targets: [{ targetId: "fresh" }],
 			},
 		]);
 	});
@@ -202,11 +221,14 @@ describe("orphan-registry — reap", () => {
 		expect(firstCount).toBe(1);
 		expect(firstClosed).toEqual(["closed-now"]);
 		const retained = (await Bun.file(path.join(registryDir(scope), `${dead}.json`)).json()) as {
+			version?: number;
 			pid: number;
 			updatedAt: number;
 			targets: string[];
 		};
-		expect(retained).toEqual({ pid: dead, updatedAt, targets: ["retry-later"] });
+		// The retained file keeps the legacy id and the dead owner's pid/heartbeat
+		// untouched; the rewrite only stamps the current file version.
+		expect(retained).toEqual({ version: 2, pid: dead, updatedAt, targets: ["retry-later"] });
 
 		const retryClosed: string[] = [];
 		const retryCount = await reapOrphanSharedTargets(makeBrowser(retryClosed), scope);
