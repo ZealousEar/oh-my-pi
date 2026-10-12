@@ -87,6 +87,8 @@ Control the host desktop from JavaScript or Python Eval with the global `compute
   - In an editable field, a following `el.type(…)` on that element replaces the selection.
   - In a terminal it selects displayed output only; typing still goes to the shell's input cursor.
   - Prefer it to clicking or arrow keys for editing part of a field's value.
+- `win.inspect({maxNodes?})` returns STRUCTURED data, not text: `{window, nodes[], nodeCount, truncated}` where each node carries `ref`, `role`, `title`, `value`, `enabled`, `focused`, global `x/y/width/height`, and native `actions`. Use it to decide with data; `win.ax()` stays the readable text view. `window` is null once the window is gone.
+- `await computer.task({goal, window|app, values?, expect?, maxActions?, maxCalls?, timeout?, allowConsequential?})` pursues ONE goal in ONE explicitly targeted window: it observes the accessibility tree, derives the allowed actions locally, has a judge pick one per step, revalidates the target, dispatches, then re-observes. Target explicitly — an exact window id, a unique `{app, title}` filter, or `window: "focused"`; ambiguity throws listing candidates. `values` are the only values you authorize; unmatched fields are derived by a small model or the step is rejected. `status: "done"` appears only when an independent re-observation (your `expect` checks, else a separate judge check) confirms it; other statuses are `blocked`, `abstained`, `unsupported` (visual-only window), `exhausted` (budget spent). Send/delete/purchase-class actions are withheld unless `allowConsequential: true`.
 - JavaScript `await computer.run(fnOrCode, { args?, read_only?, timeout? })` runs a multi-step function or code string.
   - Functions receive `{ desktop, wait, assert }`, then each `args` item as a further argument:
     `computer.run(async ({ desktop }, path) => …, { args: [path] })`.
@@ -96,18 +98,24 @@ Control the host desktop from JavaScript or Python Eval with the global `compute
 - Python helpers use the same names with keyword arguments becoming the trailing options object (`await win.click(10, 20, button="right")`);
   `win.raise_()` replaces the keyword `raise`. Python `computer.run(code, read_only=…, timeout=…)` accepts a JavaScript code string only.
 - Approval:
-  - Inspection helpers (`windows`, `screenshot`, `ax`, `find`, `value`, `bounds`, `clipboard.read`, …) need read approval.
-  - Input and mutation helpers need exec approval.
-  - `computer.run` uses `read_only: true` for the read tier, which also blocks facade mutation.
+  - Inspection helpers (`windows`, `screenshot`, `ax`, `find`, `value`, `bounds`, `clipboard.read`, …) run without a computer mutation capability.
+  - Window-handle input and mutation helpers require an exact, unexpired scope for the current frontmost application and action;
+    typed values are represented by fingerprints rather than plaintext.
+  - Root mouse/keyboard/clipboard-write helpers target the whole desktop and additionally require `desktopAccess: "broad"`;
+    an application grant cannot authorize global coordinates or input.
 - `computer.run` executes in the persistent JavaScript session with full Bun/Node and tool-bridge access; it is not sandboxed.
   Window handles, screenshot frames, and AX refs persist across calls until `computer.close()`, which ends the session; the next call opens a new one.
-- `computer.capabilities()` reports native permissions and `applications`, `menus`, `heldInput`, `spaces`, and `globalEscape` support;
+- `computer.capabilities()` reports native permissions and `applications`, `menus`, `heldInput`, `spaces`, and `globalEscape` support, plus the Cua Driver `driver` probe;
   unsupported operations fail explicitly.
   - `globalEscape` means physical Escape anywhere stops takeover input (`takeover: true`, held control, desktop-level input, raises, activating launches);
     without held control, background window input ignores the user's Escape, so they can keep working in their own app, and only the host interrupt stops it.
   - Once the user's Escape stops a call, every later `computer` call you make that turn fails before sending anything:
     stop using the computer and tell the user what you did and what remains.
   - Wayland uses the host interrupt instead of global Escape.
+- Treat writable `computer.run` as raw automation. Ordinary app grants and `"*"` actions never cover it. Raw execution requires either `rawAccess: "broad"` for the whole desktop or a full SHA-256 entry in `codeFingerprints` for the exact dispatched source; use `read_only: true` for inspection.
+- Desktop control of Chrome, Chromium, Safari, Firefox, Edge, Brave, Arc, Opera, or Vivaldi is app-wide rather than site-confined and requires `browserAppAccess: "broad"`.
+- Authorize each direct or `computer.task` mutation immediately before dispatch against a fresh focused-window observation. Native/direct worker programs assert the expected window id and app adjacent to the input call; Cua asks the driver for focus immediately before its mutation and refuses a flip with zero input dispatch. A machine-global native lease permits one desktop actor across all sessions and processes; overlap receives `AUTOMATION_BUSY`.
+- Interactive raw approval states that arbitrary code reaches the whole desktop, not only the focused app, and grants the exact code once or for 60 minutes. Browser-app approval states its app-wide breadth. Headless callers receive `AUTOMATION_DENIED` unchanged.
 </instruction>
 
 <examples>
@@ -125,6 +133,14 @@ await computer.run(async ({ desktop, wait }) => {
 	await wait(300);
 	return await target.ax();
 }, { timeout: 30 });
+const { nodes } = await win.inspect({ maxNodes: 200 });
+const result = await computer.task({
+	goal: "type the release date into the document",
+	window: { app: "TextEdit", title: "notes.txt" },
+	values: { document: "2026-09-18" },
+	expect: { find: { role: "textarea", value: "2026-09-18" } },
+});
+if (result.status !== "done") console.log(result.reason, result.steps);
 ```
 
 ```python
@@ -133,6 +149,11 @@ await win.screenshot(silent=True)
 tree = await win.ax(maxDepth=6)
 await win.ref("e12").press()
 await win.click(120, 48, button="right")
+result = await computer.task(
+	goal="press 7 then plus then 8 then equals",
+	window={"app": "Calculator"},
+	expect={"find": {"role": "statictext", "value": "15"}},
+)
 ```
 </examples>
 
@@ -152,6 +173,8 @@ await win.click(120, 48, button="right")
   - AX coordinates are global desktop coordinates. NEVER mix them.
 - Prefer a window screenshot to a desktop overview.
   Desktop capture defaults to the monitor containing the focused window, with primary-monitor fallback; an explicit `all` setting captures the combined desktop.
+- `computer.task` needs an EXPLICIT window: pass an exact id, a unique `{app, title}` filter, or `window: "focused"`. It never picks the focused window on its own.
+- Read `result.status` and `result.verification`; `done` is already independently verified, and `unsupported` means the window has no actionable accessibility nodes, so fall back to screenshots plus pixel input.
 - An element keeps its `[ref=eN]` across `.ax()`/`find()` reads until its role or label changes;
   a ref whose element is missing from the window's last two `.ax()` snapshots throws `StaleRef`. Re-snapshot; NEVER guess.
   - On macOS, an element action also refuses with `StaleRef`, sending nothing, if its element now reads with another role or label;
