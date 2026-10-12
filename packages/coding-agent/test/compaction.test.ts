@@ -304,6 +304,25 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(90_001, 100_000, settings)).toBe(true);
 	});
 
+	it("uses only the 15% reserve below thresholdMinContextWindow", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			thresholdPercent: 45,
+			thresholdMinContextWindow: 512_000,
+			keepRecentTokens: 20_000,
+		};
+
+		expect(resolveThresholdTokens(1_000_000, settings)).toBe(450_000);
+		expect(resolveThresholdTokens(512_000, settings)).toBe(230_400);
+		// 32k window: 32_768 - floor(15%) = 27_853, not the 16_384 the absolute reserve would give.
+		expect(shouldCompact(27_853, 32_768, settings)).toBe(false);
+		expect(shouldCompact(27_854, 32_768, settings)).toBe(true);
+		// An explicit absolute reserve is ignored below the gate too.
+		expect(resolveThresholdTokens(200_000, { ...settings, reserveTokens: 50_000 })).toBe(170_000);
+		// A fixed token threshold is not gated.
+		expect(resolveThresholdTokens(32_768, { ...settings, thresholdTokens: 16_000 })).toBe(16_000);
+	});
+
 	it("should use legacy reserve behavior when threshold is set to default sentinel", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
@@ -1336,6 +1355,29 @@ describe("prepareCompaction retained history", () => {
 		expect(expanded.previousSummary).toBe("Summary A");
 		expect(expanded.messagesToSummarize).toEqual([b.message, c.message, d.message]);
 		expect(expanded.recentMessages).toEqual([e.message]);
+	});
+
+	it("sizes the kept tail and summary reserve from a window below thresholdMinContextWindow", () => {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+		const model: Model = { ...bundled, contextWindow: 32_768 };
+		const entries: SessionEntry[] = [];
+		for (let turn = 0; turn < 6; turn++) {
+			entries.push(createMessageEntry(createUserMessage(`turn ${turn} ${"alpha ".repeat(3_000)}`)));
+			entries.push(createMessageEntry(createAssistantMessage(`reply ${turn} ${"beta ".repeat(3_000)}`)));
+		}
+		const small = { ...settings, thresholdMinContextWindow: 512_000 };
+
+		const gated = prepareCompaction(entries, small, model);
+		if (!gated) throw new Error("Expected small-window compaction");
+		// 25% of 32_768; the configured 20k tail would retain most of this window.
+		expect(tokenizer.countMessages(gated.recentMessages)).toBeLessThanOrEqual(8_192);
+		// compact() budgets the summary from this reserve: 15% of the window.
+		expect(gated.settings.reserveTokens).toBe(4_915);
+
+		const ungated = prepareCompaction(entries, settings, model);
+		if (!ungated) throw new Error("Expected compaction without the gate");
+		expect(tokenizer.countMessages(ungated.recentMessages)).toBeGreaterThan(8_192);
 	});
 });
 
