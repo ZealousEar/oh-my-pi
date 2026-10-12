@@ -1,30 +1,33 @@
 /**
- * Contract of the project-shared Chromium unit (`tools/browser/shared-daemon.ts`) against the
- * daemon client surface: adopt-or-replace on attach, generation-scoped stops, lease lifetime
- * across dispose and daemon reconnects, and the error a failed start surfaces.
+ * Contract of the machine-global agent Chromium unit (`tools/browser/shared-daemon.ts`) against the
+ * daemon client surface: one global-scope unit on the stable owner-private profile, adopt-or-replace
+ * on attach, generation-scoped stops, lease lifetime across dispose and daemon reconnects, and the
+ * error a failed start surfaces.
  *
  * The daemon is a stub `DaemonClient` that models the real one's open/stop/lease semantics
  * (find-or-start by identity, `stop` honoring `generation`, connection-bound leases); the CDP
- * probe is spied so no Chromium runs.
+ * probe is spied so no Chromium runs, and the profile directory is the test seam, never the real one.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as daemonClientModule from "@oh-my-pi/pi-coding-agent/daemon/client";
-import type {
-	DaemonClient,
-	DaemonOp,
-	DaemonResult,
-	OpenRequest,
-	OpenResult,
-	UnitScope,
-	UnitSnapshot,
+import {
+	type DaemonClient,
+	type DaemonOp,
+	type DaemonResult,
+	GLOBAL_SCOPE,
+	type OpenRequest,
+	type OpenResult,
+	type UnitScope,
+	type UnitSnapshot,
 } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import * as attach from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import * as launch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	ensureSharedBrowser,
+	restartSharedBrowser,
 	type SharedBrowserEndpoint,
 	sharedBrowserDaemonName,
 	stopSharedBrowserIfUnreachable,
@@ -72,6 +75,13 @@ class StubDaemon implements DaemonClient {
 	launch: (request: OpenRequest, generation: string) => Partial<UnitSnapshot> = () => ({});
 	/** Observes each open before it is served. */
 	beforeOpen: (request: OpenRequest) => void = () => {};
+	/** State a served stop leaves the unit in; `stopping` models a Chrome that outlived the stop. */
+	stopLeaves: UnitSnapshot["state"] = "exited";
+	/** Observes each stop before it is served. */
+	beforeStop: () => void = () => {};
+	/** Observes each restart before it relaunches the retained spec. */
+	beforeRestart: () => void = () => {};
+	restarts = 0;
 
 	#find(ref: string | { key: string }): UnitSnapshot {
 		const unit =
@@ -90,11 +100,20 @@ class StubDaemon implements DaemonClient {
 				return { unit: { ...this.#find(operation.unit) } } as never;
 			case "stop": {
 				const unit = this.#find(operation.unit);
+				this.beforeStop();
 				this.stops.push({ unit: unit.id, generation: operation.generation });
 				if (operation.generation === undefined || operation.generation === unit.generation) {
-					unit.state = "exited";
-					unit.pids = [];
+					unit.state = this.stopLeaves;
+					if (this.stopLeaves === "exited") unit.pids = [];
 				}
+				return { unit: { ...unit } } as never;
+			}
+			case "restart": {
+				const unit = this.#find(operation.unit);
+				this.beforeRestart();
+				this.restarts++;
+				unit.state = "running";
+				unit.generation = `g${++this.#generation}`;
 				return { unit: { ...unit } } as never;
 			}
 			case "logs": {
@@ -187,7 +206,7 @@ async function settleRetake(stub: StubDaemon, describesBefore: number): Promise<
 }
 
 let tmp: string;
-let projectDir: string;
+let profileDir: string;
 let runtimeDir: string;
 let stub: StubDaemon;
 /** CDP ports whose /json/version answers 200. */
@@ -195,12 +214,12 @@ let answering: Set<number>;
 
 beforeEach(() => {
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-shared-unit-"));
-	projectDir = fs.realpathSync(fs.mkdtempSync(path.join(tmp, "project-")));
+	profileDir = path.join(tmp, "agent-profile");
 	runtimeDir = path.join(tmp, "runtime");
 	stub = new StubDaemon();
 	answering = new Set();
 	spyOn(daemonClientModule, "daemonClient").mockResolvedValue(stub);
-	spyOn(piUtils, "getDaemonRuntimeDir").mockReturnValue(runtimeDir);
+	spyOn(piUtils, "getGlobalDaemonRuntimeDir").mockReturnValue(runtimeDir);
 	spyOn(launch, "resolveSharedBrowserLaunchSpec").mockResolvedValue({
 		executablePath: "/opt/fake/chrome",
 		args: ["--remote-debugging-port=0"],
@@ -218,7 +237,7 @@ afterEach(() => {
 function seedLiveUnit(port: number, generation = "g-old"): UnitSnapshot {
 	const unit = snapshot({
 		key: NAME,
-		scope: { kind: "project", dir: projectDir },
+		scope: GLOBAL_SCOPE,
 		generation,
 		readyMatch: devtools(port),
 	});
@@ -227,18 +246,33 @@ function seedLiveUnit(port: number, generation = "g-old"): UnitSnapshot {
 }
 
 async function attachShared(): Promise<SharedBrowserEndpoint> {
-	return ensureSharedBrowser({ projectDir, headless: true });
+	return ensureSharedBrowser({ profileDir, headless: true });
 }
 
 describe("ensureSharedBrowser", () => {
+	it("runs one global-scope unit on the owner-private stable profile and stamps the browser generation", async () => {
+		// A profile created earlier with a looser mode is tightened: it holds the agent's logins.
+		fs.mkdirSync(profileDir, { recursive: true, mode: 0o755 });
+		fs.chmodSync(profileDir, 0o755);
+		answering.add(9051);
+		stub.launch = () => ({ readyMatch: "DevTools listening on ws://127.0.0.1:9051/devtools/browser/gen-guid" });
+
+		const endpoint = await attachShared();
+
+		expect(stub.opens).toHaveLength(1);
+		expect(stub.opens[0]).toMatchObject({ kind: "proc", key: NAME, scope: GLOBAL_SCOPE });
+		expect(endpoint).toMatchObject({ profileDir, runtimeDir, daemonName: NAME, generation: "gen-guid" });
+		expect(fs.statSync(profileDir).mode & 0o777).toBe(0o700);
+		await endpoint.lease.release();
+	});
+
 	it("replaces a live Chrome that stops answering CDP exactly once, on a profile cleared of its stale session", async () => {
 		// Regression: adopting a wedged Chrome handed every session a dead endpoint; replacing it on
 		// the unprepared profile restored the stale session's tabs.
 		seedLiveUnit(9101);
 		answering.add(9102);
 		stub.launch = () => ({ readyMatch: devtools(9102), pids: [5151] });
-		const profile = path.join(runtimeDir, `${NAME}.profile`);
-		const sessions = path.join(profile, "Default", "Sessions");
+		const sessions = path.join(profileDir, "Default", "Sessions");
 		fs.mkdirSync(sessions, { recursive: true });
 		fs.writeFileSync(path.join(sessions, "Session_1"), "stale tabs");
 		let profileAtReplace: { sessions: boolean; preferences: boolean } | undefined;
@@ -246,7 +280,7 @@ describe("ensureSharedBrowser", () => {
 			if (request.replace) {
 				profileAtReplace = {
 					sessions: fs.existsSync(sessions),
-					preferences: fs.existsSync(path.join(profile, "Default", "Preferences")),
+					preferences: fs.existsSync(path.join(profileDir, "Default", "Preferences")),
 				};
 			}
 		};
@@ -303,6 +337,93 @@ describe("ensureSharedBrowser", () => {
 		stub.restart();
 		await drainMicrotasks();
 		expect(stub.opens).toHaveLength(opens);
+	});
+
+	it("starts Chrome only while holding the profile claim, though an unclaimed client may adopt it", async () => {
+		const sessions = path.join(profileDir, "Default", "Sessions");
+		fs.mkdirSync(sessions, { recursive: true });
+		fs.writeFileSync(path.join(sessions, "Session_1"), "previous chrome");
+		answering.add(9801);
+		let sessionsAtLaunch: string[] | undefined;
+		stub.launch = () => {
+			sessionsAtLaunch = fs.existsSync(sessions) ? fs.readdirSync(sessions) : [];
+			return { readyMatch: devtools(9801) };
+		};
+		spyOn(piUtils.logger, "warn").mockImplementation(() => {});
+		const holdClaimElsewhere = () =>
+			spyOn(piUtils, "acquireFileLock").mockRejectedValue(new Error("lock held by another omp process"));
+
+		// Another omp process (any channel) holds the claim past the wait, so this
+		// client cannot prepare the profile and must not launch Chrome on it.
+		const held = holdClaimElsewhere();
+		await expect(attachShared()).rejects.toThrow("held the shared browser profile");
+		expect(stub.opens).toHaveLength(0);
+		held.mockRestore();
+
+		const started = await attachShared();
+		expect(sessionsAtLaunch).toEqual([]);
+
+		// A running browser is adopted without the claim, and never relaunched.
+		holdClaimElsewhere();
+		const adopted = await attachShared();
+		expect(adopted.wsEndpoint).toBe(started.wsEndpoint);
+		expect(stub.opens.map(request => request.replace)).toEqual([false, false]);
+		await started.lease.release();
+		await adopted.lease.release();
+	});
+
+	it("lets only the client that launches Chrome prepare the profile when two cold starts race", async () => {
+		// Every channel attaches to the same global unit; racing cold starts converge on one launch.
+		answering.add(9851);
+		let launches = 0;
+		stub.launch = () => {
+			launches++;
+			return { readyMatch: devtools(9851) };
+		};
+		const seed = spyOn(launch, "seedOwnedProfilePreferences");
+
+		const [winner, loser] = await Promise.all([attachShared(), attachShared()]);
+
+		expect(loser.wsEndpoint).toBe(winner.wsEndpoint);
+		expect(launches).toBe(1);
+		expect(seed).toHaveBeenCalledTimes(1);
+		expect(stub.opens.map(request => request.replace)).toEqual([false, false]);
+		await winner.lease.release();
+		await loser.lease.release();
+	});
+});
+
+describe("restartSharedBrowser", () => {
+	it("restarts the agent browser without restoring the stopped Chrome's pages", async () => {
+		// The global unit runs on the stable agent profile under the config root; point that at the test dir.
+		spyOn(piUtils, "getBaseConfigRoot").mockReturnValue(tmp);
+		const sessions = path.join(tmp, "browser", "agent-profile", "Default", "Sessions");
+		const list = () => (fs.existsSync(sessions) ? fs.readdirSync(sessions) : []);
+		seedLiveUnit(9901, "g-live");
+		fs.mkdirSync(sessions, { recursive: true });
+		fs.writeFileSync(path.join(sessions, "Session_live"), "live chrome");
+		let sessionsAtStop: string[] | undefined;
+		let sessionsAtRestart: string[] | undefined;
+		stub.beforeStop = () => {
+			sessionsAtStop = list();
+		};
+		stub.beforeRestart = () => {
+			sessionsAtRestart = list();
+		};
+
+		// The running Chrome's pages stay until the stop is confirmed and are gone when it relaunches.
+		expect((await restartSharedBrowser(stub.units.get(NAME)!)).state).toBe("running");
+		expect(sessionsAtStop).toEqual(["Session_live"]);
+		expect(sessionsAtRestart).toEqual([]);
+		expect(stub.restarts).toBe(1);
+
+		// A stop that leaves Chrome running must neither touch its profile nor relaunch it.
+		fs.mkdirSync(sessions, { recursive: true });
+		fs.writeFileSync(path.join(sessions, "Session_next"), "live chrome");
+		stub.stopLeaves = "stopping";
+		await expect(restartSharedBrowser(stub.units.get(NAME)!)).rejects.toThrow("still stopping");
+		expect(list()).toEqual(["Session_next"]);
+		expect(stub.restarts).toBe(1);
 	});
 });
 
@@ -362,7 +483,7 @@ describe("stopSharedBrowserIfUnreachable", () => {
 		const probes: string[] = [];
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir, daemonName: NAME },
+			{ runtimeDir, daemonName: NAME },
 			{ client: stub, probe: async endpoint => (probes.push(endpoint), false) },
 		);
 
@@ -376,7 +497,7 @@ describe("stopSharedBrowserIfUnreachable", () => {
 		let probes = 0;
 
 		const stopped = await stopSharedBrowserIfUnreachable(
-			{ projectDir, daemonName: NAME },
+			{ runtimeDir, daemonName: NAME },
 			{
 				client: stub,
 				probe: async () => {

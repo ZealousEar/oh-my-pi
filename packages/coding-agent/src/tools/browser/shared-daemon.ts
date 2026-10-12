@@ -1,14 +1,26 @@
 /**
- * Shared automation Chromium supervised by the omp daemon.
+ * Machine-global agent Chromium supervised by the omp daemon.
  *
  * Instead of every omp process launching (and sometimes orphaning) a private
- * Chromium, the headless browser kind attaches to one daemon-supervised Chrome
- * per project directory — sessions and subagents each open their own tabs in
- * it. Every attached omp process holds a lease on the unit; the daemon stops
- * Chrome shortly after the last lease is released (or its connection closes),
- * so Chrome never outlives omp, while a daemon crash or upgrade keeps it.
- * `open` is find-or-start in the daemon, so concurrent
- * acquisitions across processes converge on a single launch.
+ * Chromium, the headless browser kind attaches to ONE daemon-supervised Chrome
+ * per machine — every channel (`omp`, `ompd`, `ompdev`), project, session and
+ * subagent opens its own tabs in it. The unit lives in the daemon's global
+ * scope (same identity regardless of `OMP_PROFILE`/project), and `open` is
+ * find-or-start in the daemon, so concurrent acquisitions across processes and
+ * channels converge on a single launch. Every attached omp process holds a
+ * lease on the unit; the daemon stops Chrome shortly after the last lease is
+ * released (or its connection closes), so Chrome never outlives omp, while a
+ * daemon crash or upgrade keeps it.
+ *
+ * Durable logins come from the stable profile directory: the Chromium always
+ * runs on `~/.omp/browser/agent-profile` (0700), never on a per-project or
+ * throwaway `mkdtemp` profile, so the cookie store survives browser restarts.
+ * That directory is agent-only — it is never the user's Chrome profile and
+ * nothing is ever copied into it.
+ *
+ * Per-open process flags are intentionally absent: a running shared Chromium
+ * cannot be relaunched for one tab, so invalid-certificate handling stays
+ * page-scoped through CDP.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -17,14 +29,15 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
 	acquireFileLock,
 	type FileLockHandle,
+	getBaseConfigRoot,
 	getDaemonRuntimeDir,
+	getGlobalDaemonRuntimeDir,
 	logger,
 	sanitizeText,
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import { daemonClient } from "../../daemon/client";
-import { canonicalProjectDir } from "../../daemon/paths";
-import { type DaemonClient, type OpenRequest, projectScope } from "../../daemon/protocol";
+import { type DaemonClient, GLOBAL_SCOPE, type OpenRequest } from "../../daemon/protocol";
 import { workerEnvFromParent } from "../../subprocess/worker-client";
 import { throwIfAborted } from "../tool-errors";
 import { probeCdpStatus } from "./attach";
@@ -39,7 +52,7 @@ const PROBE_TIMEOUT_MS = 1_500;
 /** Lines of Chrome's output a failed start reports. */
 const OUTPUT_TAIL_LINES = 6;
 /**
- * Chrome dies shortly after the last omp client in the project lets go
+ * Chrome dies shortly after the last omp client on the machine lets go
  * (`hold: "leases"`). It runs in its own session with output to its unit log
  * (`survive: "detached"`), so a daemon crash or upgrade leaves it running: the
  * next daemon re-adopts it and stops it once no returning client retakes a
@@ -76,6 +89,12 @@ const HEALTH_CHECK_BUDGET_MS = 15_000;
 const PROBE_ATTEMPT_CAP_MS = PROBE_TIMEOUT_MS + 1_500;
 /** Marker for a probe the cap abandoned, as opposed to a probe that failed on its own terms. */
 const PROBE_STALLED = "Shared browser probe did not settle";
+/**
+ * Profile-independent runtime service of the agent browser (like the relay's
+ * `browser-relay`): its durable target-ownership registry lives under
+ * `getGlobalDaemonRuntimeDir(AGENT_BROWSER_RUNTIME_SERVICE)`.
+ */
+export const AGENT_BROWSER_RUNTIME_SERVICE = "browser-agent";
 
 /** Daemon-supervised browser endpoint one omp process attached to. */
 export interface SharedBrowserEndpoint {
@@ -84,10 +103,35 @@ export interface SharedBrowserEndpoint {
 	pid?: number;
 	/** Unit key (`omp.browser.headless`/`omp.browser.headed`). */
 	daemonName: string;
-	/** Canonical project directory of the unit's scope. */
-	projectDir: string;
+	/** Machine-global runtime directory the durable ownership registry lives beside. */
+	runtimeDir: string;
+	/** Chromium profile directory the unit runs on. */
+	profileDir: string;
+	/** Per-launch browser identity (the ws endpoint GUID); target ids are only meaningful within it. */
+	generation: string;
 	/** Keeps Chrome alive while this process uses it; release on dispose. */
 	lease: UnitLease;
+}
+
+/**
+ * The one stable agent-browser profile directory: `~/.omp/browser/agent-profile`.
+ * Derived from the profile-independent config root so every channel resolves
+ * the same path. `override` exists for tests, which must never touch the real
+ * profile.
+ */
+export function agentBrowserProfileDir(override?: string): string {
+	return override ?? path.join(getBaseConfigRoot(), "browser", "agent-profile");
+}
+
+/** Machine-global runtime directory of the agent browser (its target-ownership registry lives here). */
+export function agentBrowserRuntimeDir(): string {
+	return getGlobalDaemonRuntimeDir(AGENT_BROWSER_RUNTIME_SERVICE);
+}
+
+/** Browser generation token from a CDP ws endpoint (`ws://host/devtools/browser/<guid>`); the whole URL when unparseable. */
+export function browserGenerationOf(wsEndpoint: string): string {
+	const match = /\/devtools\/browser\/([^/?#]+)/.exec(wsEndpoint);
+	return match?.[1] ?? wsEndpoint;
 }
 
 /** Stable unit key of the shared automation browser. */
@@ -95,21 +139,27 @@ export function sharedBrowserDaemonName(headless: boolean): string {
 	return headless ? "omp.browser.headless" : "omp.browser.headed";
 }
 
-/** True for the project-shared browser units. */
+/** Daemon identity of the machine-global agent browser unit. */
+export function sharedBrowserIdentity(name: string): UnitIdentity {
+	return { kind: "proc", scope: GLOBAL_SCOPE, key: name };
+}
+
+/**
+ * True for the shared browser units: the machine-global agent browser, and
+ * project-scoped ones a stock omp sharing the daemon started.
+ */
 export function isSharedBrowserUnit(unit: UnitSnapshot): boolean {
 	return (
 		unit.kind === "proc" &&
-		unit.scope.kind === "project" &&
+		(unit.scope.kind === "global" || unit.scope.kind === "project") &&
 		(unit.key === sharedBrowserDaemonName(true) || unit.key === sharedBrowserDaemonName(false))
 	);
 }
 
-/**
- * Stable per-project profile: reused across launches, and never contended by
- * pre-daemon Chromiums that used throwaway temp profiles.
- */
-function sharedBrowserProfileDir(projectDir: string, name: string): string {
-	return path.join(getDaemonRuntimeDir(projectDir), `${name}.profile`);
+/** Profile a shared browser unit runs on: the stable agent profile, or a stock omp's per-project one. */
+function sharedBrowserProfileDirOf(unit: UnitSnapshot): string {
+	if (unit.scope.kind === "project") return path.join(getDaemonRuntimeDir(unit.scope.dir), `${unit.key}.profile`);
+	return agentBrowserProfileDir();
 }
 
 function wsEndpointOf(unit: UnitSnapshot | undefined): string | undefined {
@@ -129,44 +179,43 @@ async function probeEndpoint(wsEndpoint: string): Promise<boolean> {
 }
 
 /**
- * Ensure the project-shared automation Chromium is running and reachable,
- * launching it under the daemon when needed, and take a lease on it.
+ * Ensure the machine-global agent Chromium is running and reachable, launching
+ * it under the daemon when needed, and take a lease on it.
  *
  * Chromium reads Preferences only at startup and rewrites them from memory,
  * so only the client that launches it may prepare the profile, and only
  * before the launch. The profile claim makes adopt-or-start one decision per
- * profile: a racing client describes after the winner's start settled and
- * adopts it. A live but unreachable Chrome (wedged, or readiness never
- * matched) is replaced once, on a freshly prepared profile.
+ * profile: a racing client (any channel) describes after the winner's start
+ * settled and adopts it. A live but unreachable Chrome (wedged, or readiness
+ * never matched) is replaced once, on a freshly prepared profile.
  *
  * Throws a ToolError naming why the shared path is unavailable (no resolvable
  * Chromium, a daemon failure, Chrome exiting or never becoming reachable, the
  * profile held by another process), with the tail of Chrome's output; a
- * CLI-host process never falls back to a process-local launch.
- *
- * Per-open process flags are intentionally absent: a running shared Chromium
- * cannot be relaunched for one tab, so invalid-certificate handling stays
- * page-scoped through CDP.
+ * CLI-host process fails closed — it never falls back to a throwaway profile.
  */
 export async function ensureSharedBrowser(opts: {
-	projectDir: string;
 	headless: boolean;
 	viewport?: { width: number; height: number };
 	signal?: AbortSignal;
+	/** Test seam: profile directory override. Production always uses {@link agentBrowserProfileDir}. */
+	profileDir?: string;
 }): Promise<SharedBrowserEndpoint> {
-	const projectDir = await canonicalProjectDir(opts.projectDir);
 	const name = sharedBrowserDaemonName(opts.headless);
-	const userDataDir = sharedBrowserProfileDir(projectDir, name);
+	const profileDir = agentBrowserProfileDir(opts.profileDir);
 	const launch = await resolveSharedBrowserLaunchSpec({
 		headless: opts.headless,
-		userDataDir,
+		userDataDir: profileDir,
 		viewport: opts.viewport,
 	});
 	if (!launch) throw new ToolError("Shared browser daemon unavailable: no Chromium executable could be resolved");
-	await fs.mkdir(userDataDir, { recursive: true });
+	// Agent-only state: cookies for logged-in accounts live here, so keep it
+	// owner-private. `chmod` covers a directory created earlier with a looser mode.
+	await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(profileDir, 0o700).catch(() => undefined);
 	const client = await daemonClient();
 	throwIfAborted(opts.signal);
-	const identity: UnitIdentity = { kind: "proc", scope: projectScope(projectDir), key: name };
+	const identity = sharedBrowserIdentity(name);
 	const request: OpenRequest = {
 		...identity,
 		label: opts.headless ? "Shared headless Chromium" : "Shared Chromium",
@@ -174,18 +223,19 @@ export async function ensureSharedBrowser(opts: {
 			application: launch.executablePath,
 			args: launch.args,
 			env: workerEnvFromParent(),
-			cwd: projectDir,
+			cwd: profileDir,
 			pty: false,
 			ready: { log: READY_LOG_PATTERN, timeoutMs: READY_TIMEOUT_MS },
 		},
 		policy: SHARED_BROWSER_POLICY,
 	};
-	const claim = await claimProfile(userDataDir, opts.signal);
+	const target: SharedBrowserTarget = { profileDir, executablePath: launch.executablePath };
+	const claim = await claimProfile(profileDir, opts.signal);
 	try {
 		const existing = await describeUnit(client, identity, opts.signal);
 		let reason: string | undefined;
 		if (isLiveUnit(existing)) {
-			const adopted = await openShared(client, request, projectDir, launch.executablePath, false, opts.signal);
+			const adopted = await openShared(client, request, target, false, opts.signal);
 			if (typeof adopted !== "string") return adopted;
 			reason = `the running Chrome (pid ${existing?.pids[0] ?? "?"}) was unusable (${adopted}), so it was stopped`;
 		}
@@ -196,16 +246,9 @@ export async function ensureSharedBrowser(opts: {
 				`Shared browser daemon unavailable: ${reason ? `${reason}, and ` : ""}another omp process held the shared browser profile while starting Chrome. \`omp ps\` lists the ${name} unit.`,
 			);
 		}
-		await seedOwnedProfilePreferences(userDataDir);
-		await discardOwnedProfileSessions(userDataDir);
-		const started = await openShared(
-			client,
-			request,
-			projectDir,
-			launch.executablePath,
-			reason !== undefined,
-			opts.signal,
-		);
+		await seedOwnedProfilePreferences(profileDir);
+		await discardOwnedProfileSessions(profileDir);
+		const started = await openShared(client, request, target, reason !== undefined, opts.signal);
 		if (typeof started !== "string") return started;
 		throw new ToolError(
 			`Shared browser daemon unavailable: ${reason ? `${reason}; its replacement failed: ` : ""}${started}. \`omp ps\` lists the ${name} unit.`,
@@ -213,6 +256,12 @@ export async function ensureSharedBrowser(opts: {
 	} finally {
 		claim?.release();
 	}
+}
+
+/** What {@link openShared} needs beyond the open request to build an endpoint or a failure. */
+interface SharedBrowserTarget {
+	profileDir: string;
+	executablePath: string;
 }
 
 /**
@@ -223,11 +272,11 @@ export async function ensureSharedBrowser(opts: {
 async function openShared(
 	client: DaemonClient,
 	request: OpenRequest,
-	projectDir: string,
-	executablePath: string,
+	target: SharedBrowserTarget,
 	replace: boolean,
 	signal?: AbortSignal,
 ): Promise<SharedBrowserEndpoint | string> {
+	const { executablePath } = target;
 	let lease: UnitLease;
 	try {
 		lease = new UnitLease(client, request, await client.open({ ...request, replace }, signal));
@@ -240,7 +289,15 @@ async function openShared(
 	const unit = lease.unit;
 	const wsEndpoint = wsEndpointOf(unit);
 	if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
-		return { wsEndpoint, pid: unit.pids[0], daemonName: request.key, projectDir, lease };
+		return {
+			wsEndpoint,
+			pid: unit.pids[0],
+			daemonName: request.key,
+			runtimeDir: agentBrowserRuntimeDir(),
+			profileDir: target.profileDir,
+			generation: browserGenerationOf(wsEndpoint),
+			lease,
+		};
 	}
 	await lease.release();
 	const failure = !isLiveUnit(unit)
@@ -295,16 +352,16 @@ async function stopUnit(
 }
 
 /**
- * Restart a project-shared browser for `omp ps`. The daemon's own restart
- * relaunches the retained spec on the same profile, where Chromium would
- * reopen every page the stopped process had open. This holds the profile
- * claim throughout, so no other client starts Chrome in between, stops the
- * unit, prepares the profile as for a cold start once the stop is confirmed,
- * and only then asks the daemon to relaunch.
+ * Restart a shared browser for `omp ps`. The daemon's own restart relaunches
+ * the retained spec on the same profile, where Chromium would reopen every
+ * page the stopped process had open. This holds the profile claim throughout,
+ * so no other client starts Chrome in between, stops the unit, prepares the
+ * profile as for a cold start once the stop is confirmed, and only then asks
+ * the daemon to relaunch.
  */
 export async function restartSharedBrowser(unit: UnitSnapshot, signal?: AbortSignal): Promise<UnitSnapshot> {
-	if (unit.scope.kind !== "project") throw new Error(`${unit.key} is not a project-shared browser`);
-	const userDataDir = sharedBrowserProfileDir(unit.scope.dir, unit.key);
+	if (!isSharedBrowserUnit(unit)) throw new Error(`${unit.key} is not a shared browser`);
+	const userDataDir = sharedBrowserProfileDirOf(unit);
 	const client = await daemonClient();
 	const claim = await claimProfile(userDataDir, signal);
 	if (!claim) throw new Error(`${unit.key} is being started by another omp process; try again shortly`);
@@ -352,19 +409,19 @@ export interface SharedBrowserHealthDeps {
 const reachabilityChecks = new Map<string, Promise<boolean>>();
 
 /**
- * Stop the project-shared browser when its CDP endpoint has stopped answering.
+ * Stop the shared agent browser when its CDP endpoint has stopped answering.
  *
  * `ensureSharedBrowser` makes this decision only while attaching, so a Chromium
  * that wedges *after* a session attached kept its whole process tree — and
- * every target whose close timed out — alive until the last omp client in the
- * project exited (a 9.1 GB, 44-process browser survived 19 h in the
+ * every target whose close timed out — alive until the last omp client
+ * exited (a 9.1 GB, 44-process browser survived 19 h in the
  * 2026-09-27 incident). Cleanup failures re-run the same decision off the
  * acquire path: stop the unit, so the next attach launches a fresh Chromium
  * and the leaked targets die with the old one.
  *
  * The liveness probe gates the stop — twice in a row, because one slow answer
  * on a loaded machine is not a wedge and stopping the shared browser costs
- * every session in the project its tabs — and the stop names the generation
+ * every session on the machine its tabs — and the stop names the generation
  * that failed them, so a browser another session replaced meanwhile is never
  * stopped under its name. A unit that has not become ready is left to the
  * acquire path, which owns that race. Concurrent failed closes share one check.
@@ -374,7 +431,7 @@ export function stopSharedBrowserIfUnreachable(
 	scope: SharedTargetScope,
 	deps: SharedBrowserHealthDeps = {},
 ): Promise<boolean> {
-	const key = `${scope.projectDir}\u0000${scope.daemonName}`;
+	const key = `${scope.runtimeDir}\u0000${scope.daemonName}`;
 	const inFlight = reachabilityChecks.get(key);
 	if (inFlight) return inFlight;
 	// The body bounds every phase it can see. This outer race is what guarantees
@@ -399,8 +456,7 @@ async function checkSharedBrowserReachable(scope: SharedTargetScope, deps: Share
 	const deadlineAt = Date.now() + HEALTH_CHECK_BUDGET_MS;
 	try {
 		const client = deps.client ?? (await daemonClient());
-		const identity: UnitIdentity = { kind: "proc", scope: projectScope(scope.projectDir), key: scope.daemonName };
-		const existing = await describeUnit(client, identity, signal);
+		const existing = await describeUnit(client, sharedBrowserIdentity(scope.daemonName), signal);
 		if (!existing || !isLiveUnit(existing)) return false;
 		const wsEndpoint = wsEndpointOf(existing);
 		// No endpoint stamped yet: still starting (or never became ready). The
@@ -450,9 +506,9 @@ async function checkSharedBrowserReachable(scope: SharedTargetScope, deps: Share
 			logger.debug("Shared browser stop was not confirmed", { daemon: scope.daemonName, state: stopped?.state });
 			return false;
 		}
-		logger.warn("Stopped the project-shared browser after a cleanup failure", {
+		logger.warn("Stopped the shared agent browser after a cleanup failure", {
 			daemon: scope.daemonName,
-			projectDir: scope.projectDir,
+			runtimeDir: scope.runtimeDir,
 			reason: "its CDP endpoint stopped answering",
 		});
 		return true;

@@ -7,7 +7,7 @@ Drive real browser tabs; start with `const tab = await browser.open({ name, url 
 - A `run` without `timeout`, and each direct helper call such as `tab.evaluate(…)`, gets the Eval cell's `timeout` when that is longer; for long page work, raise the cell's `timeout`.
 
 ```
-await browser.open({name, url, app, argv, target, viewport, wait_until, dialogs, allowed_domains, init_scripts, downloads, user_agent, insecure, headed, timeout, persist}) → BrowserTab
+await browser.open({name, url, app, argv, target, new_tab, viewport, wait_until, dialogs, allowed_domains, init_scripts, downloads, user_agent, insecure, headed, timeout, persist}) → BrowserTab
 browser.tab(name) → handle of an open tab
 await browser.tabs() → managed tabs
 await browser.targets({app?, timeout?}) → [{target, title, url, shown?, docked?, driven?, tab?}]
@@ -32,6 +32,7 @@ vitals, React: vitals reactEnable reactTree reactInspect reactRenders reactSuspe
 network: route(urlGlob, {abort?, status?, headers?, contentType?, body?, delay?, resourceType?}) unroute routes requests({filter?, type?, method?, status?, since?, limit?}) → metadata request(id) → with bodies clearRequests harStart harStop allowedDomains
 WebMCP (experimental, Chromium only): webmcpList webmcpInvoke webmcpEvents
 execution: evaluate(fnOrExpression) run(fnOrCode, {args?, timeout?})
+task({goal, values?, expect?, maxActions?, maxCalls?, timeout?, allowConsequential?}) → {status, steps, verification, budget, usage, backend}
 elements: id(n) ref("e5") → BrowserElement with click dblclick check uncheck highlight type fill press hover focus select uploadFile scrollIntoView boundingBox isVisible isHidden text html value attr styles isEnabled isChecked evaluate
 close()
 
@@ -78,11 +79,29 @@ selectors: CSS, or Puppeteer aria/… text/… xpath/… pierce/… label/… pl
   - Chromium: raw `page.setRequestInterception` and `page.on("request")` inside `tab.run` coexist with `tab.route` handlers and are cleaned up after that run.
   - `tab.route` persists until `tab.unroute` or tab close.
 - `allowed_domains`: exact hosts and `*.example.com` patterns (bare domain included); other navigation, subresource, fetch, and WebSocket requests abort.
+- `tab.task` runs a bounded goal-directed loop on that tab: one atomic control read per step, one typed judgment to pick an operation and its target, guarded input, then independent verification of the proposed completion.
+  - `status: "done"` only when `expect` and the completion check both pass; otherwise `unverified`, `blocked`, `abstain`, `exhausted`, or `error`.
+  - Supply `values` for anything you already know (`{ "Full name": "Ada" }`, matched by field label); a small model writes a value only when no supplied key matches, and never invents personal data.
+  - Consequential controls (submit, buy, pay, purchase, checkout, place order, send, delete, remove, confirm, transfer, sign) are refused with `status: "blocked"` unless you pass `allowConsequential: true`.
+  - Releases its tab when it finishes unless the tab was opened with `persist: true`.
+  - Refuses a tab that borrowed the user's visible foreground tab (a CDP endpoint `app` open without `target`): open a relay tab without `target` or a CDP endpoint tab with `new_tab: true` (omp-owned tabs), or name a dedicated tab with `target`.
+  - Canvas, file upload, frames, and shadow DOM are reported as unsupported and handed back rather than guessed; drive those with `observe` + explicit helpers.
+
+Permission policy:
+
+- Inspection helpers need no browser mutation capability.
+- Navigation helpers are automatic only on lifecycle-owned tabs; adopted/non-owned tabs require an exact origin/action scope for goto, scroll, scrollIntoView, focus, and hover. Open an omp-owned tab for autonomous navigation.
+- Obtain an exact, unexpired origin/action scope before each ordinary page mutation. Typed values are represented by fingerprints rather than plaintext.
+- `tab.run`, `evaluate`, and raw page/browser/CDP access are raw automation.
+  - Ordinary origin grants and `"*"` actions never cover raw execution.
+  - Raw execution requires either `rawAccess: "broad"` for the whole browser identity or a full SHA-256 entry in `codeFingerprints` for the exact dispatched source.
+  - Interactive raw approval states that arbitrary code reaches the whole relay browser identity, not only the current origin, and grants the exact code once or for 60 minutes. Headless callers receive `AUTOMATION_DENIED` unchanged so their owner can preconfigure `browser.permissions.grants`.
+- `tab.task` applies the same dispatch-specific rule: each selected mutation is authorized immediately before dispatch, and consequential operations require both `allowConsequential: true` and a consequential scope.
 
 Browser choice:
 
 - No `app` → the first that applies:
-  1. the user's Chrome through the relay (`browser.relay` setting; `PI_BROWSER_RELAY=1`/`=0` overrides it)
+  1. the user's Chrome through the relay (`browser.relay` setting; `PI_BROWSER_RELAY=1` turns it on even with the setting off; `=0` with the setting on fails the open rather than switching to another browser)
   2. `browser.cdpUrl`
   3. Tern inside a Tern pane
   4. cmux
@@ -123,6 +142,10 @@ Relay (`app: "relay"`: the user's Chrome through the omp relay):
 
 - No `target`: a new name opens omp's own background tab, leaving the user's tab alone (an outdated relay extension selects it instead).
   - `url` navigates that tab.
+- `new_tab: true` (relay or a CDP endpoint `app`): create a fresh omp-owned background tab instead of borrowing one; the open result says `owned tab` vs `adopted tab`.
+  - On the relay it is what an open without `target` already does; on a CDP endpoint it replaces adopting the visible tab.
+  - Mutually exclusive with `target`; rejected on omp's own and spawned browsers.
+  - Use it for `tab.task` and for any navigation the user did not ask for on their own tab.
 - `target` borrows an existing tab by URL/title substring. Reopening an open name keeps its tab.
 - `app: "auto"` skips the relay however it is enabled; the next default applies.
 - It is the user's real logged-in browser: sites attribute actions to the user. NEVER navigate a borrowed tab without authorization.
@@ -162,7 +185,7 @@ Tern and WebKit tab limits:
 
 Lifetime:
 
-- Closing releases the managed tab and closes pages omp opened, never borrowed pages or adopted Tern blocks.
+- Closing releases the managed tab and closes pages omp opened (in the relay, or with `new_tab`), never borrowed relay tabs, adopted CDP pages, or adopted Tern blocks.
 - `browser.close({ all: true })` releases the tabs you opened, not other agents'.
 - `kill: true` terminates only applications spawned by this process, never reused browser processes.
 - Idle tabs auto-freeze at turn settle, unfreeze on next use, and close past the idle-close timeout.

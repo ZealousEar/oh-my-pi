@@ -8,6 +8,7 @@ import { getBrowsersMapForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/r
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { Page, WaitForOptions } from "puppeteer-core";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -74,21 +75,24 @@ const server = Bun.serve({
 const baseUrl = `http://127.0.0.1:${server.port}`;
 
 function createHost() {
-	const session: ToolSession = {
-		cwd: process.cwd(),
-		hasUI: false,
-		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
-		settings: Settings.isolated({
-			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
-			"browser.webkit": false,
-			"browser.enabled": true,
-			"browser.headless": true,
-			"browser.cmux": false,
-			"browser.tern": false,
-			"tools.maxTimeout": 0,
-		}),
-	};
+	const session: ToolSession = grantBrowserFixtureScope(
+		{
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({
+				// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+				"browser.webkit": false,
+				"browser.enabled": true,
+				"browser.headless": true,
+				"browser.cmux": false,
+				"browser.tern": false,
+				"tools.maxTimeout": 0,
+			}),
+		},
+		loopbackOrigins(server.port),
+	);
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown, signal?: AbortSignal) =>
 		prelude.invoke(parameters, { session, toolCallId: "browser-nav-frames-dialogs-test", signal });
