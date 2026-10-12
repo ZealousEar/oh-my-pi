@@ -93,6 +93,7 @@ function bridgeWithUpdater(): {
 	const calls: string[] = [];
 	const pending: Array<(updated: boolean) => void> = [];
 	const bridge = new RelayBridge({
+		bindingPath: null,
 		updateExtension: extensionId => {
 			calls.push(extensionId);
 			const { promise, resolve } = Promise.withResolvers<boolean>();
@@ -424,6 +425,7 @@ describe("reloading into the installed folder", () => {
 		const installed = { stamp };
 		const writes: string[] = [];
 		const bridge = new RelayBridge({
+			bindingPath: null,
 			installedStamp: () => Promise.resolve(installed.stamp),
 			updateExtension: extensionId => {
 				writes.push(extensionId);

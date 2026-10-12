@@ -5,11 +5,21 @@
  * (`native-relay.ts`). Nothing on the port therefore means no such browser is running, except right after a
  * restart, while Chrome starts the next host. A 503 means a relay is up and its browser has not said hello yet,
  * which takes moments.
+ *
+ * The 503 body ({@link RelayUnavailableInfo}) also says when waiting cannot help: the browser that dialed in is
+ * from an unbound or a different Chrome profile, or the binding file is invalid. Those verdicts are immediate
+ * ({@link RelayWaitOutcome} `profile-*`); {@link relayUnavailableAt} reads the detail that names the fix.
+ *
+ * Relay protocol: a 200 body carries `OMP-Relay-Protocol`, a 503 body `relayProtocol`; a relay answering without
+ * either (stock 18.2.6, legacy 18.1.10) is protocol 1 ({@link relayProtocolOf}).
  */
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { throwIfAborted } from "../../tool-errors";
-import { probeCdpResponse } from "../attach";
+import { type CdpProbeResponse, probeCdpResponse } from "../attach";
+import type { ProfileBindingInfo, RelayUnavailableReason } from "./bridge";
 import { DISCARDED_TABS_PROTOCOL_VERSION, isOlderOmpVersion, RELAY_RESTART_PATH } from "./protocol";
+import type { RelayUnavailableInfo } from "./server";
 
 /** How long a relay that is up may go without its browser's hello. */
 const HELLO_WINDOW_MS = 10_000;
@@ -20,6 +30,8 @@ const HELLO_WINDOW_MS = 10_000;
 const RESTART_WINDOW_MS = 20_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const POLL_INTERVAL_MS = 150;
+/** Protocol of a relay whose `/json/version` answers carry no protocol field. */
+export const LEGACY_RELAY_PROTOCOL = 1;
 
 /** Outcome of {@link waitForRelayExtension}. */
 export type RelayWaitOutcome =
@@ -34,7 +46,16 @@ export type RelayWaitOutcome =
 	/** A compatible relay from an older OMP is ready and reports no CDP client connected to it. */
 	| "idle-older-relay"
 	/** The relay extension is older than the running server. */
-	| "outdated-extension";
+	| "outdated-extension"
+	/** An extension is connected but the relay has no binding file yet; {@link relayUnavailableAt} names the fix. */
+	| "profile-unbound"
+	/**
+	 * The relay is bound to another Chrome profile's install and rejected the one that dialed. Returned at once when
+	 * the bound install was never connected; after the hello window when it was (it may revive).
+	 */
+	| "profile-mismatch"
+	/** The relay's binding file is unreadable or malformed. */
+	| "profile-invalid";
 
 /** The OMP version a parsed `/json/version` body (ready or waiting) reports; empty when it reports none. */
 export function relayVersionOf(parsed: object): string {
@@ -58,6 +79,24 @@ function parseVersionBody(body: string): object | null {
 	}
 }
 
+/**
+ * Relay protocol advertised by a `/json/version` answer: 200 bodies carry `OMP-Relay-Protocol` (string map), 503
+ * bodies `relayProtocol`. Null when the answer is not a relay answer at all (a 2xx that is not a JSON discovery
+ * document, or any other status); an opaque 503 counts as a legacy relay, matching how consumers always adopted it.
+ */
+export function relayProtocolOf(response: CdpProbeResponse | null): number | null {
+	if (response === null) return null;
+	const ok = response.status >= 200 && response.status < 300;
+	if (!ok && response.status !== 503) return null;
+	const parsed = parseVersionBody(response.body);
+	if (parsed === null) return ok ? null : LEGACY_RELAY_PROTOCOL;
+	const raw = ok
+		? (parsed as Record<string, unknown>)["OMP-Relay-Protocol"]
+		: (parsed as Record<string, unknown>).relayProtocol;
+	const value = typeof raw === "string" ? Number(raw) : raw;
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : LEGACY_RELAY_PROTOCOL;
+}
+
 /** The id of the relay server answering at `cdpUrl`, ready or waiting; null when none answers. */
 async function relayInstanceAt(cdpUrl: string, signal?: AbortSignal): Promise<string | null> {
 	const response = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
@@ -66,6 +105,78 @@ async function relayInstanceAt(cdpUrl: string, signal?: AbortSignal): Promise<st
 	return parsed !== null && "ompRelayInstance" in parsed && typeof parsed.ompRelayInstance === "string"
 		? parsed.ompRelayInstance
 		: "";
+}
+
+const UNAVAILABLE_REASONS: Record<RelayUnavailableReason, true> = {
+	"profile-unbound": true,
+	"profile-mismatch": true,
+	"profile-invalid": true,
+};
+
+function parseProfileBinding(value: unknown): ProfileBindingInfo | undefined {
+	if (!isRecord(value)) return undefined;
+	if (value.state === "invalid" && typeof value.error === "string") return { state: "invalid", error: value.error };
+	if (value.state === "bound" && typeof value.boundFingerprint === "string") {
+		const rejected = value.lastRejected;
+		return {
+			state: "bound",
+			boundFingerprint: value.boundFingerprint,
+			...(isRecord(rejected) && typeof rejected.fingerprint === "string" && typeof rejected.at === "string"
+				? { lastRejected: { fingerprint: rejected.fingerprint, at: rejected.at } }
+				: {}),
+		};
+	}
+	if (value.state === "unbound") {
+		return {
+			state: "unbound",
+			...(typeof value.connectedFingerprint === "string"
+				? { connectedFingerprint: value.connectedFingerprint }
+				: {}),
+		};
+	}
+	return undefined;
+}
+
+/** A 503 body as the client sees it; `ompRelayCdpClients` is read through {@link relayCdpClientsOf} where it matters. */
+export type UnavailableInfo = Omit<RelayUnavailableInfo, "ompRelayCdpClients" | "ompRelayInstance">;
+
+/** Parse a 503 body; null for a non-relay body (foreign server). Fields a legacy relay omits get protocol-1 defaults. */
+function parseUnavailableInfo(body: string): UnavailableInfo | null {
+	const parsed = parseVersionBody(body);
+	if (!isRecord(parsed)) return null;
+	const info: UnavailableInfo = {
+		ompRelayVersion: relayVersionOf(parsed),
+		error: typeof parsed.error === "string" ? parsed.error : "",
+		relayProtocol: relayProtocolOf({ status: 503, body }) ?? LEGACY_RELAY_PROTOCOL,
+		profileBinding: parseProfileBinding(parsed.profileBinding) ?? { state: "unbound" },
+	};
+	if (typeof parsed.reason === "string" && parsed.reason in UNAVAILABLE_REASONS) {
+		info.reason = parsed.reason as RelayUnavailableReason;
+	}
+	if (typeof parsed.boundSeen === "boolean") info.boundSeen = parsed.boundSeen;
+	return info;
+}
+
+/**
+ * The 503 detail of the relay at `cdpUrl` (reason, the error text that names the fix, the binding): null when it is
+ * ready, unreachable or not a relay. Read it after {@link waitForRelayExtension} returned a `profile-*` outcome.
+ */
+export async function relayUnavailableAt(cdpUrl: string, signal?: AbortSignal): Promise<UnavailableInfo | null> {
+	const response = await probeCdpResponse(`${cdpUrl}/json/version`, { timeoutMs: PROBE_TIMEOUT_MS, signal });
+	if (response === null || response.status !== 503) return null;
+	return parseUnavailableInfo(response.body);
+}
+
+/** Immediate verdict for a 503 the relay attributes to the Chrome profile; null when waiting is right. */
+function refusalOutcome(info: UnavailableInfo): RelayWaitOutcome | null {
+	switch (info.reason) {
+		case "profile-unbound":
+		case "profile-mismatch":
+		case "profile-invalid":
+			return info.reason;
+		case undefined:
+			return null;
+	}
 }
 
 function readyOutcome(body: string): RelayWaitOutcome {
@@ -97,7 +208,8 @@ function readyOutcome(body: string): RelayWaitOutcome {
 
 /**
  * Poll the relay at `cdpUrl` until its browser said hello. Gives up at once when nothing serves the endpoint, unless
- * `restarted` (then it waits for the next host), and after the hello window when a relay serves without a browser.
+ * `restarted` (then it waits for the next host), when the relay refuses the browser's Chrome profile (waiting cannot
+ * fix that), and after the hello window when a relay serves without a browser.
  */
 export async function waitForRelayExtension(
 	cdpUrl: string,
@@ -118,11 +230,17 @@ export async function waitForRelayExtension(
 		} else if (response.status !== 503) {
 			return "unreachable";
 		} else {
+			const info = parseUnavailableInfo(response.body);
+			const refused = info ? refusalOutcome(info) : null;
+			// A rejected intruder while the bound install was connected earlier: that install's service worker may
+			// revive within the hello window, so the verdict waits for it. Every other refusal is final.
+			const deferred = refused === "profile-mismatch" && info?.boundSeen ? refused : null;
+			if (refused && !deferred) return refused;
 			helloBy ??= Date.now() + HELLO_WINDOW_MS;
 			if (Date.now() >= helloBy) {
+				if (deferred) return deferred;
 				// A relay from another version reads as outdated: no browser is behind it to blame instead.
-				const parsed = parseVersionBody(response.body);
-				return parsed !== null && relayVersionOf(parsed) !== VERSION ? "outdated-relay" : "no-extension";
+				return info !== null && info.ompRelayVersion !== VERSION ? "outdated-relay" : "no-extension";
 			}
 		}
 		await Bun.sleep(POLL_INTERVAL_MS);

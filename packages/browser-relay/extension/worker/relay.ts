@@ -136,12 +136,12 @@ export function relayStatus(): RelayStatus {
 	};
 }
 
-async function setBadge(connected: boolean): Promise<void> {
+async function setBadge(connected: boolean, text = connected ? "on" : ""): Promise<void> {
 	try {
-		await chrome.action.setBadgeText({ text: connected ? "on" : "" });
+		await chrome.action.setBadgeText({ text });
 		await chrome.action.setTitle({ title: connected ? "omp · Terminal browser relay connected" : "omp · Terminal browser relay disconnected" });
 		await chrome.action.setBadgeBackgroundColor({
-			color: connected ? "#1a7f37" : "#8b8b8b",
+			color: connected ? "#1a7f37" : text === "!" ? "#b42318" : "#8b8b8b",
 		});
 	} catch {
 		// Badge is cosmetic; never let it break the relay loop.
@@ -269,12 +269,32 @@ function linked(): void {
 	const epoch = new Link();
 	link = epoch;
 	void setBadge(true);
-	void buildHello().then((hello) => {
-		if (link !== epoch || !post(hello)) return;
-		// A new link starts idle; tell the relay right away when it isn't.
-		if (busyReasons.size > 0) post({ t: "busy", busy: true });
-	});
+	void sendHello(epoch);
 	handlers?.status(relayStatus());
+}
+
+/** After an identity-persistence failure: how long before the hello is retried. */
+const HELLO_RETRY_MS = 60_000;
+
+/**
+ * Say hello on `epoch`. The hello needs a durable instance id; when storage cannot retain one, say nothing (an id the
+ * next worker start would not reproduce splits this install), show `!`, and retry later while the epoch lasts.
+ */
+async function sendHello(epoch: Link): Promise<void> {
+	let hello: ExtToRelayMessage;
+	try {
+		hello = await buildHello();
+	} catch {
+		if (link !== epoch) return;
+		void setBadge(false, "!");
+		setTimeout(() => {
+			if (link === epoch) void sendHello(epoch);
+		}, HELLO_RETRY_MS);
+		return;
+	}
+	if (link !== epoch || !post(hello)) return;
+	// A new link starts idle; tell the relay right away when it isn't.
+	if (busyReasons.size > 0) post({ t: "busy", busy: true });
 }
 
 /** The relay went away: end the epoch, failing its calls with `reason`. */

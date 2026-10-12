@@ -174,6 +174,7 @@ describe("outdated extension reload", () => {
 		]);
 		const port = await findFreeCdpPort();
 		relay = startRelayServer({
+			bindingPath: null,
 			port,
 			group: false,
 			installRegistryFile: registryFile,
@@ -195,6 +196,7 @@ describe("outdated extension reload", () => {
 		const stopped = Promise.withResolvers<void>();
 		const logs: string[] = [];
 		relay = startRelayServer({
+			bindingPath: null,
 			port,
 			group: false,
 			installRegistryFile: registryFile,
@@ -218,6 +220,7 @@ describe("outdated extension reload", () => {
 		const script = await Bun.file(path.join(dir, "background.js")).text();
 		const port = await findFreeCdpPort();
 		relay = startRelayServer({
+			bindingPath: null,
 			port,
 			group: false,
 			installRegistryFile: registryFile,

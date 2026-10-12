@@ -9,7 +9,6 @@
 import type { WorkerContext } from "./messages";
 import { captureVisible } from "./worker/capture";
 import { installGifExport } from "./worker/gif";
-import { restoreRelayGroups } from "./worker/groups";
 import {
 	forgetTab,
 	installOverlayEvents,
@@ -63,7 +62,6 @@ setRelayHandlers({
 	input: relayInput,
 	status: status => hub.emit({ event: "relay", status }),
 	disconnected: () => {
-		void restoreRelayGroups();
 		void unmountAll();
 	},
 });

@@ -13,7 +13,11 @@ const BROWSER_SESSION_KEY = "relayBrowserSession";
  */
 let instanceId: Promise<string> | null = null;
 
-/** The per-install instance id, created on first use. */
+/**
+ * The per-install instance id, created on first use. A freshly minted id is stored and read back before it is ever
+ * returned: an id that storage did not retain would differ after the next worker start and split this install into
+ * two. A failure clears the memo so the next call retries; callers must not dial without an id.
+ */
 export function ensureInstanceId(): Promise<string> {
 	instanceId ??= (async () => {
 		const stored = await chrome.storage.local.get({ [INSTANCE_KEY]: "" });
@@ -21,8 +25,13 @@ export function ensureInstanceId(): Promise<string> {
 		if (typeof existing === "string" && existing.length > 0) return existing;
 		const created = crypto.randomUUID();
 		await chrome.storage.local.set({ [INSTANCE_KEY]: created });
+		const readBack = await chrome.storage.local.get({ [INSTANCE_KEY]: "" });
+		if (readBack[INSTANCE_KEY] !== created) throw new Error("chrome.storage.local did not retain the instance id");
 		return created;
-	})();
+	})().catch((error: unknown) => {
+		instanceId = null;
+		throw error;
+	});
 	return instanceId;
 }
 

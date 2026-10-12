@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { relayCdpClientsOf } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
-import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import {
+	type RelayServer,
+	type RelayUnavailableInfo,
+	startRelayServer,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import { removeRelayBindingFixture, TEST_HELLO_IDENTITY, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const EXTENSION_HELLO = {
 	t: "hello",
 	userAgent: "test",
 	browserVersion: "Chrome/151.0.0.0",
-	discardedTabsProtocol: 1,
 	tabs: [],
 	attachedTabIds: [],
+	...TEST_HELLO_IDENTITY,
 } as const;
 
 async function rawGet(port: number, requestBytes: string): Promise<string> {
@@ -95,7 +100,15 @@ async function waitForDiscovery(port: number): Promise<void> {
 describe("browser relay discovery endpoint", () => {
 	let relay: RelayServer | undefined;
 	let extension: WebSocket | undefined;
+	let bindingPath = "";
 
+	beforeAll(async () => {
+		bindingPath = await writeRelayBindingFixture();
+	});
+
+	afterAll(async () => {
+		await removeRelayBindingFixture(bindingPath);
+	});
 	afterEach(() => {
 		extension?.close();
 		relay?.stop();
@@ -105,7 +118,7 @@ describe("browser relay discovery endpoint", () => {
 
 	async function startReadyRelay(): Promise<number> {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath });
 		extension = await connectExtension(port);
 		await waitForDiscovery(port);
 		return port;
@@ -141,9 +154,38 @@ describe("browser relay discovery endpoint", () => {
 		expect(parseVersion(response).webSocketDebuggerUrl).toBe(`ws://127.0.0.1:${port}/cdp`);
 	});
 
+	it("reports 503 with the profile binding while no extension has ever handshaken", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath });
+		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		expect(response.status).toBe(503);
+		const info = (await response.json()) as RelayUnavailableInfo;
+		expect(info.profileBinding.state).toBe("bound");
+		expect(info.error.length).toBeGreaterThan(0);
+	});
+
+	it("refuses an extension install the relay is not bound to and reports profile-mismatch", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath });
+		const socket = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+		extension = socket;
+		const closed = Promise.withResolvers<number>();
+		socket.addEventListener("close", event => closed.resolve(event.code), { once: true });
+		socket.addEventListener(
+			"open",
+			() => socket.send(JSON.stringify({ ...EXTENSION_HELLO, instanceId: "99999999-aaaa-4bbb-8ccc-dddddddddddd" })),
+			{ once: true },
+		);
+		expect(await closed.promise).toBe(4403);
+		const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+		expect(response.status).toBe(503);
+		const info = (await response.json()) as RelayUnavailableInfo;
+		expect(info.reason).toBe("profile-mismatch");
+	});
+
 	it("reports how many CDP clients are connected, both while waiting for the extension and once ready", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath });
 		const discovery = async () => {
 			const response = await fetch(`http://127.0.0.1:${port}/json/version`);
 			const body: unknown = await response.json();

@@ -2,13 +2,24 @@ import { describe, expect, it, jest } from "bun:test";
 import { createHash } from "node:crypto";
 import { BROWSER_PAGE_PROTOCOL_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
-import { type FrontApp, RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
+import {
+	type FrontApp,
+	RelayBridge as RelayBridgeImpl,
+	type RelaySocket,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import type {
 	RelayRpcRequest,
 	RelayToExtMessage,
 	TabSnapshot,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import type { CDPSession } from "puppeteer-core";
+
+/** The pinning is covered by the compat/server/probe tests; these bridge tests run without a binding file. */
+class RelayBridge extends RelayBridgeImpl {
+	constructor(opts: ConstructorParameters<typeof RelayBridgeImpl>[0] = {}) {
+		super({ bindingPath: null, ...opts });
+	}
+}
 
 /** Same derivation as the bridge: target ids embed this per-instance code. */
 function instanceCode(instanceId: string): string {

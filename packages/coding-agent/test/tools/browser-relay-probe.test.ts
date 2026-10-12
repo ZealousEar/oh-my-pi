@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
 	relayExtensionNotice,
+	relayUnavailableAt,
 	UPDATE_RELAY_EXTENSION,
 	waitForRelayExtension,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
@@ -11,6 +12,17 @@ import {
 	isOlderOmpVersion,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import { removeRelayBindingFixture, TEST_HELLO_IDENTITY, writeRelayBindingFixture } from "./relay-binding-fixture";
+
+/** Hello of the install the binding fixture names. */
+const BOUND_HELLO = {
+	t: "hello",
+	userAgent: "test",
+	browserVersion: "Chrome/151.0.0.0",
+	tabs: [],
+	attachedTabIds: [],
+	...TEST_HELLO_IDENTITY,
+} as const;
 
 const EXTENSION_HELLO = {
 	t: "hello",
@@ -55,7 +67,7 @@ describe("waitForRelayExtension", () => {
 		const wait = waitForRelayExtension(`http://127.0.0.1:${port}`, undefined, { restarted: true });
 		// Real time on purpose: the wait polls real sockets, and must find nothing listening at least once.
 		await Bun.sleep(300);
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath: null });
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(EXTENSION_HELLO)), { once: true });
 		expect(await wait).toBe("ready");
@@ -131,7 +143,7 @@ describe("waitForRelayExtension", () => {
 
 	it("rejects an extension without discarded-tab snapshots, even when it has no tabs", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath: null });
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(LEGACY_EXTENSION_HELLO)), { once: true });
 		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("outdated-extension");
@@ -139,7 +151,7 @@ describe("waitForRelayExtension", () => {
 
 	it("keeps polling a young relay and reports ready once the extension handshakes", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath: null });
 		const wait = waitForRelayExtension(`http://127.0.0.1:${port}`);
 		// The relay is serving 503 (young, no extension yet) before the extension dials in.
 		expect((await fetch(`http://127.0.0.1:${port}/json/version`)).status).toBe(503);
@@ -150,7 +162,7 @@ describe("waitForRelayExtension", () => {
 
 	it("waits through a relay's brief 503 while its browser links again", async () => {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath: null });
 		const first = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		first.addEventListener("open", () => first.send(JSON.stringify(EXTENSION_HELLO)), { once: true });
 		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("ready");
@@ -163,6 +175,63 @@ describe("waitForRelayExtension", () => {
 		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 		extension.addEventListener("open", () => extension?.send(JSON.stringify(EXTENSION_HELLO)), { once: true });
 		expect(await wait).toBe("ready");
+	});
+});
+
+describe("waitForRelayExtension under a profile binding", () => {
+	let relay: RelayServer | undefined;
+	let extension: WebSocket | undefined;
+	let bindingPath = "";
+
+	beforeAll(async () => {
+		bindingPath = await writeRelayBindingFixture();
+	});
+
+	afterAll(async () => {
+		await removeRelayBindingFixture(bindingPath);
+	});
+
+	afterEach(() => {
+		extension?.close();
+		relay?.stop();
+		extension = undefined;
+		relay = undefined;
+	});
+
+	it("reports ready once the bound install handshakes", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath });
+		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+		extension.addEventListener("open", () => extension?.send(JSON.stringify(BOUND_HELLO)), { once: true });
+		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("ready");
+	});
+
+	it("reports profile-mismatch for an install the relay is not bound to", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath });
+		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+		extension.addEventListener(
+			"open",
+			() => extension?.send(JSON.stringify({ ...BOUND_HELLO, instanceId: "99999999-aaaa-4bbb-8ccc-dddddddddddd" })),
+			{ once: true },
+		);
+		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("profile-mismatch");
+	});
+
+	it("reports profile-unbound while the relay has no binding", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath: `${bindingPath}.missing` });
+		extension = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+		extension.addEventListener("open", () => extension?.send(JSON.stringify(BOUND_HELLO)), { once: true });
+		expect(await waitForRelayExtension(`http://127.0.0.1:${port}`)).toBe("profile-unbound");
+	});
+
+	it("describes the refusal in the 503 body", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, bindingPath: `${bindingPath}.missing` });
+		const info = await relayUnavailableAt(`http://127.0.0.1:${port}`, AbortSignal.timeout(2_000));
+		expect(info?.profileBinding.state).toBe("unbound");
+		expect(info?.error.length).toBeGreaterThan(0);
 	});
 });
 
@@ -181,7 +250,7 @@ describe("relayExtensionNotice", () => {
 
 	async function startRelay(): Promise<number> {
 		const port = await findFreeCdpPort();
-		relay = startRelayServer({ port });
+		relay = startRelayServer({ port, bindingPath: null });
 		return port;
 	}
 

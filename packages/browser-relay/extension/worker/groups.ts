@@ -55,7 +55,11 @@ function isGroupColor(color: string): color is GroupColor {
 	return GROUP_COLORS.some(known => known === color);
 }
 
-/** Move tabs into the per-window relay group, creating or reusing it by title (relay `group` RPC). */
+/**
+ * Move tabs into the per-window relay group, creating or reusing it by title (relay `group` RPC). The group is
+ * deliberately NOT dissolved when the relay disconnects: the next relay connection reuses it, and a tab the user
+ * dragged out stays out.
+ */
 export async function groupRelayTabs(
 	tabIds: number[],
 	title: string,
@@ -84,18 +88,6 @@ export async function groupRelayTabs(
 		for (const id of ids) grouped[String(id)] = groupId;
 	}
 	return { grouped };
-}
-
-/** Dissolve every relay-titled group (relay disconnected). */
-export async function restoreRelayGroups(): Promise<void> {
-	const title = await loadRelayGroupTitle();
-	if (!title) return;
-	const groups = await chrome.tabGroups.query({ title }).catch(() => []);
-	for (const group of groups) {
-		const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
-		const ids = tabs.map(tab => tab.id).filter(id => id !== undefined);
-		if (isNonEmpty(ids)) await chrome.tabs.ungroup(ids).catch(() => {});
-	}
 }
 
 /**

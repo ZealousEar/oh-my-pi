@@ -99,6 +99,7 @@ async function launchRelayFixture(
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-isolation-"));
 	const server = startRelayServer({
 		port: 0,
+		bindingPath: null,
 		group: false,
 		log,
 		installRegistryFile: path.join(root, "omp", "installs.json"),

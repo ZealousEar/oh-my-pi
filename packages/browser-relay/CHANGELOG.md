@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a relay profile binding (`~/.omp/browser-relay/binding.json`): once bound to one Chrome install (its `instanceId`), the relay serves only that install and closes any other with 4403; unbound relays accept installs but report `profile-unbound` until one is chosen
+
+### Changed
+
+- Changed the extension to keep its tab group when the relay disconnects, so the next connection reuses it
+
+### Fixed
+
+- Fixed the extension saying hello with an instance id Chrome storage did not retain: the id is stored and read back first, and on failure the hello is withheld, the badge shows `!`, and it retries after 60s
+
 ## [19.2.0] - 2026-11-25
 
 ### Fixed
