@@ -152,6 +152,7 @@ function createTaskSchema(options: {
 	structured: boolean;
 	steps: boolean;
 	perCallModel: boolean;
+	visibleEnabled: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
@@ -165,62 +166,12 @@ function createTaskSchema(options: {
 	// undeclared `model` still reaches preflight (root keys survive lenient
 	// validation; batch items keep it via keepItemModelKey) and is refused there.
 	const gatedFields = options.perCallModel ? { "model?": "string" } : {};
-	if (options.batchEnabled) {
-		if (options.isolationEnabled) {
-			const item = type.raw({
-				"name?": "string",
-				agent,
-				...taskFields,
-				solutionSpace: "string",
-				...effortField,
-				...schemaFields,
-				...toolsField,
-				...gatedFields,
-				"isolated?": "boolean",
-				"+": "delete",
-			});
-			return guardBatchAgent(
-				type.raw({
-					context: "string",
-					tasks: keepItemModelKey(item).array(),
-					"+": "delete",
-				}),
-			);
-		}
-		const item = type.raw({
-			"name?": "string",
-			agent,
-			...taskFields,
-			solutionSpace: "string",
-			...effortField,
-			...schemaFields,
-			...toolsField,
-			...gatedFields,
-			"+": "delete",
-		});
-		return guardBatchAgent(
-			type.raw({
-				context: "string",
-				tasks: keepItemModelKey(item).array(),
-				"+": "delete",
-			}),
-		);
-	}
-	if (options.isolationEnabled) {
-		return type.raw({
-			"name?": "string",
-			agent,
-			...taskFields,
-			solutionSpace: "string",
-			...effortField,
-			...schemaFields,
-			...toolsField,
-			...gatedFields,
-			"isolated?": "boolean",
-			"+": "delete",
-		});
-	}
-	return type.raw({
+	// Only advertised when a pane backend is actually reachable
+	// (`task.paneBackend`), so the model never requests a visible pane on a
+	// session where every such spawn would fail preflight.
+	const visibleField = options.visibleEnabled ? { "visible?": "boolean" } : {};
+	const isolatedField = options.isolationEnabled ? { "isolated?": "boolean" } : {};
+	const item = type.raw({
 		"name?": "string",
 		agent,
 		...taskFields,
@@ -229,8 +180,18 @@ function createTaskSchema(options: {
 		...schemaFields,
 		...toolsField,
 		...gatedFields,
+		...visibleField,
+		...isolatedField,
 		"+": "delete",
 	});
+	if (!options.batchEnabled) return item;
+	return guardBatchAgent(
+		type.raw({
+			context: "string",
+			tasks: keepItemModelKey(item).array(),
+			"+": "delete",
+		}),
+	);
 }
 
 /** Build the task wire schema for the current settings and spawn policy. */
@@ -244,6 +205,8 @@ export function getTaskSchema(options: {
 	structured?: boolean;
 	/** Advertise `steps` instead of `task` (`task.steps`); default off. */
 	steps?: boolean;
+	/** Advertise the per-spawn `visible` field (a non-native `task.paneBackend`). */
+	visibleEnabled?: boolean;
 	defaultAgent?: string;
 	/** Advertise the per-call `model` field (`task.perCallModel` allows task calls); default off. */
 	perCallModel?: boolean;
@@ -254,11 +217,20 @@ export function getTaskSchema(options: {
 	const structured = options.structured ?? true;
 	const steps = options.steps ?? false;
 	const perCallModel = options.perCallModel ?? false;
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured && !steps && !perCallModel) {
+	const visibleEnabled = options.visibleEnabled ?? false;
+	if (
+		defaultAgent === "task" &&
+		!effortEnabled &&
+		evalToolsEnabled &&
+		structured &&
+		!steps &&
+		!perCallModel &&
+		!visibleEnabled
+	) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${steps ? "steps" : "task"}:${perCallModel ? "model" : "nomodel"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${steps ? "steps" : "task"}:${perCallModel ? "model" : "nomodel"}:${visibleEnabled ? "visible" : "hidden"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = createTaskSchema({
@@ -267,6 +239,7 @@ export function getTaskSchema(options: {
 		effortEnabled,
 		evalToolsEnabled,
 		structured,
+		visibleEnabled,
 		defaultAgent,
 		perCallModel,
 	});
@@ -297,6 +270,8 @@ export interface AgentDefinition {
 	/** `true` = task spawns keep this agent's `output` schema, and with it the `yield` tool, even when `task.structured` is off. */
 	structured?: boolean;
 	autoloadSkills?: string[];
+	/** Skills listed in the spawned session's system prompt; `[]` lists none, absent lists all. Unlisted skills stay loadable via `skill://`. */
+	skills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
 	readSummarize?: boolean;
 	/** Prewalk hand-off for the spawned session: `true` = switch to the default prewalk target at the first edit/write, string = custom target model pattern. */
