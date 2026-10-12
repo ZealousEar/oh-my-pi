@@ -53,6 +53,7 @@ function createSource(): ModelHubSource {
 		getProjectModelRole: () => undefined,
 		getGlobalModelRole: () => undefined,
 		getModelRoleSource: () => "default",
+		getModelPresets: () => ({ names: [], active: undefined, summaries: {} }),
 		defaultThinkingLevel: "high",
 		modelProviderOrder: [],
 		knownRoleIds: ["web"],
@@ -119,7 +120,7 @@ describe("model hub assign mode scope filtering (#12692)", () => {
 		const { body, key } = createHub();
 		startWebAssign(key);
 
-		// Sidebar order: Roles, All models, google, litellm. Three Downs hop
+		// Sidebar order: Presets, Roles, All models, google, litellm. Three Downs hop
 		// from Roles to the litellm provider scope.
 		key(DOWN); // Roles → All models
 		key(DOWN); // All models → google
