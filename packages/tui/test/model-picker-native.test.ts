@@ -67,6 +67,7 @@ function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
 		getProjectModelRole: () => undefined,
 		getGlobalModelRole: role => roles[role],
 		getModelRoleSource: () => "global",
+		getModelPresets: () => ({ names: [], active: undefined, summaries: {} }),
 	};
 }
 
@@ -144,6 +145,7 @@ test("the model hub describes a data-first picker when the terminal has the kind
 	const p = props(root);
 	expect(p).toMatchObject({ size: "lg", layout: "rows", preview: "side", icon: "cpu", title: "Models", scope: "all" });
 	expect(p.scopes?.map(scope => [scope.id, scope.count, scope.group])).toEqual([
+		["presets", 0, undefined],
 		["roles", 2, undefined],
 		["all", 5, undefined],
 		["provider:anthropic", 2, "Providers"],
@@ -294,7 +296,11 @@ test("pointer events drive the hub through the same paths as its keys", () => {
 });
 
 test("the Roles view picker names the active preset and ctrl+←/→ switches it", () => {
-	const presets = { names: ["fast", "slow"], active: "fast" as string | undefined };
+	const presets = {
+		names: ["fast", "slow"],
+		active: "fast" as string | undefined,
+		summaries: { fast: "default → demo/demo", slow: "default → openai/gpt-5.6" },
+	};
 	let revision = 0;
 	const switched: string[] = [];
 	const base = source({ default: "demo/demo" }, []);
@@ -307,10 +313,11 @@ test("the Roles view picker names the active preset and ctrl+←/→ switches it
 			onAssign: () => {},
 			onUnassign: () => {},
 			onCancel: () => {},
-			onSwitchPreset: name => {
+			onApplyPreset: name => {
 				switched.push(name);
 				presets.active = name;
 				revision++;
+				return { applied: true };
 			},
 		},
 	);
@@ -327,6 +334,18 @@ test("the Roles view picker names the active preset and ctrl+←/→ switches it
 	expect(subtitleText()).toStartWith("Preset slow");
 	hub.handleInput("\x1b[1;5D");
 	expect(switched).toEqual(["slow", "fast"]);
+
+	// The Presets scope lists the saved presets; activating a row loads it through the same callback.
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "presets", mods: [] });
+	const p = props(hub.describe(withPicker));
+	expect(p.scopes?.find(scope => scope.id === "presets")).toMatchObject({ label: "Presets", count: 2 });
+	expect(p.items?.map(item => item.id)).toEqual(["preset:fast", "preset:slow", "newPreset"]);
+	expect(p.items?.find(item => item.id === "preset:fast")?.badges?.map(badge => badge.text)).toEqual([
+		"matches current",
+	]);
+	hub.handleNativeEvent({ type: "activate", key: "", item: "preset:slow" });
+	expect(switched).toEqual(["slow", "fast", "slow"]);
+	expect(props(hub.describe(withPicker)).items?.find(item => item.id === "preset:slow")?.badges).toBeDefined();
 });
 
 test("the quick picker is an md sheet with the summary below and a task-model toggle", () => {
