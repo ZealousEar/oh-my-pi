@@ -84,6 +84,7 @@ import {
 	cfgTaskMaxRuntimeMs,
 	cfgTaskSpeculativeLaunch,
 	cfgTaskSteps,
+	cfgTaskPaneBackend,
 	cfgTaskStructured,
 	perCallModelEnabled,
 } from "./settings";
@@ -387,6 +388,11 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("model" in item) spawn.model = item.model;
+	if (item.visible !== undefined) {
+		spawn.visible = item.visible;
+	} else if (params.visible !== undefined) {
+		spawn.visible = params.visible;
+	}
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -818,6 +824,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			structured: this.#isStructured(),
 			steps: cfgTaskSteps.get(this.session.settings),
 			perCallModel: perCallModelEnabled(this.session.settings, "task"),
+			visibleEnabled: cfgTaskPaneBackend.get(this.session.settings) !== "native",
 			defaultAgent: this.#defaultAgent(),
 		});
 	}
@@ -1902,6 +1909,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...(params.visible !== undefined ? { visible: params.visible } : {}),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: this.session.enableLsp ?? true,
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
