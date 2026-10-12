@@ -51,6 +51,8 @@ export interface ProcSpec {
 	ready?: DaemonReadySpec;
 	/** Regex; the daemon reports each matching output line to the owner while the unit runs. */
 	notify?: string;
+	/** Total wall-clock lifetime across restarts; the daemon stops the unit when it elapses. Absent = unbounded service. */
+	lifetimeMs?: number;
 }
 
 /** Serializable unit state: one row of the board. */
@@ -91,6 +93,8 @@ export interface UnitSnapshot {
 	cwd?: string;
 	/** False for `external` units and re-adopted detached units the daemon cannot wait on. */
 	supervised: boolean;
+	/** Absolute epoch-ms deadline fixed at first launch when the proc spec carries `lifetimeMs`; restarts do not move it. */
+	deadlineAt?: number;
 }
 
 /**

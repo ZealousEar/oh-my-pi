@@ -19,6 +19,7 @@ import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/m
 import { type Api, type Model, modelKind } from "@oh-my-pi/pi-catalog/types";
 import {
 	expandTilde,
+	filterChildShellEnv,
 	getAgentDbPath,
 	getAgentDir,
 	getLastChangelogVersionPath,
@@ -57,6 +58,7 @@ import {
 import "./all-settings";
 import { cfgDisabledProviders, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
 import { cfgShellPath } from "../exec/settings";
+import { sharedSecretsFilePath, writeSharedSecret } from "./shared-secrets";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -431,6 +433,55 @@ export function dropSettingsGroupShadows(data: RawSettings, sourcePath: string, 
 	return result;
 }
 
+/**
+ * Settings a cloned repository must never be able to set: they decide whether
+ * the desktop is driven at all, which executable is probed with the agent's
+ * own TCC identity, whether send/delete/pay-class actions are offered without
+ * a per-call opt-in, which browser identity (the user's relay Chrome, a CDP
+ * endpoint) the agent drives, and — the automation grants — which mutating
+ * browser/desktop actions are pre-authorised without a prompt. Project layers
+ * (`.omp/config.yml`, `.omp/settings.json`, `.claude/settings.json`) are
+ * ignored for these keys with a warning; only the user's global config,
+ * explicit `--config`/`PI_CONFIG_FILES` overlays, and runtime overrides apply.
+ */
+export const USER_LEVEL_ONLY_SETTINGS: Readonly<Record<string, true>> = {
+	"computer.enabled": true,
+	"computer.driverBin": true,
+	"computer.task.allowConsequential": true,
+	"computer.task.backend": true,
+	"computer.cua.telemetry": true,
+	"computer.permissions.grants": true,
+	"browser.permissions.grants": true,
+	"browser.task.allowConsequential": true,
+	"browser.relay": true,
+	"browser.relayUrl": true,
+	"browser.cdpUrl": true,
+};
+
+/**
+ * Remove {@link USER_LEVEL_ONLY_SETTINGS} from a project-level settings
+ * document, nested or dotted, logging each dropped key with its source file.
+ */
+export function dropUserLevelOnlySettings(data: RawSettings, sourcePath: string, basePrefix = ""): RawSettings {
+	const result: RawSettings = {};
+	for (const key of Object.keys(data)) {
+		const value = data[key];
+		const path = basePrefix === "" ? key : `${basePrefix}.${key}`;
+		if (Object.hasOwn(USER_LEVEL_ONLY_SETTINGS, path)) {
+			logger.warn("Settings: ignoring project setting that only the user's own configuration may set", {
+				setting: path,
+				source: sourcePath,
+			});
+			continue;
+		}
+		result[key] =
+			typeof value === "object" && value !== null && !Array.isArray(value)
+				? dropUserLevelOnlySettings(value as RawSettings, sourcePath, path)
+				: value;
+	}
+	return result;
+}
+
 function normalizePathPrefix(prefix: string): string {
 	return path.resolve(expandTilde(prefix));
 }
@@ -745,6 +796,8 @@ export class Settings {
 	#storage: AgentStorageApi | null = null;
 
 	#configFiles: string[] = [];
+	/** `PI_CONFIG_FILES` entries whose value was injected by the project's dotenv: project-level trust only. */
+	#projectDotenvConfigFiles = new Set<string>();
 	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
@@ -851,7 +904,26 @@ export class Settings {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
-		const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
+		// `PI_CONFIG_FILES` may have been injected by the project's own `.env`
+		// (Bun autoloads it; env.ts applies it too). A launcher/shell-provided
+		// value is a user decision; a project-dotenv value is project content
+		// and must never become a trusted capability overlay. Provenance comes
+		// from the same launch-env filter child shells use; without a launch
+		// snapshot (no procfs) a value identical to the project dotenv's is
+		// conservatively treated as project content.
+		const rawConfigFiles = process.env.PI_CONFIG_FILES;
+		const launchConfigFiles = filterChildShellEnv(process.env, this.#cwd).PI_CONFIG_FILES;
+		const configFilesTrusted = rawConfigFiles === undefined || launchConfigFiles === rawConfigFiles;
+		const configFiles = rawConfigFiles?.split(path.delimiter).filter(Boolean) ?? [];
+		if (!configFilesTrusted) {
+			logger.warn(
+				"Settings: PI_CONFIG_FILES came from a project dotenv file; its overlays load as project-level (user-level-only settings ignored)",
+				{ cwd: this.#cwd },
+			);
+		}
+		this.#projectDotenvConfigFiles = new Set(
+			configFilesTrusted ? [] : configFiles.map(file => path.resolve(this.#cwd, expandTilde(file))),
+		);
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
@@ -1228,6 +1300,13 @@ export class Settings {
 	writeValue(setting: AnySetting, value: unknown, layer: "global" | "override"): void {
 		if (this.#mirror) return this.#forward(this.#mirror, { op: "writeValue", id: setting.id, value, layer });
 		setting.assertWritable(value);
+		if (layer === "global") {
+			const sharedFile = setting.isCredential ? sharedSecretsFilePath() : undefined;
+			if (sharedFile !== undefined) {
+				this.#writeSharedSecret(sharedFile, setting, value);
+				return;
+			}
+		}
 		if (layer === "override" && setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
@@ -1254,6 +1333,11 @@ export class Settings {
 	 */
 	unsetGlobalValue(setting: AnySetting): void {
 		if (this.#mirror) return this.#forward(this.#mirror, { op: "unsetGlobalValue", id: setting.id });
+		const sharedFile = setting.isCredential ? sharedSecretsFilePath() : undefined;
+		if (sharedFile !== undefined) {
+			this.#writeSharedSecret(sharedFile, setting, undefined);
+			return;
+		}
 		const current = getByPath(this.#global, setting.segments);
 		if (current === undefined && !this.#softPins.has(setting)) return;
 		const prev = setting.get(this);
@@ -1327,6 +1411,40 @@ export class Settings {
 		this.#modified.set(key, segments);
 	}
 
+	/** Serialized writes to the shared credential-marked settings overlay; awaited by `flush()`. */
+	#sharedSecretSave: Promise<void> = Promise.resolve();
+
+	/**
+	 * Credential-marked settings are routed to the shared overlay named by
+	 * `OMP_SHARED_SECRETS_FILE` (the launchers export it; it is the last
+	 * `PI_CONFIG_FILES` entry, so it is the effective value in every channel).
+	 * A leftover profile-local copy is removed so nothing stays shadowed, and
+	 * `undefined` / `""` (unset) deletes the key from the overlay.
+	 */
+	#writeSharedSecret(file: string, setting: AnySetting, value: unknown): void {
+		const prev = setting.get(this);
+		const segments = setting.segments;
+		const overlayValue = value === "" ? undefined : value;
+		if (overlayValue === undefined) deleteByPath(this.#configOverlay, segments);
+		else setByPath(this.#configOverlay, segments, overlayValue);
+		this.#releaseSoftPin(setting);
+		const hadGlobal = getByPath(this.#global, segments) !== undefined;
+		if (hadGlobal) this.#stageGlobal(segments, undefined);
+		this.#rebuildMerged();
+		if (hadGlobal) this.#queueSave();
+		if (this.#persist) {
+			this.#sharedSecretSave = this.#sharedSecretSave
+				.then(() => writeSharedSecret(file, setting.id, overlayValue))
+				.catch(error => {
+					logger.error("Settings: shared secrets overlay write failed", {
+						file,
+						path: setting.id,
+						error: String(error),
+					});
+				});
+		}
+		this.#fireIfChanged(setting, prev);
+	}
 	/** Drops `setting`'s soft-pinned default override, if any (the caller rebuilds the merged view). */
 	#releaseSoftPin(setting: AnySetting): void {
 		if (!this.#softPins.delete(setting)) return;
@@ -1611,6 +1729,7 @@ export class Settings {
 		if (this.#projectSavePromise) {
 			await this.#projectSavePromise;
 		}
+		await this.#sharedSecretSave;
 		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
 			await this.#chainSave();
 		}
@@ -1649,6 +1768,7 @@ export class Settings {
 				: structuredClone(this.#project);
 			if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
 			cloned.#configFiles = [...this.#configFiles];
+			cloned.#projectDotenvConfigFiles = new Set(this.#projectDotenvConfigFiles);
 			cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		}
 		cloned.#global = structuredClone(this.#global);
@@ -1969,6 +2089,22 @@ export class Settings {
 	getProjectSettings(): RawSettings {
 		const own = structuredClone(this.#project);
 		return this.#parent ? this.#deepMerge(this.#parent.getProjectSettings(), own) : own;
+	}
+
+	/**
+	 * Trusted capability configuration: user-global settings, explicit CLI/
+	 * `PI_CONFIG_FILES` overlays, then runtime overrides — deep-cloned. Project-discovered
+	 * layers (`.omp/config.yml`, `.claude/settings.json`, …) are deliberately excluded so a
+	 * checked-out repository can never pre-authorize browser/desktop automation. This is the
+	 * ONLY settings view capability readers (automation-policy grants) may use. An
+	 * {@link overlay} reports its parent's trusted view with its own layers merged on top.
+	 */
+	getTrustedCapabilitySettings(): RawSettings {
+		let own = this.#deepMerge({}, this.#global);
+		own = this.#deepMerge(own, this.#configOverlay);
+		own = this.#deepMerge(own, this.#overrides);
+		const trusted = this.#parent ? this.#deepMerge(this.#parent.getTrustedCapabilitySettings(), own) : own;
+		return structuredClone(trusted);
 	}
 
 	getPlansDirectory(): string {
@@ -2910,9 +3046,11 @@ export class Settings {
 		const sourcePaths: string[] = [];
 		let shellPathSource: string | undefined;
 		for (const item of items) {
-			settings = this.#deepMerge(settings, dropSettingsGroupShadows(item.data as RawSettings, item.path), {
-				arrays: "combine",
-			});
+			settings = this.#deepMerge(
+				settings,
+				dropUserLevelOnlySettings(dropSettingsGroupShadows(item.data as RawSettings, item.path), item.path),
+				{ arrays: "combine" },
+			);
 			sourcePaths.push(item.path);
 			if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 		}
@@ -2948,7 +3086,10 @@ export class Settings {
 		let shellPathSource: string | undefined;
 		let settings: RawSettings = {};
 		for (const filePath of this.#configFiles) {
-			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
+			const loaded = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
+			const overlay = this.#projectDotenvConfigFiles.has(filePath)
+				? dropUserLevelOnlySettings(loaded, filePath)
+				: loaded;
 			settings = this.#deepMerge(settings, overlay, { arrays: "combine" });
 			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;
 		}
@@ -3893,20 +4034,49 @@ export class Settings {
 				"unexpectedStopModel",
 				"providers.unexpectedStopModel",
 			);
+			// Fork-era TypeSafe controls. `typesafeModel` pinned the native model
+			// (`jev-1.12`); `judgmentFallback: none` failed closed instead of
+			// re-asking a chat model. Both map onto the role model without loss of
+			// strictness: the pin becomes the exact `modelRoles.judge` selector
+			// (never `jev-latest`), and `none` becomes an explicit empty
+			// `retry.fallbackChains.judge`, which `judgePin` treats as "no
+			// substitute" (see src/judgment/index.ts). `llm` fallback has no exact
+			// counterpart — a prompted model never follows a native judge upstream —
+			// so it takes the ordinary role chain.
+			const legacyTypesafeModel = legacy(providerSettings, "typesafeModel", "providers.typesafeModel");
+			const legacyJudgmentFallback = legacy(providerSettings, "judgmentFallback", "providers.judgmentFallback");
+			const pinnedTypesafeModel =
+				typeof legacyTypesafeModel === "string" && legacyTypesafeModel.trim()
+					? legacyTypesafeModel.trim()
+					: undefined;
+			const usesTypeSafe = legacyJudgmentProvider !== "llm";
+			const failClosed = usesTypeSafe && legacyJudgmentFallback === "none";
 			const nonDefaultJudge =
 				(typeof legacyJudgmentProvider === "string" && legacyJudgmentProvider !== "auto") ||
 				(typeof legacyAutoThinkingModel === "string" && legacyAutoThinkingModel !== "online") ||
-				(typeof legacyUnexpectedStopModel === "string" && legacyUnexpectedStopModel !== "online");
+				(typeof legacyUnexpectedStopModel === "string" && legacyUnexpectedStopModel !== "online") ||
+				(usesTypeSafe && pinnedTypesafeModel !== undefined) ||
+				failClosed;
 			if (nonDefaultJudge) {
 				const judgeCandidates: string[] = [];
-				if (legacyJudgmentProvider !== "llm") judgeCandidates.push("typesafe/jev-1.14.0");
-				if (typeof legacyAutoThinkingModel === "string" && legacyAutoThinkingModel !== "online") {
-					judgeCandidates.push(`local/${legacyAutoThinkingModel}`);
+				if (usesTypeSafe) {
+					judgeCandidates.push(
+						pinnedTypesafeModel === undefined
+							? "typesafe/jev-1.14.0"
+							: pinnedTypesafeModel.includes("/")
+								? pinnedTypesafeModel
+								: `typesafe/${pinnedTypesafeModel}`,
+					);
 				}
-				if (typeof legacyUnexpectedStopModel === "string" && legacyUnexpectedStopModel !== "online") {
-					judgeCandidates.push(`local/${legacyUnexpectedStopModel}`);
+				if (!failClosed) {
+					if (typeof legacyAutoThinkingModel === "string" && legacyAutoThinkingModel !== "online") {
+						judgeCandidates.push(`local/${legacyAutoThinkingModel}`);
+					}
+					if (typeof legacyUnexpectedStopModel === "string" && legacyUnexpectedStopModel !== "online") {
+						judgeCandidates.push(`local/${legacyUnexpectedStopModel}`);
+					}
+					judgeCandidates.push("@tiny", "@smol", "@default");
 				}
-				judgeCandidates.push("@tiny", "@smol", "@default");
 				setRoleChain("judge", dedupe(judgeCandidates));
 			}
 
@@ -3935,6 +4105,8 @@ export class Settings {
 				"imageOrder",
 				"tts",
 				"judgmentProvider",
+				"typesafeModel",
+				"judgmentFallback",
 				"autoThinkingModel",
 				"unexpectedStopModel",
 				"tinyModel",

@@ -117,6 +117,10 @@ interface ProcRuntime {
 	readyPattern?: RegExp;
 	notify?: { tap: TextTap; notifier: OutputNotifier };
 	restartTimer?: NodeJS.Timeout;
+	/** One-shot timer for `snapshot.deadlineAt`; rearmed from the same absolute time, so relaunches never extend it. */
+	lifetimeTimer?: NodeJS.Timeout;
+	/** Set when the lifetime deadline fired; the stop it triggers is still delivered as a completion. */
+	lifetimeExpired: boolean;
 	consecutiveFailures: number;
 	terminalSettled?: Promise<void>;
 	/** Serializes detached log reads so no byte is tracked twice. */
@@ -169,6 +173,11 @@ function isTerminal(state: UnitSnapshot["state"]): boolean {
 
 function isSettled(state: UnitSnapshot["state"]): boolean {
 	return isTerminal(state) || state === "restarting";
+}
+
+/** Exit reason recorded on the snapshot and in output.log when a finite run outlives `proc.lifetimeMs`. */
+function lifetimeExpiredReason(proc: ProcSpec): string {
+	return `lifetime of ${Math.round((proc.lifetimeMs ?? 0) / 1_000)}s expired`;
 }
 
 function errorMessage(error: unknown): string {
@@ -1371,6 +1380,7 @@ export class UnitTable {
 				throw new Error(`Service ${request.key} has unacknowledged completion notifications`);
 			}
 		}
+		if (proc.lifetimeMs !== undefined && !(proc.lifetimeMs > 0)) throw new Error("proc.lifetimeMs must be > 0");
 		if (proc.ready?.log) {
 			try {
 				new RegExp(proc.ready.log, DAEMON_OUTPUT_PATTERN_FLAGS);
@@ -1411,6 +1421,7 @@ export class UnitTable {
 			this.#removeEntry(existing);
 		}
 		const owner = request.owner;
+		if (proc.lifetimeMs !== undefined) entry.snapshot.deadlineAt = now + proc.lifetimeMs;
 		entry.completion = {
 			capable: owner !== undefined && this.#subscriptions.has(owner),
 			subscriptionId: owner === undefined ? undefined : this.#subscriptions.get(owner),
@@ -1419,6 +1430,7 @@ export class UnitTable {
 			launch: 0,
 			log: await UnitLog.open(unitLogDir(entry.snapshot.id), true),
 			stopRequested: false,
+			lifetimeExpired: false,
 			logReady: !proc.ready?.log,
 			portReady: proc.ready?.port === undefined,
 			readinessBuffer: "",
@@ -1443,6 +1455,7 @@ export class UnitTable {
 		if (this.#units.get(id) !== entry) return;
 		clearTimeout(entry.idleTimer);
 		clearTimeout(entry.procRuntime?.restartTimer);
+		clearTimeout(entry.procRuntime?.lifetimeTimer);
 		this.#units.delete(id);
 		const key = identity(entry.snapshot.kind, entry.snapshot.scope, entry.snapshot.key);
 		if (this.#byIdentity.get(key) === entry) this.#byIdentity.delete(key);
@@ -1596,6 +1609,7 @@ export class UnitTable {
 		snapshot.exitedAt = undefined;
 		snapshot.exitCode = undefined;
 		snapshot.exitReason = undefined;
+		this.#armLifetime(entry);
 		snapshot.pids = [];
 		snapshot.readyMatch = undefined;
 		snapshot.outputBytes = 0;
@@ -1976,6 +1990,8 @@ export class UnitTable {
 			}, delay);
 			return;
 		}
+		clearTimeout(runtime.lifetimeTimer);
+		runtime.lifetimeTimer = undefined;
 		snapshot.state = failed && !runtime.stopRequested ? "failed" : "exited";
 		for (const tunnel of entry.tunnels) tunnel.close();
 		runtime.terminalSettled = this.#publishTerminal(entry);
@@ -1995,7 +2011,7 @@ export class UnitTable {
 		const runtime = entry.procRuntime!;
 		const owner = entry.snapshot.owner;
 		const completion: DaemonCompletionEvent | undefined =
-			owner !== undefined && !runtime.stopRequested && this.#subscriptions.has(owner)
+			owner !== undefined && (!runtime.stopRequested || runtime.lifetimeExpired) && this.#subscriptions.has(owner)
 				? { ev: "completed", completionId: crypto.randomUUID(), owner, unit: copySnapshot(entry.snapshot) }
 				: undefined;
 		if (completion) entry.pendingCompletions.push(completion);
@@ -2087,6 +2103,10 @@ export class UnitTable {
 		if (moduleRuntime) throw new Error(`Module unit ${entry.snapshot.key} restarts by being opened again`);
 		const runtime = entry.procRuntime;
 		if (!runtime) throw new Error(`Unit ${entry.snapshot.key} cannot be restarted`);
+		// Restarting a live finite run keeps its original deadline (total lifetime across restarts);
+		// re-running one that already finished is a fresh run.
+		await this.#refreshDetached(entry);
+		const freshRun = isTerminal(entry.snapshot.state);
 		await this.#stopEntry(entry, 2_000, "restarting");
 		await runtime.log?.close();
 		runtime.log =
@@ -2094,6 +2114,8 @@ export class UnitTable {
 				? undefined
 				: await UnitLog.open(unitLogDir(entry.snapshot.id), false);
 		runtime.stopRequested = false;
+		runtime.lifetimeExpired = false;
+		if (freshRun && entry.proc?.lifetimeMs !== undefined) entry.snapshot.deadlineAt = Date.now() + entry.proc.lifetimeMs;
 		const owner = entry.snapshot.owner;
 		entry.completion = {
 			capable: owner !== undefined && this.#subscriptions.has(owner),
@@ -2102,6 +2124,35 @@ export class UnitTable {
 		// A restarted unit is live again under its identity.
 		this.#byIdentity.set(identity(entry.snapshot.kind, entry.snapshot.scope, entry.snapshot.key), entry);
 		await this.#launch(entry);
+	}
+
+	/**
+	 * Arm the one-shot lifetime deadline from `snapshot.deadlineAt`. The deadline is absolute, so
+	 * relaunches, daemon re-execs and re-adoption neither extend nor forget it. Expiry goes through
+	 * the ordinary stop path so process-tree termination stays in one place.
+	 */
+	#armLifetime(entry: UnitEntry): void {
+		const runtime = entry.procRuntime;
+		const deadlineAt = entry.snapshot.deadlineAt;
+		if (!runtime || !entry.proc || deadlineAt === undefined) return;
+		clearTimeout(runtime.lifetimeTimer);
+		const proc = entry.proc;
+		runtime.lifetimeTimer = setTimeout(
+			() => {
+				runtime.lifetimeTimer = undefined;
+				if (isTerminal(entry.snapshot.state)) return;
+				runtime.lifetimeExpired = true;
+				const reason = lifetimeExpiredReason(proc);
+				runtime.log?.append(`\n[${reason}; stopping]\n`);
+				void this.#stopEntry(entry, 2_000, reason).catch(error =>
+					logger.warn("Failed to stop a service whose lifetime expired", {
+						id: entry.snapshot.id,
+						error: errorMessage(error),
+					}),
+				);
+			},
+			Math.max(0, deadlineAt - Date.now()),
+		);
 	}
 
 	#setCompletionCapability(owner: string, capable: boolean): void {
@@ -2189,6 +2240,7 @@ export class UnitTable {
 		entry.procRuntime = {
 			launch: 1,
 			stopRequested: false,
+			lifetimeExpired: false,
 			logReady: !proc.ready?.log || stored.snapshot.state === "ready",
 			portReady: proc.ready?.port === undefined || stored.snapshot.state === "ready",
 			readinessBuffer: "",
@@ -2221,6 +2273,7 @@ export class UnitTable {
 				void this.#pollPort(entry, runtime.launch, proc.ready);
 			}
 			this.#monitorDetached(entry, runtime.launch);
+			this.#armLifetime(entry);
 			this.#persist(entry);
 			return;
 		}
@@ -2303,6 +2356,7 @@ export class UnitTable {
 		if (entry.proc?.ready?.port !== undefined && entry.snapshot.state !== "ready") {
 			void this.#pollPort(entry, launch, entry.proc.ready);
 		}
+		this.#armLifetime(entry);
 		this.#persist(entry);
 		return true;
 	}

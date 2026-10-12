@@ -3631,6 +3631,8 @@ pub enum AutoCompactionAction {
 	Handoff,
 	#[serde(rename = "shake")]
 	Shake,
+	#[serde(rename = "semantic-shake")]
+	SemanticShake,
 	#[serde(rename = "snapcompact")]
 	Snapcompact,
 }
@@ -3643,6 +3645,7 @@ impl AutoCompactionAction {
 			Self::Remote => "remote",
 			Self::Handoff => "handoff",
 			Self::Shake => "shake",
+			Self::SemanticShake => "semantic-shake",
 			Self::Snapcompact => "snapcompact",
 		}
 	}

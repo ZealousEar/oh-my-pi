@@ -831,9 +831,14 @@ export function getWebKitHostPath(platform: NodeJS.Platform = process.platform):
 	return path.join(os.homedir(), ".o2", "lib", "abkit", platform === "win32" ? "ABHost.exe" : "ABHost");
 }
 
-/** Get the browser relay extension install directory (~/.omp/browser-relay). */
+/**
+ * Get the browser relay root (~/.omp/browser-relay). Profile-independent like
+ * {@link getGlobalDaemonRuntimeRoot}: one Chrome loads one unpacked extension
+ * path (its extension id is derived from that path), so `browser-relay
+ * install` from every omp profile must write the same directory.
+ */
 export function getBrowserRelayDir(): string {
-	return dirs.rootSubdir("browser-relay", "data");
+	return path.join(getBaseConfigRoot(), "browser-relay");
 }
 
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */
