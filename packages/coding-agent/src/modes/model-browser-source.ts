@@ -1,5 +1,5 @@
 import type { ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
-import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
+import { describeModelPreset, findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
 import { resolveModelRoleValue, rolePriorityDefaults } from "../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -52,6 +52,11 @@ export function createModelBrowserSource(settings: Settings): ModelHubSource {
 		getRoleInfo: role => getRoleInfo(role, settings),
 		defaultRoleChain: role => rolePriorityDefaults(role),
 		resolveRoleValue: (value, models, roleLookup) => resolveModelRoleValue(value, models, { settings, roleLookup }),
-		getModelPresets: () => ({ names: getModelPresetNames(settings), active: findActiveModelPreset(settings) }),
+		getModelPresets: () => {
+			const names = getModelPresetNames(settings);
+			const summaries: Record<string, string> = {};
+			for (const name of names) summaries[name] = describeModelPreset(settings, name);
+			return { names, active: findActiveModelPreset(settings), summaries };
+		},
 	};
 }

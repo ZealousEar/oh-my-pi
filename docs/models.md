@@ -624,31 +624,33 @@ If a role points at another role, the target model still inherits normally and a
 
 ### Model presets
 
-A model preset is a named snapshot of every role assignment plus `defaultThinkingLevel`, so you can swap a whole setup at once:
+A model preset is a named snapshot of the whole routing setup — every role assignment, the per-role fallback chains, the quick-switch cycle order, and `defaultThinkingLevel` — so you can swap it at once:
 
 ```text
-/modelpreset save cheap      # save the current roles and thinking level
-/modelpreset switch deep     # apply a saved preset
+/modelpreset save cheap      # save the current roles, chains, cycle order and thinking level
+/modelpreset switch deep     # apply a saved preset to this session (never persisted)
 /modelpreset                 # pick one from a list (interactive)
 /modelpreset list | delete <name>
 ```
 
-In `/models`, press `s` in the Roles view to save the current setup under a name. Presets live under `modelPresets` in `config.yml`:
+In `/models`, the **Presets** sidebar scope lists, loads, saves and deletes presets; `s` in the Roles view saves the current setup too, and `ctrl+←/→` (or `p`/`⇧P`) there steps through the saved presets. Presets live under `modelPresets` in `config.yml` (`version: 1`):
 
 ```yaml
 modelPresets:
   deep:
-    modelRoles:
+    version: 1
+    roles:
       default: anthropic/claude-opus-4-5:high
       smol: anthropic/claude-sonnet-4-5
+    fallbackChains:
+      default: [openai-codex/gpt-6-astra]
+    cycleOrder: [smol, default, slow]
     defaultThinkingLevel: high
 ```
 
-Switching writes roles the way the model picker does: into the scope chosen by `modelRoleStorage`, clearing roles the preset leaves out and replacing `--model`/`--smol` session overrides. The preset's `defaultThinkingLevel` is written to the global config. It then switches the active model to the resulting `default` (an automatic provider-default selection when the preset has none) and sets the session's thinking level from the `:level` suffix on that selector, or else the preset's `defaultThinkingLevel`; a `:inherit` suffix leaves the level the model switch set. When a preset's `default` model is unavailable, nothing is changed. Roles that another layer still decides — a `--config` file, a project config in `global` storage, or the global config in `project` storage — are listed in the switch message with the layer that wins, instead of being reported as switched. The same goes for a `defaultThinkingLevel` set by a project config or `--config` file: the session still switches to the preset's level, but the message names that layer, whose level returns on the next start.
+Every entry point — `/modelpreset switch`, the Presets view, and the Roles-view keys — applies a preset through the same session-scoped, transactional path described in [Model presets](#model-presets) below. Saving captures the effective configuration — including any `--model` session override and a currently loaded preset — and the configured `defaultThinkingLevel`, not the session's live thinking level.
 
 When several config layers define a preset of the same name, the highest layer (command line, then `--config` file, then project config, then global config) wins whole: entries are never merged across layers, so a project `deep` that only sets `default` applies without the global `deep`'s other roles. A `null` entry in a `--config` file (or a command-line override) hides the preset from lists and switches; a `null` entry in a project config is ignored, so the global preset of that name still applies. Saving always writes the named entry to the global config and reports when a higher layer still takes precedence for that name.
-
-Saving captures the effective assignments — including any `--model` session override — and the configured `defaultThinkingLevel`, not the session's live thinking level.
 
 Related settings:
 
@@ -687,9 +689,11 @@ A **model preset** is a saved, named permutation of your model-role setup. It ca
 
 Manage presets from the `/models` hub under the **Presets** sidebar scope:
 
-- **Save current** — `s` snapshots the current effective configuration into a new named preset.
+- **Save current** — `s` (or the trailing `+ Save current as preset…` row) snapshots the current effective configuration into a new named preset. Names start with a letter and may contain letters, digits, spaces, `-` and `_`.
 - **Load** — `Enter` applies the selected preset (see semantics below).
-- **Delete** — `x` is an armed confirm: the first `x` (or backspace) arms the row ("press x again to delete") and a second `x` deletes it; navigating away disarms.
+- **Delete** — `x` is an armed confirm: the first `x` (or backspace) arms the row ("press x again to delete") and a second `x` deletes it; navigating away disarms. Deleting removes the global definition only; a same-name project or `--config` definition keeps listing.
+
+`/modelpreset list|save|switch|delete <name>` and the Roles-view `ctrl+←/→` / `p` / `⇧P` keys drive the same backend: a switch from any entry point applies the preset exactly as a load from the Presets view does.
 
 ### What a preset captures
 
@@ -718,7 +722,7 @@ Loading a preset applies it **session-scoped as a runtime routing override** —
 
 A preset row shows a **matches current** badge when its captured configuration equals your current effective configuration (roles, chains, cycle order, and default thinking level). It marks equality, not an "active" state — presets are never persisted as active.
 
-Preset **definitions** live in the `modelPresets` setting (`ModelPresetV1`, `version: 1`): the `/models` view saves and deletes them per key in the **global** layer (other presets are never rewritten), while definitions from project or overlay layers are also listed and remain visible after a global delete. A queued save or delete does not overwrite a newer external edit to the same definition.
+Preset **definitions** live in the `modelPresets` setting (`ModelPresetV1`, `version: 1`): saves and deletes write only the named entry in the **global** layer (other presets are never rewritten), while definitions from project or overlay layers are also listed and remain visible after a global delete. A queued save or delete does not overwrite a newer external edit to the same definition.
 
 ## `/model` and `omp models`
 
