@@ -90,6 +90,9 @@ type RolesRow =
 	| { kind: "newFallback" }
 	| { kind: "newRole" };
 
+/** A row of the Presets view: a saved preset, or the trailing "+ Save current as preset…". */
+type PresetRow = { kind: "preset"; name: string } | { kind: "newPreset" };
+
 /**
  * What the model browser is currently picking for: a role's model, a slot in
  * a fallback chain (`role` may be a role name, model selector, or `provider/*`
@@ -109,11 +112,8 @@ export interface ModelHubSource extends ModelBrowserSource {
 	getProjectModelRole(role: string): string | undefined;
 	getGlobalModelRole(role: string): string | undefined;
 	getModelRoleSource(role: string): "global" | "project" | "default";
-	/**
-	 * Saved model presets (in switch order) and the one the current role setup
-	 * matches, if any. Absent hosts have no presets to switch between.
-	 */
-	getModelPresets?(): { names: readonly string[]; active: string | undefined };
+	/** Saved model presets: sorted names, the one the current routing matches, and a row summary per name. */
+	getModelPresets(): ModelPresetListing;
 }
 
 /** Catalog capabilities required by the model hub. */
@@ -145,6 +145,20 @@ export interface ScopedModelItem {
 
 export type ModelRoleSelectionScope = "global" | "project";
 
+export interface ModelPresetApplyResult {
+	applied: boolean;
+	error?: string;
+}
+
+export interface ModelPresetListing {
+	/** Sorted saved preset names. */
+	names: readonly string[];
+	/** The preset whose captured routing equals the current effective routing, if any ("matches current"). */
+	active: string | undefined;
+	/** One-line row summary per name, e.g. `default → anthropic/claude-x`, `3 roles`, or `malformed: …`. */
+	summaries: Readonly<Record<string, string>>;
+}
+
 export interface ModelHubCallbacks {
 	/** Persist a role assignment. */
 	onAssign: (
@@ -160,14 +174,12 @@ export interface ModelHubCallbacks {
 	onFallbackChainChange?: (role: string, chain: string[]) => void;
 	/** Locked provider activation: forward to the /login flow. */
 	onLoginRequest?: (providerId: string) => void;
-	/** Save the current role assignments and default thinking level as a named model preset. */
+	/** Apply saved preset `name` through the host's validated transaction. The host reports the outcome (status/error) itself. */
+	onApplyPreset?: (name: string) => Promise<ModelPresetApplyResult> | ModelPresetApplyResult;
+	/** Capture and persist the current routing under `name` (host validates/reports). */
 	onSavePreset?: (name: string) => void;
-	/**
-	 * Apply a saved model preset (ctrl+←/→ or p/⇧P in the Roles view) and report
-	 * the outcome itself. A switch that writes nothing (a refused preset) still
-	 * advances the hub's preset cursor, so the next press moves past it.
-	 */
-	onSwitchPreset?: (name: string) => void | Promise<void>;
+	/** Delete the global definition named `name` (host reports). */
+	onDeletePreset?: (name: string) => void;
 	/** Persist a new quick-switch cycle order (the ctrl+p role cycle). */
 	onCycleOrderChange?: (order: string[]) => void;
 	onCancel: () => void;
@@ -180,7 +192,7 @@ export interface ModelHubOptions {
 	currentSelector?: string;
 }
 
-interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "all" | "separator" | "provider"> {
+interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "presets" | "all" | "separator" | "provider"> {
 	providerId?: string;
 	locked?: boolean;
 	oauth?: boolean;
@@ -261,6 +273,22 @@ const ROLE_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 	{ id: "thinking", head: "Thinking", format: "dim", priority: 1 },
 ];
 
+/**
+ * A Presets-view command; keys and the picker's action bar both run
+ * {@link ModelHubComponent}'s `#runPresetsAction`. `activate` is Enter: load
+ * the selected preset, or open the name input on the trailing row.
+ */
+type PresetsAction = "activate" | "save" | "delete";
+
+/** Picker fact columns of the Presets view. */
+const PRESET_PICKER_COLUMNS: readonly TspPickerColumn[] = [
+	{ id: "summary", head: "Routing", format: "dim", priority: 1 },
+];
+
+/** Preset names the hub accepts: a letter, then letters, digits, spaces, `-` and `_`. */
+const PRESET_NAME_PATTERN = /^[a-zA-Z][\w -]*$/;
+const PRESET_NAME_ERROR = "Name must start with a letter (letters, digits, space, - and _).";
+
 /** Kind tab labels (sentence case; acronyms stay upper). */
 const MODEL_KIND_LABELS: Record<"all" | ModelKind, string> = {
 	all: "All",
@@ -305,6 +333,11 @@ function rolesRowKey(row: RolesRow, index: number): string {
 		case "newFallback":
 			return row.kind;
 	}
+}
+
+/** Stable native list-item key of a Presets-view row. */
+function presetRowKey(row: PresetRow): string {
+	return row.kind === "preset" ? `preset:${row.name}` : row.kind;
 }
 
 /**
@@ -367,6 +400,20 @@ export class ModelHubComponent implements Component {
 	/** Roles rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
 	#rolesVisibleCount = 0;
 
+	#presetsRows: PresetRow[] = [];
+	#presetIndex = 0;
+	#presetHover: number | null = null;
+	/** First presets row drawn in the scroll window; follows the cursor and clamps to the list. */
+	#presetScrollStart = 0;
+	/** Presets rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
+	#presetsVisibleCount = 0;
+	/** Preset being applied through the host; every input is ignored until it settles. */
+	#applyingPreset: string | null = null;
+	/** Validation error of the preset-name input, shown in place of its hint until the next keystroke. */
+	#presetNameError: string | null = null;
+	/** Preset whose deletion `x` armed; the next `x` deletes it, any navigation disarms. */
+	#deleteArmed: string | null = null;
+
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
 	#assignmentPending = false;
@@ -375,7 +422,7 @@ export class ModelHubComponent implements Component {
 	 * attempt; steps from it while nothing matches the setup or nothing changed since.
 	 */
 	#presetCursor: { name: string; revision: number } | undefined;
-	#presetsMemo: { revision: number; names: readonly string[]; active: string | undefined } | undefined;
+	#presetsMemo: { revision: number; listing: ModelPresetListing } | undefined;
 	#disposed = false;
 	/** Per-provider fuzzy match counts while a query is active; null when not searching. */
 	#searchCounts: Map<string, number> | null = null;
@@ -393,6 +440,8 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (entry.kind === "roles" && this.#assigning === null) {
 			lines.push(...this.#renderRolesView(width, rows - 1));
+		} else if (entry.kind === "presets" && this.#assigning === null) {
+			lines.push(...this.#renderPresetsView(width, rows - 1));
 		} else if (entry.kind === "provider" && entry.locked && this.#assigning === null) {
 			lines.push(...this.#renderLockedView(entry, width, rows - 1));
 		} else {
@@ -413,6 +462,7 @@ export class ModelHubComponent implements Component {
 	);
 	#lockedLoginLine: number | null = null;
 	#rolesRowStart = 1;
+	#presetsRowStart = 1;
 	/** Bumped on every visible-state change; the described node is rebuilt when it moves. */
 	#nativeVersion = 0;
 	#nativeCache: { version: number; picker: boolean; node: NativeNode } | undefined;
@@ -572,6 +622,7 @@ export class ModelHubComponent implements Component {
 
 		this.#reloadRoles(availableModels);
 		this.#buildRolesRows();
+		this.#buildPresetsRows();
 
 		const mruOrder = this.#settings.mruOrder;
 		this.#availableItems = buildBrowserItems(availableModels);
@@ -665,9 +716,16 @@ export class ModelHubComponent implements Component {
 			if (assignment && !assignment.autoSelected) assignedCount++;
 		}
 
-		// Roles leads the fixed section so downward hops from Recent head into
-		// model scopes instead of being captured by the roles view.
+		// Presets and Roles lead the fixed section so downward hops from Recent
+		// head into model scopes instead of being captured by either management
+		// view. Both are hop-skipped while a search query is active.
 		const fixed: SidebarEntry[] = [
+			{
+				id: "presets",
+				kind: "presets",
+				label: "Presets",
+				annotation: String(this.#presets().names.length),
+			},
 			{
 				id: "roles",
 				kind: "roles",
@@ -766,12 +824,13 @@ export class ModelHubComponent implements Component {
 	#setActiveEntry(id: string): void {
 		if (!this.#entries.some(entry => entry.id === id)) return;
 		this.#activeEntryId = id;
+		this.#deleteArmed = null;
 		this.#sidebarFollowActive = true;
 		this.#applyScope();
 		const entry = this.#activeEntry();
 		// Hops must never steal arrow focus: landing on a scope keeps provider
-		// navigation active. Diving into the roles rows is explicit (Enter, →,
-		// or a click on the Roles entry).
+		// navigation active. Diving into the roles or presets rows is explicit
+		// (Enter, →, or a click on the entry).
 		this.#focus = "scope";
 		if (entry.kind === "provider" && !entry.locked) {
 			this.#scheduleProviderRefresh(entry.providerId ?? "");
@@ -801,6 +860,9 @@ export class ModelHubComponent implements Component {
 			}
 			case "roles":
 				this.#roleIndex = Math.min(this.#roleIndex, Math.max(0, this.#rolesRowCount - 1));
+				break;
+			case "presets":
+				this.#presetIndex = Math.min(this.#presetIndex, Math.max(0, this.#presetsRows.length - 1));
 				break;
 			default:
 				this.#browser.setShowProvider(true);
@@ -899,6 +961,15 @@ export class ModelHubComponent implements Component {
 		this.#rolesRows = rows;
 	}
 
+	/** Rebuild the Presets view rows: each saved preset (host order), then the trailing "+ Save current…". */
+	#buildPresetsRows(): void {
+		this.#presetsRows = [
+			...this.#presets().names.map(name => ({ kind: "preset", name }) as const),
+			{ kind: "newPreset" },
+		];
+		this.#presetIndex = Math.min(this.#presetIndex, Math.max(0, this.#presetsRows.length - 1));
+	}
+
 	/**
 	 * Rows the Roles view lists on the All tab, separators aside: the picker's
 	 * unfiltered `total`, counted in the same rows Tern counts as shown.
@@ -961,13 +1032,13 @@ export class ModelHubComponent implements Component {
 
 	/**
 	 * Entries the scope hop skips: separators always; while searching, also
-	 * the Roles view (not a model scope), an empty Recent, locked providers,
-	 * and providers without matches.
+	 * the Roles and Presets views (not model scopes), an empty Recent, locked
+	 * providers, and providers without matches.
 	 */
 	#isHopSkipped(entry: SidebarEntry): boolean {
 		if (entry.kind === "separator") return true;
 		if (!this.#searchCounts) return false;
-		if (entry.kind === "roles") return true;
+		if (entry.kind === "roles" || entry.kind === "presets") return true;
 		if (entry.kind === "recent") return this.#recentSearchCount === 0;
 		if (entry.kind === "provider") {
 			if (entry.locked) return true;
@@ -1491,6 +1562,7 @@ export class ModelHubComponent implements Component {
 	#closeStrip(): void {
 		const strip = this.#strip;
 		this.#strip = null;
+		this.#presetNameError = null;
 		this.#frame.chipRanges = [];
 		if ((strip?.kind === "scope" || strip?.kind === "thinking") && strip.returnToRoles) {
 			this.#setActiveEntry("roles");
@@ -1728,6 +1800,7 @@ export class ModelHubComponent implements Component {
 
 	/** Open the footer name input: a new custom role, or saving the current setup as a model preset. */
 	#openNameStrip(purpose: "role" | "preset"): void {
+		this.#presetNameError = null;
 		this.#strip = { kind: "name", purpose, input: new Input() };
 	}
 
@@ -1754,16 +1827,199 @@ export class ModelHubComponent implements Component {
 		this.#startAssign(name);
 	}
 
-	/** Validate and commit the preset name: save the current setup under it (overwrites). */
+	/**
+	 * Validate and commit the preset name: save the current setup under it
+	 * (overwrites). An invalid name keeps the input open and shows the rule in
+	 * place of its hint until the next keystroke.
+	 */
 	#submitPresetName(): void {
 		const strip = this.#strip;
 		if (strip?.kind !== "name" || strip.purpose !== "preset") return;
 		const name = strip.input.getValue().trim();
-		if (!/^[a-zA-Z][\w-]*$/.test(name)) return;
+		if (!PRESET_NAME_PATTERN.test(name)) {
+			this.#presetNameError = PRESET_NAME_ERROR;
+			this.#requestRender();
+			return;
+		}
+		this.#presetNameError = null;
 		this.#strip = null;
 		this.#frame.chipRanges = [];
+		this.#savePreset(name);
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Presets
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/** The host's preset listing (sorted names, the matching one, row summaries), re-read when settings change. */
+	#presets(): ModelPresetListing {
+		const revision = this.#settings.revision;
+		if (this.#presetsMemo?.revision !== revision) {
+			this.#presetsMemo = { revision, listing: this.#settings.getModelPresets() };
+		}
+		return this.#presetsMemo.listing;
+	}
+
+	/** Whether the Roles view can step through presets (ctrl+←/→, p/⇧P): a host that applies, and something to apply. */
+	#canSwitchPresets(): boolean {
+		return this.#callbacks.onApplyPreset !== undefined && this.#presets().names.length > 0;
+	}
+
+	/**
+	 * The preset ctrl+←/→ steps from: the last one tried here while settings are
+	 * unchanged since (a refused switch writes nothing, so the next press moves
+	 * past it) or nothing matches; otherwise the preset the setup matches.
+	 */
+	#presetBase(active: string | undefined): string | undefined {
+		const cursor = this.#presetCursor;
+		if (cursor && (active === undefined || cursor.revision === this.#settings.revision)) return cursor.name;
+		return active;
+	}
+
+	/** Apply the previous/next saved preset (wrapping), as `/modelpreset switch` does. */
+	#switchPreset(delta: -1 | 1): void {
+		const { names, active } = this.#presets();
+		if (!this.#canSwitchPresets()) return;
+		const base = this.#presetBase(active);
+		const current = base === undefined ? -1 : names.indexOf(base);
+		const next = current < 0 ? (delta > 0 ? 0 : names.length - 1) : (current + delta + names.length) % names.length;
+		const name = names[next];
+		if (name === undefined) return;
+		const settle = () => {
+			this.#presetCursor = { name, revision: this.#settings.revision };
+		};
+		// Stepping onto the preset already in effect has nothing to apply.
+		if (name === active) {
+			settle();
+			this.#refreshAfterMutation();
+			return;
+		}
+		// The host reports refusals itself, so the cursor moves once the switch
+		// settles, refused or not (`#presetBase` sees a refusal left the revision alone).
+		this.#applyPreset(name, settle);
+	}
+
+	/**
+	 * Load saved preset `name` through the host. The hub freezes (every key,
+	 * mouse and native event is dropped) until the host settles — resolved,
+	 * rejected or thrown — then `onSettled` runs and the view re-syncs. The
+	 * host owns outcome reporting, so a refusal just leaves the overlay retryable.
+	 */
+	#applyPreset(name: string, onSettled?: () => void): void {
+		const callback = this.#callbacks.onApplyPreset;
+		if (this.#applyingPreset !== null || !callback || !this.#presets().names.includes(name)) return;
+		this.#applyingPreset = name;
+		this.#requestRender();
+		const settle = () => {
+			this.#applyingPreset = null;
+			onSettled?.();
+			if (!this.#disposed) this.#refreshAfterMutation();
+		};
+		let pending: Promise<ModelPresetApplyResult> | ModelPresetApplyResult;
+		try {
+			pending = callback(name);
+		} catch {
+			settle();
+			return;
+		}
+		if (!(pending instanceof Promise)) {
+			settle();
+			return;
+		}
+		void pending.then(settle, settle);
+	}
+
+	/** Persist the current routing as `name` through the host, then land the Presets cursor on its row. */
+	#savePreset(name: string): void {
 		this.#callbacks.onSavePreset?.(name);
 		this.#refreshAfterMutation();
+		const index = this.#presetsRows.findIndex(row => row.kind === "preset" && row.name === name);
+		if (index >= 0) this.#presetIndex = index;
+	}
+
+	/** Delete `name` through the host; the cursor steps up onto the nearest surviving row. */
+	#deletePreset(name: string): void {
+		this.#callbacks.onDeletePreset?.(name);
+		this.#refreshAfterMutation();
+		this.#presetIndex = this.#stepPresetIndex(this.#presetIndex, -1, { wrap: false });
+	}
+
+	/** `x` on a preset row: the first press arms deletion of `name`, the second deletes it. */
+	#armOrDeletePreset(name: string): void {
+		if (this.#deleteArmed !== name) {
+			this.#deleteArmed = name;
+			return;
+		}
+		this.#deleteArmed = null;
+		this.#deletePreset(name);
+	}
+
+	/** Step the presets cursor by one row. Wraps at the ends unless `wrap: false` (then the cursor stays put). */
+	#stepPresetIndex(from: number, delta: -1 | 1, options: { wrap?: boolean } = {}): number {
+		const count = this.#presetsRows.length;
+		if (count === 0) return 0;
+		const next = from + delta;
+		if (next < 0 || next >= count) return (options.wrap ?? true) ? (next + count) % count : from;
+		return next;
+	}
+
+	/** Enter/click activation for a Presets-view row: load the preset, or name a new one. */
+	#activatePresetRow(row: PresetRow): void {
+		this.#deleteArmed = null;
+		if (row.kind === "newPreset") {
+			if (this.#callbacks.onSavePreset) this.#openNameStrip("preset");
+			return;
+		}
+		this.#applyPreset(row.name);
+	}
+
+	#handlePresetsViewInput(data: string): void {
+		// Scope focus treats the presets view as a preview: Enter/Space dives
+		// into the rows, everything else is inert (arrows already hop).
+		if (this.#focus === "scope") {
+			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n" || matchesKey(data, "space")) {
+				this.#focus = "list";
+			}
+			return;
+		}
+		if (matchesSelectUp(data)) {
+			this.#deleteArmed = null;
+			this.#presetIndex = this.#stepPresetIndex(this.#presetIndex, -1);
+			return;
+		}
+		if (matchesSelectDown(data)) {
+			this.#deleteArmed = null;
+			this.#presetIndex = this.#stepPresetIndex(this.#presetIndex, 1);
+			return;
+		}
+		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			this.#runPresetsAction("activate");
+			return;
+		}
+		if (matchesKey(data, "backspace") || matchesKey(data, "delete")) {
+			this.#runPresetsAction("delete");
+			return;
+		}
+		const printable = extractPrintableText(data);
+		if (printable === "x") this.#runPresetsAction("delete");
+		else if (printable === "s") this.#runPresetsAction("save");
+	}
+
+	/** One Presets-view command on the selected row (keys and action-bar buttons share it). */
+	#runPresetsAction(action: PresetsAction): void {
+		const row = this.#presetsRows[this.#presetIndex];
+		switch (action) {
+			case "activate":
+				if (row) this.#activatePresetRow(row);
+				return;
+			case "delete":
+				if (row?.kind === "preset") this.#armOrDeletePreset(row.name);
+				return;
+			case "save":
+				this.#deleteArmed = null;
+				if (this.#callbacks.onSavePreset) this.#openNameStrip("preset");
+				return;
+		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -1786,58 +2042,14 @@ export class ModelHubComponent implements Component {
 		this.#buildRolesRows();
 	}
 
-	/** Saved presets and the one the setup matches; empty unless the host can both list and switch. */
-	#presets(): { names: readonly string[]; active: string | undefined } {
-		if (!this.#callbacks.onSwitchPreset || !this.#settings.getModelPresets) return { names: [], active: undefined };
-		const revision = this.#settings.revision;
-		if (this.#presetsMemo?.revision !== revision) {
-			const { names, active } = this.#settings.getModelPresets();
-			this.#presetsMemo = { revision, names, active };
-		}
-		return this.#presetsMemo;
-	}
-
-	/**
-	 * The preset ctrl+←/→ steps from: the last one tried here while settings are
-	 * unchanged since (a refused switch writes nothing, so the next press moves
-	 * past it) or nothing matches; otherwise the preset the setup matches.
-	 */
-	#presetBase(active: string | undefined): string | undefined {
-		const cursor = this.#presetCursor;
-		if (cursor && (active === undefined || cursor.revision === this.#settings.revision)) return cursor.name;
-		return active;
-	}
-
-	/** Apply the previous/next saved preset (wrapping), as `/modelpreset switch` does. */
-	#switchPreset(delta: -1 | 1): void {
-		const onSwitchPreset = this.#callbacks.onSwitchPreset;
-		const { names, active } = this.#presets();
-		if (!onSwitchPreset || names.length === 0) return;
-		const base = this.#presetBase(active);
-		const current = base === undefined ? -1 : names.indexOf(base);
-		const next = current < 0 ? (delta > 0 ? 0 : names.length - 1) : (current + delta + names.length) % names.length;
-		const name = names[next];
-		if (name === undefined) return;
-		const settle = () => {
-			this.#presetCursor = { name, revision: this.#settings.revision };
-			this.#refreshAfterMutation();
-		};
-		// Stepping onto the preset already in effect has nothing to apply.
-		if (name === active) {
-			settle();
-			return;
-		}
-		// The host reports refusals itself, so the cursor moves once the switch
-		// resolves, refused or not (`#presetBase` sees a refusal left the revision alone).
-		this.#finishAssignment(onSwitchPreset(name), settle);
-	}
-
 	handleInput(data: string): void {
 		this.#nativeVersion++;
 		if (this.#assignmentPending) {
 			if (matchesSelectCancel(data)) this.#callbacks.onCancel();
 			return;
 		}
+		// A preset apply owns the hub until the host settles: no key, cancel, or mouse gets through.
+		if (this.#applyingPreset !== null) return;
 		if (data.startsWith("\x1b[<")) {
 			routeSgrMouseInput(data, event => this.#routeMouseEvent(event));
 			return;
@@ -1855,6 +2067,7 @@ export class ModelHubComponent implements Component {
 
 		const entry = this.#activeEntry();
 		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const presetsView = entry.kind === "presets" && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked && this.#assigning === null;
 
 		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
@@ -1896,7 +2109,7 @@ export class ModelHubComponent implements Component {
 		}
 		if (matchesKey(data, "right")) {
 			// Only views with rows can take list focus (not the locked pane).
-			if (rolesView || this.#isBrowserView(entry)) {
+			if (rolesView || presetsView || this.#isBrowserView(entry)) {
 				this.#focus = "list";
 			}
 			return;
@@ -1923,6 +2136,17 @@ export class ModelHubComponent implements Component {
 				return;
 			}
 			this.#handleRolesViewInput(data);
+			return;
+		}
+		if (presetsView) {
+			const printable = extractPrintableText(data);
+			if (this.#focus === "scope" && printable !== undefined && printable.trim().length > 0) {
+				this.#setActiveEntry("all");
+				this.#focus = "list";
+				this.#browser.handleInput(data);
+				return;
+			}
+			this.#handlePresetsViewInput(data);
 			return;
 		}
 		if (lockedView) {
@@ -1992,6 +2216,8 @@ export class ModelHubComponent implements Component {
 				this.#submitNameStrip();
 				return;
 			}
+			// Editing the name clears a stale validation error; the rule hint returns.
+			this.#presetNameError = null;
 			strip.input.handleInput(data);
 			return;
 		}
@@ -2012,8 +2238,8 @@ export class ModelHubComponent implements Component {
 			const entry = this.#entries[index];
 			if (entry && !this.#isHopSkipped(entry)) {
 				// Scope changes keep an active assignment (scoping helps find the
-				// model); landing on the Roles view cancels it.
-				if (entry.kind === "roles") this.#assigning = null;
+				// model); landing on the Roles or Presets view cancels it.
+				if (entry.kind === "roles" || entry.kind === "presets") this.#assigning = null;
 				this.#setActiveEntry(entry.id);
 				return;
 			}
@@ -2179,7 +2405,7 @@ export class ModelHubComponent implements Component {
 	// ═══════════════════════════════════════════════════════════════════════
 
 	#routeMouseEvent(event: SgrMouseEvent): boolean {
-		if (this.#assignmentPending) return true;
+		if (this.#assignmentPending || this.#applyingPreset !== null) return true;
 		const { footerColumn, bodyHeight, contentLine, overSidebar, overBody, bodyLine } = this.#frame.locate(
 			event.row,
 			event.col,
@@ -2203,6 +2429,11 @@ export class ModelHubComponent implements Component {
 			} else if (overBody) {
 				if (entry.kind === "roles" && this.#assigning === null) {
 					this.#roleIndex = this.#stepRoleIndex(this.#roleIndex, event.wheel > 0 ? 1 : -1, { wrap: false });
+				} else if (entry.kind === "presets" && this.#assigning === null) {
+					this.#deleteArmed = null;
+					this.#presetIndex = this.#stepPresetIndex(this.#presetIndex, event.wheel > 0 ? 1 : -1, {
+						wrap: false,
+					});
 				} else if (this.#isBrowserView(entry) && bodyLine > 0) {
 					this.#browser.routeMouse(event, bodyLine - 1);
 				}
@@ -2212,6 +2443,12 @@ export class ModelHubComponent implements Component {
 
 		if (event.motion) {
 			this.#sidebarHover = overSidebar ? this.#sidebarEntryIndexAt(contentLine) : null;
+			const presetsView = overBody && entry.kind === "presets" && this.#assigning === null;
+			const presetLine = bodyLine - this.#presetsRowStart;
+			this.#presetHover =
+				presetsView && presetLine >= 0 && presetLine < this.#presetsVisibleCount
+					? presetLine + this.#presetScrollStart
+					: null;
 			if (overBody && entry.kind === "roles" && this.#assigning === null) {
 				const roleLine = bodyLine - this.#rolesRowStart;
 				this.#roleHover =
@@ -2252,6 +2489,21 @@ export class ModelHubComponent implements Component {
 						}
 					}
 				}
+			} else if (entry.kind === "presets" && this.#assigning === null) {
+				this.#focus = "list";
+				const listLine = bodyLine - this.#presetsRowStart;
+				if (listLine >= 0 && listLine < this.#presetsVisibleCount) {
+					const presetLine = listLine + this.#presetScrollStart;
+					const rowDef = this.#presetsRows[presetLine];
+					if (rowDef) {
+						this.#deleteArmed = null;
+						if (presetLine === this.#presetIndex) {
+							this.#activatePresetRow(rowDef);
+						} else {
+							this.#presetIndex = presetLine;
+						}
+					}
+				}
 			} else if (entry.kind === "provider" && entry.locked && this.#assigning === null) {
 				if (this.#lockedLoginLine !== null && bodyLine === this.#lockedLoginLine) {
 					this.#requestLogin(entry);
@@ -2267,10 +2519,11 @@ export class ModelHubComponent implements Component {
 	#clickSidebarEntry(clicked: SidebarEntry | undefined): void {
 		if (!clicked || clicked.kind === "separator") return;
 		const already = clicked.id === this.#activeEntryId;
-		if (clicked.kind === "roles") this.#assigning = null;
+		const management = clicked.kind === "roles" || clicked.kind === "presets";
+		if (management) this.#assigning = null;
 		this.#setActiveEntry(clicked.id);
-		// A click on Roles is a deliberate dive into the rows.
-		if (clicked.kind === "roles") this.#focus = "list";
+		// A click on Roles or Presets is a deliberate dive into the rows.
+		if (management) this.#focus = "list";
 		if (already && clicked.kind === "provider" && clicked.locked) {
 			this.#requestLogin(clicked);
 		}
@@ -2312,11 +2565,12 @@ export class ModelHubComponent implements Component {
 			}
 		}
 		// Search-ineligible entries gray out, but keep their place in the viewport.
-		const muted = entry.locked || matchCount === 0 || (searching && entry.kind === "roles");
+		const muted =
+			entry.locked || matchCount === 0 || (searching && (entry.kind === "roles" || entry.kind === "presets"));
 		let icon: string;
 		if (entry.kind === "recent") {
 			icon = theme.icon.time;
-		} else if (entry.kind === "roles") {
+		} else if (entry.kind === "roles" || entry.kind === "presets") {
 			icon = theme.icon.extensionSkill;
 		} else if (entry.kind === "all") {
 			icon = theme.icon.model;
@@ -2354,11 +2608,10 @@ export class ModelHubComponent implements Component {
 			ROLE_TABS.map(tab => ({ label: tab === "kind" ? "kinds" : tab })),
 			Math.max(0, active),
 		);
-		const { names, active: activePreset } = this.#presets();
-		const preset =
-			names.length > 0
-				? `   ${theme.fg("dim", "Preset:")} ${activePreset ? theme.fg("accent", activePreset) : theme.fg("muted", "custom")}  ${theme.fg("dim", `${formatKeyHints(["ctrl+left", "ctrl+right"])} · ${formatKeyHints(["p", "shift+p"])}`)}`
-				: "";
+		const { active: activePreset } = this.#presets();
+		const preset = this.#canSwitchPresets()
+			? `   ${theme.fg("dim", "Preset:")} ${activePreset ? theme.fg("accent", activePreset) : theme.fg("muted", "custom")}  ${theme.fg("dim", `${formatKeyHints(["ctrl+left", "ctrl+right"])} · ${formatKeyHints(["p", "shift+p"])}`)}`
+			: "";
 		return truncateToWidth(
 			` ${theme.fg("dim", "Roles:")} ${track}  ${theme.fg("dim", formatKeyHints(["alt+left", "alt+right"]))}${preset}`,
 			width,
@@ -2368,6 +2621,9 @@ export class ModelHubComponent implements Component {
 	#statusRow(width: number): string {
 		if (this.#assignmentPending) {
 			return truncateToWidth(theme.fg("accent", " Applying model…"), width);
+		}
+		if (this.#applyingPreset !== null) {
+			return truncateToWidth(theme.fg("accent", ` Applying preset ${this.#applyingPreset}…`), width);
 		}
 		if (this.#assigning !== null) {
 			const enter = formatKeyHint("enter");
@@ -2404,6 +2660,9 @@ export class ModelHubComponent implements Component {
 				break;
 			case "roles":
 				text = `Model roles — ${formatKeyHint("f")} adds a retry fallback, cleared roles fall back to auto-selection`;
+				break;
+			case "presets":
+				text = `Model presets — ${formatKeyHint("enter")} loads a preset · ${formatKeyHint("s")} saves current · ${formatKeyHint("x")} deletes`;
 				break;
 			case "provider":
 				if (entry.locked) {
@@ -2579,6 +2838,73 @@ export class ModelHubComponent implements Component {
 		return lines;
 	}
 
+	#renderPresetsView(width: number, rows: number): string[] {
+		// A blank spacer stands where the Roles view draws its tabs row, so the
+		// first preset row sits at the same bodyLine the mouse router expects.
+		const lines: string[] = [""];
+		this.#presetsRowStart = lines.length;
+		const { active, summaries } = this.#presets();
+		const listFocused = this.#focus === "list";
+		const total = this.#presetsRows.length;
+		// Window the list around the cursor; the last row is reserved for the hint line.
+		const capacity = Math.max(1, rows - 2);
+		let start = this.#presetScrollStart;
+		if (this.#presetIndex < start) start = this.#presetIndex;
+		else if (this.#presetIndex >= start + capacity) start = this.#presetIndex - capacity + 1;
+		start = Math.max(0, Math.min(start, Math.max(0, total - capacity)));
+		this.#presetScrollStart = start;
+		const endIndex = Math.min(start + capacity, total);
+		this.#presetsVisibleCount = Math.max(0, endIndex - start);
+
+		for (let i = start; i < endIndex; i++) {
+			const rowDef = this.#presetsRows[i];
+			if (!rowDef) continue;
+			const selected = i === this.#presetIndex;
+			const hovered = i === this.#presetHover;
+			// The unfocused pane draws no cursor; accent text still marks the row.
+			const cursor = selected && listFocused ? theme.fg("accent", theme.nav.cursor) : " ";
+
+			if (rowDef.kind === "newPreset") {
+				const line = ` ${cursor} ${theme.fg(selected ? "accent" : "dim", "+ Save current as preset…")}`;
+				lines.push(this.#finishRolesRow(line, width, hovered));
+				continue;
+			}
+
+			if (this.#deleteArmed === rowDef.name) {
+				const warning = theme.fg("warning", "press x again to delete");
+				lines.push(this.#finishRolesRow(` ${cursor} ${warning} ${rowDef.name}`, width, hovered));
+				continue;
+			}
+
+			const matches = active === rowDef.name;
+			const dot = matches ? theme.fg("accent", theme.status.enabled) : theme.fg("dim", theme.status.shadowed);
+			const name = selected ? theme.fg("accent", rowDef.name) : rowDef.name;
+			const summary = this.#applyingPreset === rowDef.name ? "applying…" : (summaries[rowDef.name] ?? "");
+			let line = ` ${cursor} ${dot} ${name}  ${theme.fg("dim", summary)}`;
+			if (matches) {
+				// Right-align the badge; fall back to a short form, or drop it, on narrow panes.
+				const lineWidth = visibleWidth(line);
+				for (const badge of [theme.fg("accent", "matches current"), theme.fg("accent", "match")]) {
+					const badgeWidth = visibleWidth(badge);
+					if (lineWidth + badgeWidth + 2 <= width) {
+						line = `${line}${" ".repeat(width - lineWidth - badgeWidth - 1)}${badge}`;
+						break;
+					}
+				}
+			}
+			lines.push(this.#finishRolesRow(line, width, hovered));
+		}
+
+		while (lines.length < rows) lines.push("");
+		if (total <= 1 && rows >= 2) {
+			lines[rows - 1] = truncateToWidth(
+				theme.fg("dim", `  No presets yet — press ${formatKeyHint("s")} to save the current models as one`),
+				width,
+			);
+		}
+		return lines;
+	}
+
 	#renderLockedView(entry: SidebarEntry, width: number, rows: number): string[] {
 		const lines: string[] = [];
 		this.#lockedLoginLine = null;
@@ -2657,8 +2983,7 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (entry.kind === "roles") {
 			if (this.#focus !== "list") {
-				const presets =
-					this.#presets().names.length > 0 ? ` · ${formatKeyHints(["ctrl+left", "ctrl+right"])} preset` : "";
+				const presets = this.#canSwitchPresets() ? ` · ${formatKeyHints(["ctrl+left", "ctrl+right"])} preset` : "";
 				return `${upDown} providers · ${enterRight} roles · ${altLeftRight} tabs${presets} · ${cancel} close`;
 			}
 			const row = this.#rolesRows[this.#roleIndex];
@@ -2681,8 +3006,21 @@ export class ModelHubComponent implements Component {
 			const editable = row?.kind === "role" && this.#roleThinkingTarget(row.role) !== undefined;
 			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
 			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
-			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
+			const switchPreset = this.#canSwitchPresets() ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
 			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking} · ${formatKeyHint("c")} cycle · [/] reorder · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
+		}
+		if (entry.kind === "presets") {
+			if (this.#focus !== "list") {
+				return `${upDown} providers · ${formatKeyHint("right")} presets · ${cancel} close`;
+			}
+			const row = this.#presetsRows[this.#presetIndex];
+			if (row?.kind === "preset" && this.#deleteArmed === row.name) {
+				return `press ${formatKeyHint("x")} again to delete "${row.name}" · ${upDown} cancel`;
+			}
+			if (row?.kind === "newPreset") {
+				return `${upDown} rows · ${enter} save current as preset · ${left} providers`;
+			}
+			return `${upDown} presets · ${enter} load · ${formatKeyHint("s")} save current · ${formatKeyHint("x")} delete · ${left} providers`;
 		}
 		if (entry.kind === "provider" && entry.locked) {
 			return entry.oauth
@@ -2712,7 +3050,13 @@ export class ModelHubComponent implements Component {
 			const label = theme.fg("accent", labelText);
 			const inputWidth = Math.max(8, Math.min(32, width - visibleWidth(labelText) - 24));
 			const inputLine = strip.input.render(inputWidth)[0] ?? "";
-			return truncateToWidth(`${label} ${inputLine} ${theme.fg("dim", "(letters, digits, - and _)")}`, width);
+			const hint = this.#presetNameError
+				? theme.fg("error", this.#presetNameError)
+				: theme.fg(
+						"dim",
+						preset ? "(start with a letter; letters, digits, space, - and _)" : "(letters, digits, - and _)",
+					);
+			return truncateToWidth(`${label} ${inputLine} ${hint}`, width);
 		}
 
 		const prefix =
@@ -2786,6 +3130,8 @@ export class ModelHubComponent implements Component {
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		// Same gate as the keys and the mouse router: a preset apply owns the hub until it settles.
+		if (this.#applyingPreset !== null) return;
 		const picked = pickerEvent(event);
 		if (picked) {
 			this.#handlePickerEvent(picked);
@@ -2813,6 +3159,16 @@ export class ModelHubComponent implements Component {
 					this.#focus = "list";
 					this.#roleIndex = index;
 					this.#activateRolesRow(rowDef);
+					break;
+				}
+				case "presets": {
+					if (this.#activeEntry().kind !== "presets" || this.#assigning !== null) return;
+					const index = this.#presetsRows.findIndex(rowDef => presetRowKey(rowDef) === event.item);
+					const rowDef = this.#presetsRows[index];
+					if (!rowDef) return;
+					this.#focus = "list";
+					this.#presetIndex = index;
+					this.#activatePresetRow(rowDef);
 					break;
 				}
 				case "roleTabs": {
@@ -2861,6 +3217,8 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (entry.kind === "roles" && this.#assigning === null) {
 			children.push(...this.#describeRolesView());
+		} else if (entry.kind === "presets" && this.#assigning === null) {
+			children.push(...this.#describePresetsView());
 		} else if (entry.kind === "provider" && entry.locked && this.#assigning === null) {
 			children.push(this.#describeLockedView(entry));
 		} else {
@@ -2888,6 +3246,14 @@ export class ModelHubComponent implements Component {
 	#describeStatus(): NativeNode {
 		if (this.#assignmentPending) {
 			return node("spinner", { label: [span("Applying model…", "accent")] }, undefined, "status");
+		}
+		if (this.#applyingPreset !== null) {
+			return node(
+				"spinner",
+				{ label: [span("Applying preset ", "accent"), span(this.#applyingPreset, "accent strong")] },
+				undefined,
+				"status",
+			);
 		}
 		let spans: TspSpan[];
 		const assigning = this.#assigning;
@@ -2921,6 +3287,17 @@ export class ModelHubComponent implements Component {
 					span("Model roles — ", "muted"),
 					span("f", "key"),
 					span(" adds a retry fallback, cleared roles fall back to auto-selection", "muted"),
+				];
+				break;
+			case "presets":
+				spans = [
+					span("Model presets — ", "muted"),
+					span("enter", "key"),
+					span(" loads a preset · ", "muted"),
+					span("s", "key"),
+					span(" saves current · ", "muted"),
+					span("x", "key"),
+					span(" deletes", "muted"),
 				];
 				break;
 			case "provider":
@@ -3040,6 +3417,60 @@ export class ModelHubComponent implements Component {
 		return node("item", { label, detail, value: value.length > 0 ? value : undefined }, undefined, key);
 	}
 
+	#describePresetsView(): NativeNode[] {
+		const { active, summaries } = this.#presets();
+		const items = this.#presetsRows.map(rowDef => {
+			const key = presetRowKey(rowDef);
+			if (rowDef.kind === "newPreset") {
+				return node("item", { label: [span("+ Save current as preset…", "dim")] }, undefined, key);
+			}
+			if (this.#deleteArmed === rowDef.name) {
+				return node(
+					"item",
+					{ label: [span("press x again to delete ", "warning"), span(rowDef.name)] },
+					undefined,
+					key,
+				);
+			}
+			const matches = active === rowDef.name;
+			const summary = this.#applyingPreset === rowDef.name ? "applying…" : (summaries[rowDef.name] ?? "");
+			return node(
+				"item",
+				{
+					label: matches
+						? [span(`${theme.status.enabled} `, "accent"), span(rowDef.name)]
+						: [span(`${theme.status.shadowed} `, "dim"), span(rowDef.name)],
+					detail: [span(summary, "dim")],
+					value: matches ? [span("matches current", "accent")] : undefined,
+				},
+				undefined,
+				key,
+			);
+		});
+		const selectedRow = this.#presetsRows[this.#presetIndex];
+		const list = node(
+			"list",
+			{
+				selected: selectedRow ? presetRowKey(selectedRow) : null,
+				virtual: true,
+				grow: 1,
+				tone: this.#focus === "list" ? "accent" : undefined,
+				aria: "Presets",
+			},
+			items,
+			"presets",
+		);
+		if (this.#presetsRows.length > 1) return [list];
+		return [
+			list,
+			text([
+				span("No presets yet — press ", "dim"),
+				span("s", "key"),
+				span(" to save the current models as one", "dim"),
+			]),
+		];
+	}
+
 	/** Live preview of the quick-switch cycle; the selected row's role is emphasized. */
 	#describeCycle(cycleOrder: readonly string[]): NativeNode {
 		const [cycleKey] = boundKeys("app.model.cycleForward", ["ctrl+p"]);
@@ -3124,13 +3555,14 @@ export class ModelHubComponent implements Component {
 	#describePicker(): NativeNode {
 		const entry = this.#activeEntry();
 		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const presetsView = entry.kind === "presets" && this.#assigning === null;
 		const lockedView = entry.kind === "provider" && entry.locked === true && this.#assigning === null;
 		const strip = this.#strip;
 		const props: TspPickerProps = {
 			title: "Models",
-			subtitle: this.#pickerSubtitle(entry, rolesView),
+			subtitle: this.#pickerSubtitle(entry, rolesView, presetsView),
 			icon: "cpu",
-			noun: rolesView ? "roles" : "models",
+			noun: rolesView ? "roles" : presetsView ? "presets" : "models",
 			size: "lg",
 			layout: "rows",
 			preview: "side",
@@ -3139,7 +3571,7 @@ export class ModelHubComponent implements Component {
 			placeholder: "Search models…",
 			scopes: this.#pickerScopes(),
 			scope: entry.id,
-			actions: this.#pickerActions(entry, rolesView, lockedView),
+			actions: this.#pickerActions(entry, rolesView, presetsView, lockedView),
 			strip: strip ? this.#pickerStrip(strip) : null,
 			focus: strip ? "strip" : this.#focus === "scope" ? "scopes" : "list",
 		};
@@ -3163,6 +3595,21 @@ export class ModelHubComponent implements Component {
 					total: this.#allRolesRowCount(),
 				},
 				this.#rolePreview(row),
+			);
+		}
+		if (presetsView) {
+			const row = this.#presetsRows[this.#presetIndex];
+			return picker(
+				{
+					...props,
+					columns: PRESET_PICKER_COLUMNS,
+					items: this.#presetPickerItems(),
+					order: this.#presetsRows.map(presetRowKey),
+					selected: row ? presetRowKey(row) : null,
+					total: this.#presetsRows.length,
+					empty: "No presets yet — save the current models as one",
+				},
+				this.#presetPreview(row),
 			);
 		}
 		const catalogue = this.#browser.pickerItems(this.#availableItems);
@@ -3221,8 +3668,9 @@ export class ModelHubComponent implements Component {
 	}
 
 	/** What the hub is doing when it is more than browsing: applying, assigning, refreshing, a config error. */
-	#pickerSubtitle(entry: SidebarEntry, rolesView: boolean): TspPickerProps["subtitle"] {
+	#pickerSubtitle(entry: SidebarEntry, rolesView: boolean, presetsView: boolean): TspPickerProps["subtitle"] {
 		if (this.#assignmentPending) return "Applying model…";
+		if (this.#applyingPreset !== null) return [span("Applying preset "), span(this.#applyingPreset, "strong")];
 		const assigning = this.#assigning;
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") return "New fallback chain — pick the model it protects";
@@ -3240,8 +3688,15 @@ export class ModelHubComponent implements Component {
 		if (entry.kind === "provider" && entry.providerId && this.#refreshingProviders.has(entry.providerId)) {
 			return `${entry.label} · refreshing model list…`;
 		}
-		const presets = rolesView ? this.#presets() : undefined;
-		if (presets && presets.names.length > 0) {
+		if (presetsView) {
+			const row = this.#presetsRows[this.#presetIndex];
+			if (row?.kind === "preset" && this.#deleteArmed === row.name) {
+				return [span("Press "), span("x", "key"), span(" again to delete "), span(row.name, "strong")];
+			}
+			return "Saved role setups — load one, or save the current routing";
+		}
+		if (rolesView && this.#canSwitchPresets()) {
+			const presets = this.#presets();
 			return [
 				span("Preset ", "muted"),
 				presets.active ? span(presets.active, "strong") : span("custom", "muted"),
@@ -3267,6 +3722,9 @@ export class ModelHubComponent implements Component {
 					break;
 				case "roles":
 					scopes.push({ id: entry.id, label: "Roles", icon: "sparkles", count: this.#visibleRoleIds().length });
+					break;
+				case "presets":
+					scopes.push({ id: entry.id, label: "Presets", icon: "bookmark", count: this.#presets().names.length });
 					break;
 				case "all":
 					scopes.push({
@@ -3356,10 +3814,17 @@ export class ModelHubComponent implements Component {
 	}
 
 	/** The action bar for the current view; every button runs the path of the key it shows. */
-	#pickerActions(entry: SidebarEntry, rolesView: boolean, lockedView: boolean): TspPickerAction[] {
+	#pickerActions(
+		entry: SidebarEntry,
+		rolesView: boolean,
+		presetsView: boolean,
+		lockedView: boolean,
+	): TspPickerAction[] {
 		const strip = this.#strip;
 		const cancel = (label: string): TspPickerAction => ({ ...CLOSE_ACTION, label });
 		if (this.#assignmentPending) return [CLOSE_ACTION];
+		// Nothing is interactive while a preset applies; the bar says why.
+		if (this.#applyingPreset !== null) return [{ ...CLOSE_ACTION, disabled: "Applying preset…" }];
 		if (strip) {
 			const apply =
 				strip.kind === "name"
@@ -3404,7 +3869,7 @@ export class ModelHubComponent implements Component {
 						roleAction("cycle", this.#cycleOrder().includes(row.role) ? "Leave cycle" : "Add to cycle", "c"),
 						roleAction("new", "New role", "n"),
 						this.#callbacks.onSavePreset ? roleAction("save", "Save preset", "s") : undefined,
-						this.#presets().names.length > 0 ? roleAction("nextPreset", "Next preset", "p") : undefined,
+						this.#canSwitchPresets() ? roleAction("nextPreset", "Next preset", "p") : undefined,
 					);
 					break;
 				}
@@ -3431,6 +3896,24 @@ export class ModelHubComponent implements Component {
 					break;
 			}
 			return compact([...actions, CLOSE_ACTION]);
+		}
+		if (presetsView) {
+			const row = this.#presetsRows[this.#presetIndex];
+			const presetAction = (action: PresetsAction, label: string, key: string, primary = false) =>
+				pickerAction(`presets:${action}`, label, key, primary ? { primary: true } : undefined);
+			const save = this.#callbacks.onSavePreset ? presetAction("save", "Save current as preset", "s") : undefined;
+			if (row?.kind === "preset") {
+				const armed = this.#deleteArmed === row.name;
+				return compact([
+					presetAction("activate", "Load preset", "enter", true),
+					save,
+					this.#callbacks.onDeletePreset
+						? { ...presetAction("delete", armed ? "Confirm delete" : "Delete", "x"), danger: armed }
+						: undefined,
+					CLOSE_ACTION,
+				]);
+			}
+			return compact([save ? { ...save, keys: ["enter"], primary: true } : undefined, CLOSE_ACTION]);
 		}
 		if (lockedView) {
 			return entry.oauth
@@ -3669,6 +4152,46 @@ export class ModelHubComponent implements Component {
 		return children;
 	}
 
+	/** Presets-view rows as picker items: a dot for the matching preset, its routing summary as the fact column. */
+	#presetPickerItems(): TspPickerItem[] {
+		const { active, summaries } = this.#presets();
+		return this.#presetsRows.map((row): TspPickerItem => {
+			const id = presetRowKey(row);
+			if (row.kind === "newPreset") return { id, label: "Save current as preset…", icon: "plus", tone: "muted" };
+			if (this.#deleteArmed === row.name) {
+				return { id, label: `press x again to delete ${row.name}`, dot: "warning", tone: "warning" };
+			}
+			const matches = active === row.name;
+			return {
+				id,
+				label: row.name,
+				dot: matches ? "accent" : "muted",
+				facts: { summary: this.#applyingPreset === row.name ? "applying…" : (summaries[row.name] ?? "") },
+				...(matches
+					? { badges: [{ text: "matches current", tone: "accent" as const }] }
+					: { tone: "muted" as const }),
+			};
+		});
+	}
+
+	/** The selected Presets-view row's preview: the preset's routing summary, or how to save one. */
+	#presetPreview(row: PresetRow | undefined): readonly NativeChild[] {
+		if (row?.kind !== "preset") {
+			return [
+				text("Save current as preset", { role: "omp.picker.title" }),
+				text([span("Capture the current role routing under a name to load it again later.", "muted")], {
+					wrap: "word",
+				}),
+			];
+		}
+		const { active, summaries } = this.#presets();
+		const children: NativeChild[] = [text(row.name, { role: "omp.picker.title" })];
+		if (active === row.name) children.push(text([span("Matches the current routing", "accent")]));
+		const summary = summaries[row.name];
+		if (summary) children.push(text([span(summary, "muted")], { wrap: "word" }));
+		return children;
+	}
+
 	#lockedMessage(entry: SidebarEntry): string {
 		const envVars = entry.providerId ? (providerEntry(entry.providerId)?.envVars ?? []) : [];
 		const how =
@@ -3705,6 +4228,7 @@ export class ModelHubComponent implements Component {
 		if (this.#assignmentPending) return;
 		const entry = this.#activeEntry();
 		const rolesView = entry.kind === "roles" && this.#assigning === null;
+		const presetsView = entry.kind === "presets" && this.#assigning === null;
 		if (event.kind !== "action") {
 			if (this.#strip) return;
 			if (rolesView) {
@@ -3714,6 +4238,16 @@ export class ModelHubComponent implements Component {
 				this.#focus = "list";
 				this.#roleIndex = index;
 				if (event.kind === "activate") this.#activateRolesRow(row);
+				return;
+			}
+			if (presetsView) {
+				const index = this.#presetsRows.findIndex(row => presetRowKey(row) === event.item);
+				const row = this.#presetsRows[index];
+				if (!row) return;
+				this.#focus = "list";
+				if (index !== this.#presetIndex) this.#deleteArmed = null;
+				this.#presetIndex = index;
+				if (event.kind === "activate") this.#activatePresetRow(row);
 				return;
 			}
 			if (this.#isBrowserView(entry) && this.#browser.routePickerItem(event.item, event.kind === "activate")) {
@@ -3727,6 +4261,13 @@ export class ModelHubComponent implements Component {
 			if (!rolesView || this.#strip) return;
 			this.#focus = "list";
 			this.#runRolesAction(action);
+			return;
+		}
+		if (act.startsWith("presets:")) {
+			const action = act.slice("presets:".length) as PresetsAction;
+			if (!presetsView || this.#strip) return;
+			this.#focus = "list";
+			this.#runPresetsAction(action);
 			return;
 		}
 		switch (act) {
@@ -3822,7 +4363,16 @@ export class ModelHubComponent implements Component {
 				[
 					text([span(preset ? "Preset name:" : "New role name:", "accent")]),
 					col([strip.input], { grow: 1 }),
-					text([span("(letters, digits, - and _)", "dim")]),
+					text([
+						this.#presetNameError
+							? span(this.#presetNameError, "error")
+							: span(
+									preset
+										? "(start with a letter; letters, digits, space, - and _)"
+										: "(letters, digits, - and _)",
+									"dim",
+								),
+					]),
 				],
 				preset ? "presetName" : "roleName",
 			);
@@ -3891,7 +4441,7 @@ export class ModelHubComponent implements Component {
 						: "assign";
 			return [keys(pick, "enter"), upDown("models"), keys("providers", "left"), search, kind, cancel("cancel")];
 		}
-		const presetHint = this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right") : undefined;
+		const presetHint = this.#canSwitchPresets() ? keys("preset", "ctrl+left", "ctrl+right") : undefined;
 		const entry = this.#activeEntry();
 		if (entry.kind === "roles") {
 			if (this.#focus !== "list") {
@@ -3939,7 +4489,24 @@ export class ModelHubComponent implements Component {
 				reorder,
 				keys("new", "n"),
 				this.#callbacks.onSavePreset ? keys("save preset", "s") : undefined,
-				this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right", "p", "shift+p") : undefined,
+				this.#canSwitchPresets() ? keys("preset", "ctrl+left", "ctrl+right", "p", "shift+p") : undefined,
+			];
+		}
+		if (entry.kind === "presets") {
+			if (this.#focus !== "list") return [upDown("providers"), keys("presets", "right"), cancel("close")];
+			const row = this.#presetsRows[this.#presetIndex];
+			if (row?.kind === "preset" && this.#deleteArmed === row.name) {
+				return [keys(`again to delete "${row.name}"`, "x"), upDown("cancel")];
+			}
+			if (row?.kind === "newPreset") {
+				return [upDown("rows"), keys("save current as preset", "enter"), keys("providers", "left")];
+			}
+			return [
+				upDown("presets"),
+				keys("load", "enter"),
+				keys("save current", "s"),
+				keys("delete", "x"),
+				keys("providers", "left"),
 			];
 		}
 		if (entry.kind === "provider" && entry.locked) {

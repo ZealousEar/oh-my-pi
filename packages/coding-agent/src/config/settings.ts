@@ -48,14 +48,16 @@ import {
 	inheritWarnings,
 	lookup as lookupSetting,
 	resetRegistryForTest,
+	type SettingValueOf,
 	settingValuesEqual,
 	type ValueCacheEntry,
 	type WarnState,
 } from "./registry";
 // Registers every setting before any instance is read (definitions live next to their domains).
 import "./all-settings";
-import { cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
+import { cfgCycleOrder, cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
 import { cfgShellPath } from "../exec/settings";
+import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../session/settings";
 import { sharedSecretsFilePath, writeSharedSecret } from "./shared-secrets";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -222,6 +224,16 @@ function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
 		else delete container[segments[i]];
 		replacement = Object.keys(container).length > 0 ? container : undefined;
 	}
+}
+
+/** Whether `layer` owns every segment of `segments` as an own property chain. */
+function layerOwnsPath(layer: RawSettings, segments: readonly string[]): boolean {
+	let current: unknown = layer;
+	for (const segment of segments) {
+		if (!isRecord(current) || !Object.hasOwn(current, segment)) return false;
+		current = current[segment];
+	}
+	return true;
 }
 
 /** Whether `prefix` is `segments` or the path of one of its ancestors. */
@@ -498,7 +510,7 @@ function migrateNestedLeafRename(
 	}
 }
 
-function modelRoleValueFromUnknown(value: unknown): string | undefined {
+export function modelRoleValueFromUnknown(value: unknown): string | undefined {
 	if (typeof value === "string") return value;
 	if (!Array.isArray(value)) return undefined;
 
@@ -609,6 +621,44 @@ function physicalTargetSegments(target: string, pathApi: typeof path = path): st
 	return body.split(separator);
 }
 
+/** Settings pinned/restored as a unit by the runtime routing plan. */
+const RUNTIME_ROUTING_SETTINGS = [
+	cfgModelRoles,
+	cfgRetryFallbackChains,
+	cfgCycleOrder,
+	cfgDefaultThinkingLevel,
+] as const satisfies readonly AnySetting[];
+
+export type RuntimeRoutingPath = (typeof RUNTIME_ROUTING_SETTINGS)[number]["id"];
+
+/**
+ * Session-scoped routing override applied as a single transaction by
+ * {@link Settings.applyRuntimeRoutingPlan}. Runtime-only; never persisted.
+ */
+export interface RuntimeRoutingPlan {
+	/** Role -> selector, pinned at the runtime override layer. */
+	roles: ReadOnlyDict<string>;
+	/** Roles absent from `roles` get a runtime `null` tombstone. */
+	clearRoles: Iterable<string>;
+	/** Exact effective `retry.fallbackChains` after apply (empty = no chains). */
+	fallbackChains: Record<string, string[]>;
+	/** Exact `cycleOrder` after apply. */
+	cycleOrder: string[];
+	/** Effective `defaultThinkingLevel` after apply. */
+	defaultThinkingLevel: SettingValueOf<typeof cfgDefaultThinkingLevel>;
+}
+
+/**
+ * Opaque capture of the runtime-override routing state, produced by
+ * {@link Settings.snapshotRuntimeRoutingState} and consumed by
+ * {@link Settings.restoreRuntimeRoutingState}. Treat as a black box.
+ */
+export interface RuntimeRoutingSnapshot {
+	readonly overrides: Readonly<Record<RuntimeRoutingPath, { readonly present: boolean; readonly value: unknown }>>;
+	readonly exactPaths: readonly RuntimeRoutingPath[];
+	readonly savedRoleCaptures: ReadonlyArray<readonly [string, string | null | undefined]>;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
@@ -644,6 +694,13 @@ export class Settings {
 	#overrides: RawSettings = {};
 	/** Settings whose runtime override is a soft-pinned default ({@link pinDefaultValue}). */
 	#softPins = new Set<AnySetting>();
+	/**
+	 * Ids of settings whose runtime override replaces the merged value verbatim (no deep merge
+	 * with lower layers). A path installed by {@link applyRuntimeRoutingPlan} also marks that
+	 * override as the active preset value, so an explicit persisted edit updates the running plan.
+	 * A plain handle `override` / `clearOverride` removes that linkage.
+	 */
+	#exactOverridePaths = new Set<string>();
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
 	/** Monotonic revision of merged layers and cwd-scoped resolution. */
@@ -682,10 +739,10 @@ export class Settings {
 	 * Original process-wide model-role overrides captured before a project edit
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
 	 * on `reloadForCwd` / `cloneForCwd` so destination projects never inherit the
-	 * source-project value. Maps role → original override value (`undefined`
-	 * when the role had no runtime override).
+	 * source-project value. Maps role → original override value (`null` when the
+	 * role was tombstoned, `undefined` when the role had no runtime override).
 	 */
-	#savedRuntimeModelRoleOverrides = new Map<string, string | undefined>();
+	#savedRuntimeModelRoleOverrides = new Map<string, string | null | undefined>();
 
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
@@ -968,13 +1025,21 @@ export class Settings {
 		if (layer === "override" && setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
-		if (layer === "override") this.#softPins.delete(setting);
+		if (layer === "override") {
+			this.#softPins.delete(setting);
+			// A plain override leaves preset exact-replacement semantics behind.
+			this.#exactOverridePaths.delete(setting.id);
+		}
 		const prev = setting.get(this);
 		// Re-setting the persisted global value is a no-op for config.yml: staging it would still
 		// queue a full re-read, rewrite, fsync, and rename of the file.
 		const persistGlobal = layer === "global" && !this.#globalWriteIsNoop(setting.segments, value);
 		if (layer === "global") {
 			if (persistGlobal) this.#stageGlobal(setting.segments, value);
+			// An explicit persisted edit of a path pinned by the active routing plan updates the plan too.
+			if (this.#exactOverridePaths.has(setting.id)) {
+				setByPath(this.#overrides, setting.segments, structuredClone(value));
+			}
 			this.#releaseSoftPin(setting);
 		} else {
 			setByPath(this.#overrides, setting.segments, value);
@@ -1022,13 +1087,22 @@ export class Settings {
 			value !== undefined
 				? !this.#globalWriteIsNoop([...setting.segments, key], value)
 				: isRecord(record) && Object.hasOwn(record, key);
-		if (!staged && !this.#softPins.has(setting)) return;
+		const pinned = this.#exactOverridePaths.has(setting.id);
+		if (!staged && !pinned && !this.#softPins.has(setting)) return;
 		const prev = setting.get(this);
 		this.#releaseSoftPin(setting);
 		if (staged) {
 			// Replace rather than mutate the record: the merged view and cached reads may share it.
 			if (isRecord(record)) setByPath(this.#global, setting.segments, { ...record });
 			this.#stageGlobal([...setting.segments, key], value);
+		}
+		if (pinned) {
+			// An explicit persisted edit of a record pinned by the active routing plan updates the plan's entry too.
+			const override = getByPath(this.#overrides, setting.segments);
+			const next: RawSettings = isRecord(override) ? { ...override } : {};
+			if (value === undefined) delete next[key];
+			else next[key] = structuredClone(value);
+			setByPath(this.#overrides, setting.segments, next);
 		}
 		this.#rebuildMerged();
 		if (staged) this.#queueSave();
@@ -1125,7 +1199,7 @@ export class Settings {
 	 */
 	#settlePins(layers: OwnLayers): AnySetting[] {
 		if (this.#softPins.size === 0) return [];
-		const persisted = this.#mergeOverParent(this.#mergeOwnLayers({ ...layers, overrides: {} }));
+		const persisted = this.#mergeLayers({ ...layers, overrides: {} });
 		const settled = [...this.#softPins].filter(setting => {
 			const value = getByPath(persisted, setting.segments);
 			return value !== undefined && value !== null;
@@ -1142,6 +1216,7 @@ export class Settings {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
 		this.#softPins.delete(setting);
+		this.#exactOverridePaths.delete(setting.id);
 		if (getByPath(this.#overrides, setting.segments) === undefined) return;
 		const prev = setting.get(this);
 		deleteByPath(this.#overrides, setting.segments);
@@ -1386,6 +1461,7 @@ export class Settings {
 		const layers = { ...cloned.#ownLayers(), overrides: this.#buildOriginalOverrides() };
 		for (const setting of cloned.#settlePins(layers)) cloned.#softPins.delete(setting);
 		cloned.#overrides = layers.overrides;
+		cloned.#exactOverridePaths = new Set(this.#exactOverridePaths);
 		cloned.#rebuildMerged();
 		inheritWarnings(cloned, this);
 		cloned.#validateAll();
@@ -1495,7 +1571,7 @@ export class Settings {
 				adopted.push(refresh);
 			}
 			const settled = this.#settlePins(layers);
-			if (!keepLastGood) this.#validateAll(this.#mergeOverParent(this.#mergeOwnLayers(layers)), this.#cwd);
+			if (!keepLastGood) this.#validateAll(this.#mergeLayers(layers), this.#cwd);
 
 			const previous = this.#snapshot();
 			for (const refresh of adopted) refresh.commit();
@@ -1518,7 +1594,7 @@ export class Settings {
 		const committed = { ...layers };
 		this.#settlePins(committed);
 		try {
-			this.#validateAll(this.#mergeOverParent(this.#mergeOwnLayers(committed)), this.#cwd);
+			this.#validateAll(this.#mergeLayers(committed), this.#cwd);
 			return true;
 		} catch (error) {
 			logger.warn("Settings: keeping last good config; on-disk change is invalid", {
@@ -1568,7 +1644,7 @@ export class Settings {
 					this.#savedRuntimeModelRoleOverrides.size === 0 ? this.#overrides : this.#buildOriginalOverrides(),
 			};
 			const settledPins = this.#settlePins(candidate);
-			this.#validateAll(this.#mergeOverParent(this.#mergeOwnLayers(candidate)), normalized);
+			this.#validateAll(this.#mergeLayers(candidate), normalized);
 
 			const previous = this.#snapshot();
 			this.#cwd = normalized;
@@ -1655,7 +1731,7 @@ export class Settings {
 		own = this.#deepMerge(own, this.#configOverlay);
 		own = this.#deepMerge(own, this.#overrides);
 		const trusted = this.#parent ? this.#deepMerge(this.#parent.getTrustedCapabilitySettings(), own) : own;
-		return structuredClone(trusted);
+		return structuredClone(this.#applyExactOverrides(trusted, this.#overrides));
 	}
 
 	getPlansDirectory(): string {
@@ -1723,13 +1799,49 @@ export class Settings {
 	}
 
 	/**
+	 * Read the runtime override layer's `modelRoles` map PRESERVING `null`
+	 * tombstones (installed by {@link applyRuntimeRoutingPlan}). Every rebuild
+	 * of the runtime map must go through this — `#modelRolesFromLayer` drops
+	 * non-strings, which would silently erase tombstones.
+	 */
+	#runtimeModelRolesWithTombstones(): Record<string, string | null> {
+		const value = getByPath(this.#overrides, ["modelRoles"]);
+		if (!isRecord(value)) return {};
+
+		const roles: Record<string, string | null> = {};
+		for (const role in value) {
+			if (!Object.hasOwn(value, role)) continue;
+			if (value[role] === null) {
+				roles[role] = null;
+				continue;
+			}
+			const modelId = modelRoleValueFromUnknown(value[role]);
+			if (modelId !== undefined) {
+				roles[role] = modelId;
+			}
+		}
+		return roles;
+	}
+
+	/**
+	 * Whether a project/global role edit must be mirrored into the runtime `modelRoles` map: the
+	 * runtime layer owns the role, or the map is exact-replaced by an active routing plan (then
+	 * every role lives there, tombstoned or not).
+	 */
+	#runtimeModelRolesTrack(role: ModelRole | string): boolean {
+		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
+		if (!isRecord(runtimeOverrides)) return false;
+		return Object.hasOwn(runtimeOverrides, role) || this.#exactOverridePaths.has(cfgModelRoles.id);
+	}
+
+	/**
 	 * Set the full `modelRoles` map on the runtime override layer without
 	 * routing through the public {@link override} method. Internal callers
 	 * (project edits, global fallback updates) use this so they can control
 	 * capture invalidation independently of the whole-map replacement
 	 * semantics that `override("modelRoles", …)` carries.
 	 */
-	#setRuntimeModelRoleOverrides(next: Record<string, string>): void {
+	#setRuntimeModelRoleOverrides(next: Record<string, string | null>): void {
 		const prev = cfgModelRoles.get(this);
 		setByPath(this.#overrides, ["modelRoles"], next);
 		this.#rebuildMerged();
@@ -1737,10 +1849,9 @@ export class Settings {
 	}
 
 	#updateRuntimeModelRoleOverride(role: ModelRole | string, modelId: string | undefined): void {
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
+		if (!this.#runtimeModelRolesTrack(role)) return;
 
-		const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
+		const nextRuntimeOverride = this.#runtimeModelRolesWithTombstones();
 		if (modelId === undefined) {
 			delete nextRuntimeOverride[role];
 		} else {
@@ -1757,9 +1868,8 @@ export class Settings {
 	 */
 	#captureRuntimeModelRoleOverride(role: ModelRole | string): void {
 		if (this.#savedRuntimeModelRoleOverrides.has(role)) return;
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		if (!isRecord(runtimeOverrides) || !Object.hasOwn(runtimeOverrides, role)) return;
-		this.#savedRuntimeModelRoleOverrides.set(role, this.#modelRolesFromLayer(this.#overrides)[role]);
+		if (!this.#runtimeModelRolesTrack(role)) return;
+		this.#savedRuntimeModelRoleOverrides.set(role, this.#runtimeModelRolesWithTombstones()[role]);
 	}
 
 	/**
@@ -1910,7 +2020,9 @@ export class Settings {
 	 * tombstone.
 	 */
 	getModelRoleProvenance(role: ModelRole | string): SettingProvenance {
-		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
+		if (this.#exactOverridePaths.has(cfgModelRoles.id) || this.#modelRoleLayerOwns(this.#overrides, role)) {
+			return "runtime";
+		}
 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
 		if (this.#modelRoleLayerOwns(projectLayerForMerge(this.#project), role)) return "project";
 		if (this.#modelRoleLayerOwns(this.#global, role)) return "global";
@@ -1974,11 +2086,26 @@ export class Settings {
 		return normalized;
 	}
 
+	/**
+	 * Union of OWN `modelRoles` keys across the runtime-override, config-overlay,
+	 * project (raw, unfiltered), and global layers — including keys whose runtime
+	 * value is a `null` tombstone. An {@link overlay} includes its parent's keys.
+	 */
+	getAllModelRoleKeys(): string[] {
+		const keys = new Set<string>(this.#parent?.getAllModelRoleKeys());
+		for (const layer of [this.#overrides, this.#configOverlay, this.#project, this.#global]) {
+			const value = getByPath(layer, ["modelRoles"]);
+			if (!isRecord(value)) continue;
+			for (const role of Object.keys(value)) keys.add(role);
+		}
+		return [...keys];
+	}
+
 	/*
 	 * Override model roles (helper for modelRoles record).
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = this.#modelRolesFromLayer(this.#overrides);
+		const next = this.#runtimeModelRolesWithTombstones();
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
 				next[role] = modelId;
@@ -1986,6 +2113,86 @@ export class Settings {
 			}
 		}
 		this.#setRuntimeModelRoleOverrides(next);
+	}
+
+	/**
+	 * Install a session-scoped routing override that makes the plan the exact
+	 * effective routing state. Every entry in `plan.roles` is pinned at the
+	 * runtime layer, and every role in `plan.clearRoles` that is absent from
+	 * `plan.roles` is tombstoned with `null`. The whole `modelRoles` path is
+	 * exact-replaced as well, so roles first discovered on a later reload or
+	 * project switch cannot leak through. Every routing path remains linked to
+	 * its active preset override so a later explicit persisted edit immediately
+	 * updates the running plan. One rebuild, then change events fire strictly
+	 * afterwards so observers only ever see the final complete plan.
+	 * Runtime-only; never persisted.
+	 */
+	applyRuntimeRoutingPlan(plan: RuntimeRoutingPlan): void {
+		const prev = RUNTIME_ROUTING_SETTINGS.map(setting => setting.get(this));
+
+		const nextRoles: Record<string, string | null> = {};
+		for (const role of plan.clearRoles) nextRoles[role] = null;
+		for (const [role, modelId] of Object.entries(plan.roles)) {
+			if (modelId) nextRoles[role] = modelId;
+		}
+		this.#savedRuntimeModelRoleOverrides.clear();
+		setByPath(this.#overrides, cfgModelRoles.segments, nextRoles);
+		setByPath(this.#overrides, cfgRetryFallbackChains.segments, structuredClone(plan.fallbackChains));
+		setByPath(this.#overrides, cfgCycleOrder.segments, [...plan.cycleOrder]);
+		setByPath(this.#overrides, cfgDefaultThinkingLevel.segments, plan.defaultThinkingLevel);
+		for (const setting of RUNTIME_ROUTING_SETTINGS) {
+			this.#softPins.delete(setting);
+			this.#exactOverridePaths.add(setting.id);
+		}
+		this.#rebuildMerged();
+		RUNTIME_ROUTING_SETTINGS.forEach((setting, i) => this.#fireIfChanged(setting, prev[i]));
+	}
+
+	/**
+	 * Capture the runtime-override state of every routing path (presence +
+	 * deep-cloned value), the exact-replace flags, and the saved runtime role
+	 * captures, so {@link restoreRuntimeRoutingState} can roll back a failed
+	 * {@link applyRuntimeRoutingPlan} exactly.
+	 */
+	snapshotRuntimeRoutingState(): RuntimeRoutingSnapshot {
+		const overrides = {} as Record<RuntimeRoutingPath, { present: boolean; value: unknown }>;
+		for (const setting of RUNTIME_ROUTING_SETTINGS) {
+			const present = layerOwnsPath(this.#overrides, setting.segments);
+			overrides[setting.id] = {
+				present,
+				value: present ? structuredClone(getByPath(this.#overrides, setting.segments)) : undefined,
+			};
+		}
+		return {
+			overrides,
+			exactPaths: RUNTIME_ROUTING_SETTINGS.filter(setting => this.#exactOverridePaths.has(setting.id)).map(
+				setting => setting.id,
+			),
+			savedRoleCaptures: [...this.#savedRuntimeModelRoleOverrides],
+		};
+	}
+
+	/**
+	 * Restore the runtime-override routing state captured by
+	 * {@link snapshotRuntimeRoutingState}: override values (deleting paths that
+	 * were absent), exact-replace flags, and saved runtime role captures. One
+	 * rebuild, then change events fire for each effectively-changed path.
+	 */
+	restoreRuntimeRoutingState(snap: RuntimeRoutingSnapshot): void {
+		const prev = RUNTIME_ROUTING_SETTINGS.map(setting => setting.get(this));
+		for (const setting of RUNTIME_ROUTING_SETTINGS) {
+			const state = snap.overrides[setting.id];
+			if (state.present) {
+				setByPath(this.#overrides, setting.segments, structuredClone(state.value));
+			} else {
+				deleteByPath(this.#overrides, setting.segments);
+			}
+			this.#exactOverridePaths.delete(setting.id);
+		}
+		for (const id of snap.exactPaths) this.#exactOverridePaths.add(id);
+		this.#savedRuntimeModelRoleOverrides = new Map(snap.savedRoleCaptures);
+		this.#rebuildMerged();
+		RUNTIME_ROUTING_SETTINGS.forEach((setting, i) => this.#fireIfChanged(setting, prev[i]));
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -3987,7 +4194,7 @@ export class Settings {
 	#rebuildMerged(): void {
 		this.#revision++;
 		if (this.#parent) this.#syncedParentRevision = this.#parent.revision;
-		this.#merged = this.#mergeOverParent(this.#mergeOwnLayers(this.#ownLayers()));
+		this.#merged = this.#mergeLayers(this.#ownLayers());
 	}
 
 	#ownLayers(): OwnLayers {
@@ -4009,6 +4216,24 @@ export class Settings {
 	/** `own` merged over an overlay parent's current view (itself for a root instance). */
 	#mergeOverParent(own: RawSettings): RawSettings {
 		return this.#parent ? this.#deepMerge(this.#parent.#mergedView(), own) : own;
+	}
+
+	/** `layers` merged over the parent view, then exact-replace paths take `layers.overrides`' value verbatim. */
+	#mergeLayers(layers: OwnLayers): RawSettings {
+		return this.#applyExactOverrides(this.#mergeOverParent(this.#mergeOwnLayers(layers)), layers.overrides);
+	}
+
+	/**
+	 * Exact-replace paths ({@link #exactOverridePaths}): the override layer's value wins verbatim, so
+	 * the deep merge must not resurrect keys from lower layers or the parent. Mutates and returns `merged`.
+	 */
+	#applyExactOverrides(merged: RawSettings, overrides: RawSettings): RawSettings {
+		for (const id of this.#exactOverridePaths) {
+			const segments = id.split(".");
+			if (!layerOwnsPath(overrides, segments)) continue;
+			setByPath(merged, segments, getByPath(overrides, segments));
+		}
+		return merged;
 	}
 
 	/**
