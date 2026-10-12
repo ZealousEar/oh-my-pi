@@ -53,6 +53,8 @@ export interface ServiceStart {
 	 * name (`local://…`, a URL `cwd`), then the functions and aliases of the session starting it.
 	 */
 	seed?: string;
+	/** Total wall-clock lifetime in seconds across restarts; the broker stops the process tree when it elapses. */
+	lifetime?: number;
 }
 
 /** The script a service's shell sources, beside the daemon's other per-service files. */
@@ -334,6 +336,7 @@ export async function startService(
 	if (ready?.port !== undefined && (!Number.isInteger(ready.port) || ready.port < 1 || ready.port > 65_535))
 		throw new ToolError("ready.port must be an integer from 1 to 65535");
 	if (ready && !ready.log && ready.port === undefined) throw new ToolError("ready requires log or port");
+	if (params.lifetime !== undefined && !(params.lifetime > 0)) throw new ToolError("lifetime must be > 0 seconds");
 	if (ready?.log) {
 		try {
 			new RegExp(ready.log, DAEMON_OUTPUT_PATTERN_FLAGS);
@@ -366,6 +369,7 @@ export async function startService(
 				}
 			: undefined,
 		notify: params.notify,
+		...(params.lifetime === undefined ? {} : { lifetimeMs: Math.round(params.lifetime * 1_000) }),
 	};
 	const persist = cfgLaunchPersist.get(session.settings);
 	// Session services live on this process's lease; persistent ones until stopped.
@@ -528,5 +532,10 @@ export async function modeService(
 export function serviceStatus(unit: UnitSnapshot): string {
 	const age = formatDuration(Math.max(0, (unit.exitedAt ?? Date.now()) - unit.startedAt));
 	const pid = unit.pids[0];
-	return `${unit.key} [service] — ${unit.state} — up ${age}${pid === undefined ? "" : ` — pid ${pid}`}${unit.policy.hold === "persist" ? " — persistent" : ""}${unit.policy.hold === "detached" ? " — detached" : ""}${unit.adopted ? " — adopted" : ""}`;
+	const lifetime =
+		unit.exitedAt === undefined && unit.deadlineAt !== undefined
+			? ` — lifetime left ${formatDuration(Math.max(0, unit.deadlineAt - Date.now()))}`
+			: "";
+	const reason = unit.exitedAt !== undefined && unit.exitReason ? ` — ${replaceTabs(unit.exitReason)}` : "";
+	return `${unit.key} [service] — ${unit.state} — up ${age}${pid === undefined ? "" : ` — pid ${pid}`}${lifetime}${unit.policy.hold === "persist" ? " — persistent" : ""}${unit.policy.hold === "detached" ? " — detached" : ""}${unit.adopted ? " — adopted" : ""}${reason}`;
 }
