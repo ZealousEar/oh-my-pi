@@ -15,7 +15,6 @@ import {
 	deleteModelPreset,
 	formatModelPresetSwitch,
 	getModelPresetNames,
-	isCleanModelPresetSwitch,
 	isValidModelPresetName,
 	modelPresetSavedMessage,
 	type ModelPresetSession,
@@ -829,14 +828,18 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "modelpreset",
 		icon: "model",
-		description: "Save and switch model presets (role models + thinking level)",
+		description: "Save and switch model presets (role models, fallback chains, cycle order, thinking level)",
 		acpDescription: "Manage model presets",
 		acpInputHint: "[list|save|switch|delete] [name]",
 		inlineHint: "[save|switch|delete|list] [name]",
 		subcommands: [
 			{ name: "list", description: "List saved presets" },
-			{ name: "save", description: "Save the current role models and thinking level", usage: "<name>" },
-			{ name: "switch", description: "Apply a saved preset", usage: "<name>" },
+			{
+				name: "save",
+				description: "Save the current routing setup (roles, chains, cycle, thinking)",
+				usage: "<name>",
+			},
+			{ name: "switch", description: "Apply a saved preset for this session (never persisted)", usage: "<name>" },
 			{ name: "delete", description: "Delete a saved preset", usage: "<name>" },
 		],
 		allowArgs: true,
@@ -959,7 +962,7 @@ async function runPresetsCommand(
 			if (!name) return { message: "Usage: /modelpreset save <name>", usage: true };
 			if (!isValidModelPresetName(name)) {
 				return {
-					message: `Invalid preset name "${name}": use a letter, then letters, digits, - or _`,
+					message: `Invalid preset name "${name}": use a letter, then letters, digits, space, - or _`,
 					usage: true,
 				};
 			}
@@ -969,13 +972,12 @@ async function runPresetsCommand(
 		case "switch": {
 			if (!name) return { message: "Usage: /modelpreset switch <name>", usage: true };
 			const result = await applyModelPreset(settings, session, name);
-			const message = formatModelPresetSwitch(name, result);
-			const wroteRoles = result.kind === "switched" || result.kind === "failed";
+			// Session-scoped: nothing is persisted, but the effective routing changed for hosts that mirror it.
 			return {
-				message,
-				failed: !isCleanModelPresetSwitch(result),
-				switched: result.kind === "switched",
-				changedConfig: wroteRoles,
+				message: formatModelPresetSwitch(name, result),
+				failed: !result.applied,
+				switched: result.applied,
+				changedConfig: result.applied,
 			};
 		}
 		case "delete": {
