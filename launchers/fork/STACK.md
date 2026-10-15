@@ -1,4 +1,4 @@
-# ompd fork stack (fork/stack-18.6.1 on v18.6.1)
+# ompd fork stack (fork/stack-18.11.0 on v18.11.0; previously fork/stack-18.6.1 on v18.6.1, synced 2026-10-15 via fork-sync)
 
 Final tree == 33ed76aea5. Built file-level from the squashed port; settings.ts/docs/settings.md split in two steps (core = pre-presets 925ffc71f6 version, presets = final). Other shared files (main.ts, settings modules, rpc wire, judgment) live wholesale in the core commit. Intermediate commits NOT type-checked.
 

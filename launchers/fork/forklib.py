@@ -115,22 +115,21 @@ def describe_tag(conf: dict, rev: str) -> str:
 def base_tag(conf: dict, ref: str = "HEAD") -> str:
     """Upstream tag the fork stack sits on.
 
-    BASE_TAG (conf or FORK_BASE_TAG env) wins. Otherwise: newest v* tag reachable from
-    merge-base(ref, UPSTREAM_REMOTE/UPSTREAM_BRANCH). Cross-checked against the nearest v* tag
-    reachable from ref itself (fork commits carry no tags): if upstream's branch is stale the
-    merge-base lags, so the nearer tag wins, with a warning."""
+    BASE_TAG (conf or FORK_BASE_TAG env) wins. Otherwise the nearest v* tag reachable from ref:
+    fork-sync rebases the stack directly onto a tag and fork commits carry no tags, so that is
+    the base. Only when ref reaches no tag at all (shallow clone) fall back to the newest v* tag
+    reachable from merge-base(ref, UPSTREAM_REMOTE/UPSTREAM_BRANCH), which lags when the
+    upstream branch is stale."""
     if conf["BASE_TAG"]:
         tag = conf["BASE_TAG"]
     else:
-        upstream = f"{conf['UPSTREAM_REMOTE']}/{conf['UPSTREAM_BRANCH']}"
-        mb = git(conf, "merge-base", ref, upstream, check=False)
-        tag = describe_tag(conf, mb) if mb else ""
-        nearest = describe_tag(conf, ref)
+        tag = describe_tag(conf, ref)
         if not tag:
-            tag = nearest
-        elif nearest and nearest != tag:
-            warn(f"merge-base with {upstream} describes as {tag}, but {ref} sits on {nearest}; using {nearest}")
-            tag = nearest
+            upstream = f"{conf['UPSTREAM_REMOTE']}/{conf['UPSTREAM_BRANCH']}"
+            mb = git(conf, "merge-base", ref, upstream, check=False)
+            tag = describe_tag(conf, mb) if mb else ""
+            if tag:
+                warn(f"{ref} reaches no v* tag; using {tag} from merge-base with {upstream}")
     if not tag:
         die(f"cannot derive the base tag of {ref}; set BASE_TAG in {CONF_FILE} or FORK_BASE_TAG")
     if run(["git", "merge-base", "--is-ancestor", tag, ref], cwd=conf["CHECKOUT"]).returncode != 0:
