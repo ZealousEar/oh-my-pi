@@ -6,8 +6,8 @@
 # disabled so an API key inherited from the shell environment (e.g. FIREWORKS_API_KEY from
 # ~/.zshenv) can never become the silently selected default. With no login yet, no model
 # resolves and the TUI shows the pending-login state instead of a paid fallback.
-# Generated from /Users/farhad/Code/omp-fork/packages/catalog/src/models.json: 74 catalog providers
-# - 7 allowed (anthropic, local, openai-codex, opencode-go, openrouter, typesafe, web) + 3 keyless local discoverables = 70 denied ids.
+# Generated from /Users/farhad/Code/omp-fork/packages/catalog/src/models.json: 78 catalog providers
+# - 7 allowed (anthropic, local, openai-codex, opencode-go, openrouter, typesafe, web) + 3 keyless local discoverables = 74 denied ids.
 disabledProviders:
   - abliteration
   - aiand
@@ -21,7 +21,9 @@ disabledProviders:
   - cerebras
   - cline-pass
   - cloudflare-ai-gateway
+  - cloudflare-workers-ai
   - commandcode
+  - coralbricks
   - coreweave
   - cursor
   - deepinfra
@@ -59,6 +61,8 @@ disabledProviders:
   - qianfan
   - qwen-portal
   - sakana
+  - sambanova
+  - snowflake
   - stepfun
   - synthetic
   - together
