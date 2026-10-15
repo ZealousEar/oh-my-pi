@@ -17,7 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/webmcp";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { rejectionOf } from "../helpers/rejection";
-import { grantBrowserFixtureScope } from "./browser-scope";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -40,22 +40,25 @@ function headless(): PuppeteerBrowserHandle {
 	return sharedHeadless;
 }
 
-function createBrowserHost() {
-	const session: ToolSession = grantBrowserFixtureScope({
-		cwd: process.cwd(),
-		hasUI: false,
-		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
-		settings: Settings.isolated({
-			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
-			"browser.webkit": false,
-			"browser.enabled": true,
-			"browser.headless": true,
-			"browser.cmux": false,
-			"browser.tern": false,
-			"tools.maxTimeout": 0,
-		}),
-	});
+function createBrowserHost(extraTargets: readonly string[] = []) {
+	const session: ToolSession = grantBrowserFixtureScope(
+		{
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({
+				// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+				"browser.webkit": false,
+				"browser.enabled": true,
+				"browser.headless": true,
+				"browser.cmux": false,
+				"browser.tern": false,
+				"tools.maxTimeout": 0,
+			}),
+		},
+		extraTargets,
+	);
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown) => prelude.invoke(parameters, { session, toolCallId: "browser-webmcp-test" });
 }
@@ -278,7 +281,6 @@ document.modelContext.registerTool({
 	it(
 		"keeps a page alive whose same-site iframe is touched before it navigates",
 		async () => {
-			const invoke = createBrowserHost();
 			// Same site, other origin: the iframe shares the parent's renderer.
 			using child = Bun.serve({
 				port: 0,
@@ -312,6 +314,7 @@ context.registerTool({
 					),
 			});
 
+			const invoke = createBrowserHost([...loopbackOrigins(parent.port), ...loopbackOrigins(child.port)]);
 			await invoke({ action: "open", name: "webmcp-iframe", url: `http://localhost:${parent.port}/`, timeout: 10 });
 			expect(valueFrom<string>(await invoke(call("webmcp-iframe", "evaluate", ["document.title"])))).toBe(
 				"iframe loaded",
