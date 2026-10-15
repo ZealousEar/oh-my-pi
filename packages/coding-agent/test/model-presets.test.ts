@@ -1000,7 +1000,6 @@ describe("applyModelPreset over a live session", () => {
 		expect(session.model?.id).toBe("claude-opus-4-5");
 	});
 
-
 	it("reports when a higher layer still defines a just-saved preset name", async () => {
 		const settings = await projectSettings({
 			project: `modelPresets:\n  team:\n    version: 1\n    roles:\n      default: ${SONNET}\n    fallbackChains: {}\n    cycleOrder: []\n    defaultThinkingLevel: high\n`,
