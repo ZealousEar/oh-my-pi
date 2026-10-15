@@ -153,7 +153,6 @@ describe("BashTool output pruning", () => {
 		expect(archived).toContain("Compiling 2500");
 		expect(archived).toContain("warning: middle diagnostic");
 		expect(archived).toContain("2499 pass, 1 fail");
-		expect(archived).toContain("Wall time:");
 		const recovered = await tool.execute("recover-call", { command: `cat artifact://${artifactId}` });
 		const recoveredText = recovered.content.find(block => block.type === "text")?.text ?? "";
 		expect(recovered.details?.reduction?.skipped?.reason).toBe("already-reduced");

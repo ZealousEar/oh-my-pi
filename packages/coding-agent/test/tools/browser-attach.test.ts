@@ -684,6 +684,9 @@ describe("pickElectronTarget", () => {
 				// `onRequest` and worker init times out instead.
 				const error = await rejectionOf(
 					acquireTab(tabName, attached, {
+						// The open navigates the new tab, which the automation gate treats as a
+						// mutation: grant the loopback target so the test reaches interception.
+						session: grantBrowserFixtureScope(makeSession(), ["http://127.0.0.1:9"]),
 						// Loopback keeps a hypothetical interception miss local and
 						// loud (instant connection refusal, count 0) instead of
 						// wandering into DNS or a proxy.
