@@ -1,0 +1,6 @@
+gap,turns,prefix_rebuilds,rebuild_rate_pct,rebuild_tokens_M
+<1m,10101,23,0,6
+1-5m,1243,17,1,5
+5-15m,290,25,9,8
+15-60m,151,99,66,35
+>1h,47,41,87,9

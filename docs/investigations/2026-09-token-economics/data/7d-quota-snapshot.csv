@@ -1,0 +1,29 @@
+provider,account,label,window,max_used_fraction
+anthropic,acct1,Claude 5 Hour,5 Hour,0.08
+anthropic,acct1,Claude 7 Day,7 Day,0.77
+anthropic,acct1,Claude 7 Day (Fable),7 Day,1.0
+anthropic,acct2,Claude 5 Hour,5 Hour,0.22
+anthropic,acct2,Claude 7 Day,7 Day,0.75
+anthropic,acct2,Claude 7 Day (Fable),7 Day,1.0
+anthropic,acct3,Claude 5 Hour,5 Hour,0.16
+anthropic,acct3,Claude 7 Day,7 Day,0.6
+anthropic,acct3,Claude 7 Day (Fable),7 Day,0.91
+google-antigravity,acct1,Usage (Anthropic),Weekly,0.0
+google-antigravity,acct1,Usage (Google),5 Hour,0.42685320000000004
+google-antigravity,acct1,Usage (OpenAI),Weekly,0.0
+openai-codex,acct1,5 hours,5 hours,1.0
+openai-codex,acct1,5 hours (Spark),5 hours,0.0
+openai-codex,acct1,7 days,7 days,1.0
+openai-codex,acct1,7 days (Spark),7 days,0.0
+openai-codex,acct1,7 days (gpt-reserve),7 days,0.0
+openai-codex,acct2,5 hours (Spark),5 hours,0.0
+openai-codex,acct2,7 days,7 days,1.0
+openai-codex,acct2,7 days (Spark),7 days,0.0
+openai-codex,acct3,5 hours (Spark),5 hours,0.0
+openai-codex,acct3,7 days,7 days,1.0
+openai-codex,acct3,7 days (Spark),7 days,0.0
+openai-codex,acct4,5 hours (Spark),5 hours,0.0
+openai-codex,acct4,7 days,7 days,1.0
+openai-codex,acct4,7 days (Spark),7 days,0.0
+zai,acct1,ZAI 5 Hours Credit Quota,5 Hours,1.0
+zai,acct1,ZAI Weekly Credit Quota,Weekly,0.2061

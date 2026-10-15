@@ -1,0 +1,38 @@
+block,section,chars
+0,"<skills>",4705
+0,"# Bounded runs",4550
+0,"# Push state; never poll",3686
+0,"§ Delivery",1533
+0,"# Grill before building",1479
+0,"# 5. Verify",1290
+0,"# Internal URLs",1131
+0,"# Explain visually",947
+0,"# Specialized Tools",780
+0,"# Delegation",755
+0,"# xd:// Tool Devices",675
+0,"# Engineering",538
+0,"# Tone",454
+0,"§ Critical",415
+0,"# General",291
+0,"(preamble)",255
+0,"# 2. Research Before Editing",253
+0,"# Tool Inventory",210
+0,"# 4. Implement",179
+0,"# 6. Cleanup",178
+0,"# Escalation",161
+0,"# Tool I/O",156
+0,"# 3. Decompose",153
+0,"# Reasoning Format",121
+0,"# Exploration",99
+0,"# Succinct Patterns",86
+0,"# 1. Scope",86
+0,"# Personality",85
+0,"# AST",85
+0,"# Skills & Rules",67
+0,"§ Role",47
+0,"<generic-rules>",15
+0,"§ Tool Policy",13
+0,"§ Workflow",10
+0,"§ Runtime",9
+1,"<repo-rules> AGENTS.md",27769
+1,"<workstation>",~100
