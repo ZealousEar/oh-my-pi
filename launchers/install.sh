@@ -166,7 +166,7 @@ for profile in stock daily-fork dev-fork; do
 done
 
 # Synced profile layer. Fork profiles (ompd, ompdev) get one symlink per layer entry in
-# skills/ agents/ rules/ extensions/; every channel links models.yml. A real file at a link
+# skills/ agents/ rules/ extensions/ commands/; every channel links models.yml. A real file at a link
 # path is never replaced (move it into the layer first). Links whose layer entry was removed
 # are pruned; links to anything outside the layer are left alone.
 layer_link() { # layer_link <target> <link>
@@ -180,7 +180,7 @@ layer_link() { # layer_link <target> <link>
 }
 for profile in daily-fork dev-fork; do
 	root=$PROFILES/$profile/agent
-	for kind in skills agents rules extensions; do
+	for kind in skills agents rules extensions commands; do
 		mkdir -p "$root/$kind"
 		for src in "$LAYER/agent/$kind"/*; do
 			[ -e "$src" ] && layer_link "$src" "$root/$kind/$(basename "$src")"
@@ -190,6 +190,11 @@ for profile in daily-fork dev-fork; do
 			case $(readlink "$l") in "$LAYER"/*) [ -e "$l" ] || rm -f "$l" ;; esac
 		done
 	done
+done
+# Stock gets only the ompd update entry points (the procedure itself runs the fork tooling).
+for entry in commands/ompd-update.md rules/ompd-update.md; do
+	mkdir -p "$PROFILES/stock/agent/$(dirname "$entry")"
+	layer_link "$LAYER/agent/$entry" "$PROFILES/stock/agent/$entry"
 done
 for profile in stock daily-fork dev-fork; do
 	layer_link "$LAYER/agent/models.yml" "$PROFILES/$profile/agent/models.yml"
