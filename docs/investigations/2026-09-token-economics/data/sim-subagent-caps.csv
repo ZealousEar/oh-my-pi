@@ -1,0 +1,11 @@
+policy,tokens_B,delta_pct,compactions,handoffs,runs_affected
+none,5.93,0,0,0,0
+ctx96k/24k,2.43,-59,1157,0,542
+ctx150k/32k,3.32,-44,503,0,329
+ctx200k/48k,4.06,-32,266,0,196
+turn48+handoff,3.9,-34,0,440,254
+turn90+handoff,4.64,-22,0,133,88
+ctx150k/32k+turn90,3.29,-45,439,133,330
+ctx200k/48k+turn120,3.91,-34,228,70,198
+turn48+handoff P=10,3.44,-42,0,440,254
+turn48+handoff P=55,5.13,-14,0,440,254
