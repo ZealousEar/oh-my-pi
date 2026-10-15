@@ -1,0 +1,12 @@
+provider,model,messages,input_M,cache_read_M,output_M,nominal_usd,errors
+anthropic,claude-fable-5-1,15780,0.0,2938.1,12.02,4707,113
+openai-codex,gpt-5.6-sol,26168,70.7,2969.8,11.65,1941,89
+anthropic,claude-opus-5,10511,0.0,1795.0,9.6,1472,53
+anthropic,claude-fable-5,2524,0.0,344.3,1.99,571,13
+openai-codex,gpt-5.6-terra,3918,15.4,216.9,1.19,94,17
+anthropic,claude-opus-4-8,357,0.0,73.3,0.96,89,6
+fireworks,kimi-k3,98,0.2,7.5,0.06,4,0
+fireworks,glm-5.3,24,0.0,0.8,0.0,0,0
+openrouter,openai/gpt-5.6-sol,2,0.0,0.0,0.0,0,0
+openai-codex,gpt-5.6-luna,173,0.1,0.0,0.01,0,15
+openai-codex,gpt-6-astra,3373,7.7,343.6,0.75,0,18

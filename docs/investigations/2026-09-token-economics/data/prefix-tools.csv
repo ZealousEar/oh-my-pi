@@ -1,0 +1,13 @@
+tool,desc_chars,schema_chars,est_tokens
+edit,5235,108,1336
+task,2861,539,850
+eval,1707,496,551
+todo,862,676,385
+read,1212,174,347
+bash,641,615,314
+find,792,208,250
+grep,449,228,169
+web_search,187,301,122
+glob,298,171,117
+write,298,134,108
+wait,237,62,75
