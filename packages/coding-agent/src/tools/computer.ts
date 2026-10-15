@@ -305,13 +305,7 @@ async function invokeComputer(
 						context.toolCallId,
 						context.signal,
 					);
-					return await runComputer(
-						session,
-						controller,
-						params,
-						renderExpectedFocusGuard(code, expected),
-						context,
-					);
+					return await runComputer(session, controller, params, renderExpectedFocusGuard(code, expected), context);
 				},
 				context.signal,
 			);
