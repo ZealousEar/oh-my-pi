@@ -1,0 +1,9 @@
+class,turns,ctx_B,out_M,ctx_per_out
+bash/eval,16424,3.96,10.36,382
+read/search,10287,1.79,3.4,526
+edit/write,5475,1.31,6.8,193
+hub-only,3477,0.86,1.06,818
+text-only,2909,0.53,2.47,214
+other,2553,0.44,2.08,211
+todo-only,1346,0.25,0.4,623
+task-spawn,339,0.07,0.96,73

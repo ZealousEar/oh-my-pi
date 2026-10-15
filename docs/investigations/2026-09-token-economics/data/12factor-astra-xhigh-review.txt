@@ -1,0 +1,290 @@
+READ-ONLY RESEARCH SUBAGENT OUTPUT
+Model observed: openai-codex/gpt-6-astra
+Effort requested via CLI: xhigh
+Session: 01a0b144-6dcd-7000-b83a-79b2c02f1433
+Process exit: 0
+Inputs: public framework/vendor sources and a sanitised project charter; no historical logs.
+
+PARENT REVIEW: The proposed $25 experiment and fixed panel/threshold numbers below are recommendations from the subagent, NOT owner decisions or authorised execution. They are not adopted. Existing approved OpenRouter calibration ceiling remains $3 total; paid TypeSafe inference has no approval. The parent recommends a smaller, costed calibration before selecting sample size and gates.
+
+# Assessment
+
+**Adopt the engineering principles selectively; treat Jev as a replaceable judgment backend, not the organizing architecture of the fork.** The strongest fit is explicit control flow, recorded evidence, inspectable context construction, and human-controlled execution. The weakest fit is replacing general-purpose coding with predefined workflows or making confidence scores into authorization.
+
+**Near-term recommendation [INFERENCE]:** improve evidence and accounting at existing OMP boundaries, then evaluate one narrow, advisory judgment. Do not begin with a new provider adapter, aggressive context reduction, or a framework rewrite.
+
+## 1. What the evidence establishes
+
+### Architectural arguments—not measured guarantees
+
+HumanLayer’s [README](https://github.com/humanlayer/12-factor-agents) explicitly recommends incorporating small, modular agent concepts into existing products rather than undertaking greenfield framework rewrites. Its production-quality narrative rests on practitioner experience and conversations with builders, not a controlled comparison establishing that all twelve factors improve every workload.
+
+That supports the owner’s minimal-patch approach. It does **not** establish that shorter contexts, smaller agents, or predetermined workflows improve long-horizon coding.
+
+The supplied [Dillon Mulroy commentary](https://x.com/dillon_mulroy/status/2100427432918462897) expresses a useful compositional intuition, not benchmark evidence. The separately supplied “classify+action” quotation has unverified attribution; its technical proposition can be evaluated without assigning an author.
+
+### Observed documentation facts
+
+TypeSafe documents:
+
+- `POST /v1/systemone`: a `state`, model identifier, and named typed questions produce answers and usage.
+- **Choice:** a supplied option plus its probability distribution and confidence.
+- **Score:** a probability-weighted position across descriptive levels, not an arbitrary generated number.
+- **Noul:** probability that a yes/no proposition is true; no separate confidence field.
+- Questions share a state and are evaluated independently and in parallel.
+- Jev does not generate arbitrary text or code. Its function-calling cookbook fills **closed-set arguments**; unsupported open-ended arguments retain defaults in that example.
+- Current documented limits include 255 Choice options, 64k tokens across state and questions, and 32k across state plus the longest question.
+- The model documentation recommends pinning `jev-1.13.0` rather than moving aliases when thresholds depend on a version.
+
+Sources: [API](https://docs.typesafe.ai/api.md), [Choice](https://docs.typesafe.ai/primitives/choice.md), [Score](https://docs.typesafe.ai/primitives/score.md), [state](https://docs.typesafe.ai/concepts/state.md), [function calling](https://docs.typesafe.ai/cookbooks/function_calling.md), [models](https://docs.typesafe.ai/models.md), [limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md).
+
+These are facts about the published contract, not independently verified runtime behavior.
+
+### Vendor claims and vendor-produced empirical evidence
+
+The [announcement](https://typesafe.ai/blog/introducing-system-one-models-and-jev) claims calibrated decisions, 70–500 ms responses, and selected workflow gains of 193.6× speed and 444.6× cost. It also says Jev “can’t hallucinate,” qualifying that claim through schema conformance.
+
+The [workflow evaluation site](https://evals.typesafe.ai/) supplies vendor-produced comparative evidence, but:
+
+- It assumes the workflow code is correct.
+- Reference labels derive from GPT-6 Astra and Claude Fable 5.1 probabilities, not independent factual ground truth.
+- Four selected workflows cover security incidents, support-agent trace review, invoices, and customer service—not open-ended repository development.
+- Reference models use high thinking; evaluated models use provider-default reasoning.
+- The announcement acknowledges favorable demo inputs, possible capabilities-team selection bias, and probability-generating adapter overhead for competing LLMs.
+
+**Conclusion [INFERENCE]:** these results justify testing the primitive. They do not establish OMP quality preservation, long-horizon reliability, local calibration, or an end-to-end coding speedup. “Structure is always better,” as the evaluation page states, exceeds what those comparisons establish.
+
+The owner-reported OMP integration, PR simulations, and four-arm study remain separate evidence categories. This review did not independently audit their source or results.
+
+## 2. All twelve factors: adopt, adapt, or defer
+
+“Adopt” means retain the principle and fill demonstrated gaps—not reimplement an existing capability.
+
+| Canonical factor | Decision | Application to this fork |
+|---|---|---|
+| [01 — Natural language to tool calls](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-01-natural-language-to-tool-calls.md) | **Adapt** | Treat interpretation as a proposal. Separate action classification, parameter construction, validation, authorization, and execution. |
+| [02 — Own your prompts](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-02-own-your-prompts.md) | **Adopt** | Version prompts, judgment questions, criteria, tool schemas, and resolved settings. Record what was actually submitted, not merely the template name. |
+| [03 — Own your context window](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-03-own-your-context-window.md) | **Adapt** | Make model context an inspectable projection of retained evidence. Preserve authority boundaries and transformation lineage; smaller is not inherently better. |
+| [04 — Tools are structured outputs](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-04-tools-are-structured-outputs.md) | **Adopt** | A model-produced tool proposal must not itself execute or authorize anything. Deterministic code owns validation and invocation. |
+| [05 — Unify execution and business state](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-05-unify-execution-state.md) | **Adapt** | Use one logically linked event history with derived views. Do **not** make the current context window the authoritative store for permissions, spending, secrets, or completed effects. |
+| [06 — Launch/pause/resume](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-06-launch-pause-resume.md) | **Adopt** | Preserve an interruptible boundary between proposal and invocation. Durable resumption also needs action reconciliation, not just thread serialization. |
+| [07 — Contact humans with tool calls](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-07-contact-humans-with-tools.md) | **Adapt** | Record clarification, approval, rejection, and owner resolution explicitly. Mandatory pauses must not depend on a model remembering to request them. |
+| [08 — Own your control flow](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-08-own-your-control-flow.md) | **Adopt** | Code enforces permissions, budgets, cancellation, and fallback behavior while retaining a general coding loop. |
+| [09 — Compact errors into context](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-09-compact-errors.md) | **Adapt** | Give the model useful failure information and bounded recovery. Preserve underlying errors, failed attempts, and costs outside the compacted view. |
+| [10 — Small, focused agents](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-10-small-focused-agents.md) | **Adapt** | Use focused helpers where responsibilities and evidence contracts are stable. Reject a universal 3–20-step cap or compulsory decomposition of coding work. |
+| [11 — Trigger from anywhere](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-11-trigger-from-anywhere.md) | **Defer** | Slack/email/cron integrations add identity, privacy, and authorization surfaces without serving the immediate evidence objective. |
+| [12 — Stateless reducer](https://github.com/humanlayer/12-factor-agents/blob/main/content/factor-12-stateless-reducer.md) | **Adapt** | Deterministically reduce **recorded events** into state. Model calls and external effects remain nondeterministic boundaries whose results must be recorded. |
+
+Factor 12 is chiefly diagrammatic and explicitly presented as “mostly just for fun.” Its fold analogy is useful; it is not a durable-execution or deterministic-replay specification.
+
+## 3. Architecture that fits the charter
+
+### Separate interpretation from authority [INFERENCE]
+
+“Classify + action” omits several load-bearing boundaries:
+
+1. **Classification:** identify a candidate tool, handler, risk category, or need for clarification. Include `other`, `unknown`, and `insufficient evidence` where appropriate.
+2. **Parameter construction:** obtain paths, patches, commands, identifiers, and arguments through deterministic extraction, supplied candidates, or a generative model.
+3. **Validation:** check schemas, cross-field relationships, current resource state, paths, and preconditions.
+4. **Authorization:** apply the owner’s approved scope, data boundary, spending limit, and action policy.
+5. **Execution:** invoke through a controlled boundary and capture the outcome or receipt.
+6. **Reconciliation:** distinguish success, failure, cancellation, and an unknown outcome before retrying or resuming.
+
+Jev fits selected parts of steps 1–2 and advisory semantic checks. It cannot replace arbitrary code/patch generation. A valid enum can select the wrong repository, wrong operation, or wrong candidate.
+
+Approval should bind to the concrete action and relevant state—not a general model assertion that the action is safe. Material changes to scope, cost, reversibility, or intent require pushback and pause. Within the existing approved boundary, advise and proceed; do not turn every ordinary operation into a confirmation dialog. Record and respect the owner’s resolution.
+
+**Confidence never grants a capability, expands a spending limit, or substitutes for consent.**
+
+### Retain general-purpose coding [INFERENCE]
+
+A coding harness cannot predefine all useful investigations, discoveries, repairs, and planning changes. The appropriate hybrid is:
+
+- A general agent loop for open-ended reasoning and generation.
+- Deterministic policy and accounting around it.
+- Narrow typed judgments at stable decision points.
+- Small helpers only where their interface preserves the necessary evidence and shared constraints.
+
+Decomposition can lose cross-file invariants, introduce serial round trips, duplicate context, and produce incompatible local conclusions. Independent evaluation does not mean independent errors: questions can share a mistaken premise, omitted evidence, or injected instruction.
+
+TypeSafe’s own [limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md) document literal interpretation, weak numerical precision, difficulty with indirection, accuracy loss from irrelevant context, and adversarial steering of state. These are directly relevant to coding traces.
+
+Batch genuinely independent questions when useful. Do not batch dependent questions as though later decisions already possess earlier results. Measure the whole objective—including extra retrieval, repair, escalation, and owner interruption—not merely judgment-call latency.
+
+### Context lineage, not context destruction [INFERENCE]
+
+Keep three distinct layers:
+
+- **Private retained evidence:** permitted source events, tool results, model responses, and effect receipts.
+- **Derived artifacts:** summaries, compacted errors, retrieved selections, child reports, and extracted facts.
+- **Submitted requests:** the actual client-observed payload sent to each provider attempt.
+
+For each derivation, retain source references, transformation/version, ordering, omissions, and output identity. For each child, retain what it received and what the parent later incorporated.
+
+This permits a retrospective viewer to answer:
+
+- What evidence existed?
+- What did this model call actually receive?
+- What was omitted or transformed?
+- Which output affected which subsequent decision?
+
+Dropping information from a model’s context need not delete it from evidence storage. Conversely, a summary is not a lossless substitute for its sources.
+
+“Exact model inputs” must mean **exactly recorded client-submitted inputs**, subject to explicit credential exclusions. Provider-internal preprocessing and hidden reasoning are not observable. Returned reasoning fields, when available, are recorded outputs—not access to the model’s complete internal reasoning.
+
+### Replay has three different meanings [INFERENCE]
+
+| Replay mode | Defensible claim |
+|---|---|
+| **Recorded playback** | Display the requests, responses, transformations, and receipts that were retained. |
+| **Deterministic state reconstruction** | Rebuild state from recorded events using pinned reducer code and recorded nondeterministic inputs. |
+| **Counterfactual rerun** | Make new model/tool calls under a specified environment; results may differ and incur new costs or effects. |
+
+A reducer is not deterministic if replay silently calls a model again, reads the current filesystem, consults the clock, or reissues an external action.
+
+After a crash, “request sent, receipt absent” is an **unknown outcome**, not proof that execution failed. Use idempotency where supported; otherwise reconcile current state or pause. Thread restoration alone does not prevent duplicate actions.
+
+### Accounting must precede optimization [INFERENCE]
+
+Use the **user objective** as the aggregation unit, with explicit links through episodes, sessions, children, logical requests, and provider attempts. Preserve inferred segmentation as inferred.
+
+Include:
+
+- Successful and failed attempts, transport retries, repairs, and fallback calls.
+- Judges, compaction, orchestration, and child work.
+- Provider-reported usage, including applicable cache/reasoning categories.
+- Latency, waiting, cancellations, and owner-review burden.
+
+Keep separate:
+
+1. Token counts.
+2. Nominal dollar equivalents at recorded prices.
+3. Actual attributable charges.
+4. Quota consumption and attribution.
+
+Do not double-count child costs through parent aggregates. Do not assign shared-account quota changes to an experiment without evidence. Missing usage is unknown, not zero.
+
+This is especially important for Jev: its [JavaScript retry policy](https://docs.typesafe.ai/sdk/javascript/api/interfaces/RetryPolicy.md) defaults to two retries after the initial attempt. Its [client configuration](https://docs.typesafe.ai/sdk/javascript/api/interfaces/TypeSafeClientConfig.md) documents a per-attempt timeout, not a total retry budget. A successful final response is not an attempt ledger.
+
+The [published price](https://docs.typesafe.ai/models.md) is $0.042 per million input tokens with free output tokens; the API still reports output-token usage. “Free” and “zero usage” are different quantities.
+
+### Privacy remains an independent gate [INFERENCE]
+
+TypeSafe’s [privacy policy](https://typesafe.ai/legal/privacy-policy) says inputs are not used to train or fine-tune models. It nevertheless describes collection, processing, service-provider disclosure, US hosting, and retention for business purposes. That is not a zero-retention guarantee or permission to upload private history.
+
+Preserve the charter:
+
+- Raw permitted traces remain private with indefinite owner-controlled retention.
+- Known credentials stay out of recordings and external payloads.
+- Redaction gaps are explicit; do not claim byte-exact replay where material was excluded.
+- External historical analysis requires separately approved sanitized samples.
+- Publish sanitized protocols, findings, and patch provenance—not raw traces.
+
+The SDK’s debug logging deserves attention: its [configuration documentation](https://docs.typesafe.ai/sdk/javascript/api/interfaces/TypeSafeClientConfig.md) says known credential headers are redacted but bodies are not.
+
+## 4. Probabilities, judgments, and limitations
+
+**Type safety is useful but narrower than truth.** A schema-valid answer can be confidently wrong. The announcement’s “can’t hallucinate” wording should not enter the fork’s safety claims.
+
+The [confidence documentation](https://docs.typesafe.ai/confidence.md) defines confidence as a statistic derived from the returned distribution. It is not a documented probability-of-correctness contract. The [Score documentation](https://docs.typesafe.ai/primitives/score.md) explicitly says confidence 1.0 does not guarantee correctness and that different distributions can have the same mean score.
+
+Required evaluation discipline [INFERENCE]:
+
+- Measure calibration against objective or adjudicated labels using reliability plots and proper scoring rules such as Brier score/log loss.
+- Report false-clear rates, false alarms, abstention, and coverage by workload and risk class.
+- Keep full distributions; a single score can hide consequential tails.
+- Do not multiply marginal probabilities—or take their minimum—and call that the probability the whole workflow is correct.
+- Treat weighted scores as policy calculations, not automatically calibrated probabilities.
+- Revalidate after changes to model version, rubric, context construction, candidate set, or workload.
+- Use judges as supporting evidence, never sole authority for correctness or default promotion.
+
+Fallbacks need their own identity, cost, latency, and evaluation. A failed Jev call followed by a frontier-model answer is a **compound policy result**, not a Jev-only result. Missing advisory judgment should remain explicitly unavailable; it must not imply approval.
+
+Finally, automation can amplify overengineering. TypeSafe’s [composition guide](https://docs.typesafe.ai/concepts/how-to-build-with-system-one.md) advocates using code for deterministic work, yet its trace example asks model questions about schema conformance and exact identifier matching. Those checks belong in ordinary code when the necessary fields already exist.
+
+## 5. Practical sequencing
+
+1. **Audit evidence before changing behavior.**  
+   Start with the existing recent-four-week analysis, expand backward, and collect new sessions. Use observations to identify recurring decisions and accounting gaps—not to claim causal savings. Reserve held-out objectives before tuning.
+
+2. **Patch only demonstrated recording gaps.**  
+   Add objective/attempt linkage, resolved model and fallback identity, request/response references, context transformations, and usage provenance at existing boundaries. Keep this separate from routing, compaction, child caps, and retry-policy changes.
+
+3. **Verify existing judgment integration before adding anything.**  
+   The owner reports that OMP 18.2.4 already includes `Judge`, `TypeSafeJudge`, `TextJudge`, authentication, typed evaluation helpers, and several judgment consumers. A new adapter is therefore likely duplication, pending the parent’s source review. Reuse the existing boundary; change its contract only where required.
+
+4. **Run the narrow comparison below separately from the model-policy study.**  
+   Do not mix it into the [four-arm study](https://github.com/ZealousEar/oh-my-pi/issues/1). Keep the [historical-analysis proposals](https://github.com/ZealousEar/oh-my-pi/pull/2) categorized as proposals/simulations until measured. Missing attempt accounting—including reported soft-compaction limitations—can disqualify a comparison.
+
+5. **Promote through distinct gates.**  
+   Controlled evidence → individually approved opt-in real-work trial → owner-approved default promotion. Evaluate patches individually and the combined fork on pinned upstream. Keep quality-first as the default; label any cost/latency compromise explicitly.
+
+Defer broad workflow orchestration, new communication channels, generalized autonomous optimization, and self-modifying skills. Evidence-backed improvement can come later without granting the optimizer authority over evaluation, spending, or promotion.
+
+## 6. Bounded, falsifiable first experiment
+
+### Question
+
+**Can decomposed typed judgments detect misleading verification claims better than one holistic judgment, and does Jev improve that same architecture’s cost/latency without worsening its decisions?**
+
+This tests an evidence-review boundary—not whether code is correct, whether an objective is complete, or whether an action is authorized.
+
+### Scope and inputs
+
+Use **120 public or explicitly synthetic evidence packets**:
+
+- 24 development cases.
+- 96 held-out cases: 48 accurately qualified claims and 48 misleading/unsupported claims.
+- Split by source/task family before tuning; keep related mutations together.
+
+Each packet contains a fixed verification claim, relevant task requirement, artifact/revision identity, and supplied verification receipts. Include missing runs, failed checks, wrong revisions, partial coverage, unresolved contradictions, long-context distractors, and injected instructions in untrusted output.
+
+Synthetic receipts must be labeled as constructed fixtures, not represented as measured coding successes. No raw historical logs leave the owner’s boundary.
+
+Code checks exact facts—receipt identity, revision equality, exit status, missing results. Models assess only the semantic relationship between the claim and the evidence.
+
+### Separate comparisons
+
+| Arm | Configuration | Purpose |
+|---|---|---|
+| **D** | Deterministic checks only; unresolved semantics abstain | Establish whether a model adds useful coverage. |
+| **A** | One holistic judgment using a pinned existing generative backend | Baseline judgment architecture. |
+| **B** | Narrow typed questions plus a fixed reducer, using the **same backend as A** | Architecture comparison: **B versus A**. |
+| **C** | Identical questions, state, reducer, and decision contract as B, using pinned Jev | Backend comparison: **C versus B**. |
+
+B/C separately assess whether evidence concerns the claimed behavior, supports the claim’s strength, and leaves material contradictory evidence unresolved. The reducer can label a claim supported only when all required conditions pass; otherwise it flags review or abstains.
+
+Hold context construction constant. Do not simultaneously add retrieval filtering, compaction, model routing, or new retry policies. Backend-specific serialization may differ; semantic instructions must not.
+
+### Bounds and controls
+
+Proposed limits, requiring owner approval before execution:
+
+- Two repeats per case and model arm: **720 planned model requests**, including development cases.
+- **800 total provider attempts**, including all retries and repairs.
+- **$25 maximum billable exposure**, conservatively reserved before requests; stop if exposure cannot be bounded.
+- **90 minutes of owner review**, with unresolved labels excluded from correctness claims and reported.
+- No repository writes, tool execution, real stop decisions, approval decisions, or default changes.
+
+Freeze prompts, thresholds, versions, cases, and reducer after development. Randomize/interleave arm order. Disable silent backend substitution; failures become explicit abstentions. Count attempted requests even when responses or usage are missing.
+
+Use fixture-grounded labels and bounded blinded human adjudication—not model consensus as ground truth.
+
+### Preregistered pilot gates
+
+These are screening gates, not production safety guarantees:
+
+- **Architecture gate:** B produces fewer unsupported claims labeled “supported” than A; introduces no more than two additional false alarms on the 48 valid cases; and gives non-abstaining decisions on at least 60% of held-out cases. Its total judgment-path p95 latency and nominal cost must each remain within 1.25× A.
+- **Backend gate:** C produces zero false “supported” decisions on the held-out negative cases across both repeats, no more than two additional false alarms versus B, and at least B’s coverage minus five percentage points. Total judgment-path median cost and p95 latency must each improve by at least 25%.
+- **Simplicity gate:** if deterministic arm D provides comparable coverage and error performance, prefer D.
+- **Evidence gate:** every attempt must have an identity and accounting status; unknown usage must be explicit. Unbounded spend or missing decision provenance invalidates promotion.
+
+Report paired differences and uncertainty clustered by original case—not by question or repeat. Report distributions, calibration diagnostics, abstentions, failures, and all-in costs. A small sample cannot establish rare-error safety.
+
+If A already has zero false clears, this pilot cannot establish the specified architecture quality improvement; do not redefine success afterward. If B helps but C fails, keep the architectural result without adopting Jev. If C helps within B but B does not beat A, that does not justify restructuring the harness.
+
+**Passing earns only consideration for an owner-approved advisory trial.** Long-horizon coding benefits still require end-to-end objectives with objective checks and bounded owner review; frozen evidence packets cannot measure changes in investigation, repair, or user interaction.
+
+---
+
+**Research completed:** primary README, all twelve canonical factor documents—including Factor 12’s figures—and the relevant TypeSafe announcement, API, SDK, limitation, privacy, and evaluation sources were read. No private history, repository files, live inference, builds, or tests were accessed or run.
