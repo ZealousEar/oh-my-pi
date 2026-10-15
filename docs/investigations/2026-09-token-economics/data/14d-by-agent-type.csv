@@ -1,0 +1,4 @@
+agent_type,messages,input_M,cache_read_M,cache_write_M,output_M,avg_ctx
+advisor,24365,53.9,2698.7,12.4,9.63,113481
+main,18284,14.8,3695.0,93.8,12.56,208027
+subagent,20279,25.4,2295.6,55.5,16.04,117193
