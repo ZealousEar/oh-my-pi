@@ -181,7 +181,14 @@ export function getTaskSchema(options: {
 	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${visibleEnabled ? "visible" : "hidden"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, structured, visibleEnabled, defaultAgent });
+	const schema = createTaskSchema({
+		...options,
+		effortEnabled,
+		evalToolsEnabled,
+		structured,
+		visibleEnabled,
+		defaultAgent,
+	});
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
