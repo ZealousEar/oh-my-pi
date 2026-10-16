@@ -1,4 +1,4 @@
-import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
+import { BRAND_NAME } from "@oh-my-pi/pi-utils/dirs";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { formatDoubleTap, formatKeyHint, formatKeyHints, type KeyName } from "../app-keybindings";
 import { editorKey } from "../chrome/keybinding-hints";
@@ -249,7 +249,7 @@ export class WelcomeComponent implements Component {
 						"image",
 						{
 							builtin: "omp",
-							alt: brandName(),
+							alt: BRAND_NAME,
 							w: 128,
 							role: "omp.welcome.logo",
 						},
@@ -259,7 +259,7 @@ export class WelcomeComponent implements Component {
 					keyed(
 						col(
 							[
-								art([span(brandName(), "strong")], "omp.welcome.wordmark"),
+								art([span(BRAND_NAME, "strong")], "omp.welcome.wordmark"),
 								art([span(`v${this.version}`, "dim mono")], "omp.welcome.version"),
 							],
 							{ role: "omp.welcome.mark" },
@@ -376,7 +376,7 @@ export class WelcomeComponent implements Component {
 		if (room < 4) return [];
 		const logo = this.#currentLogoFrame();
 		const version = theme.fg("dim", `v${this.version}`);
-		const wordmarkWidth = Math.max(...(WORDMARKS[brandName()] ?? WORDMARKS.omp!).map(row => row.length));
+		const wordmarkWidth = Math.max(...(WORDMARKS[BRAND_NAME] ?? WORDMARKS.omp!).map(row => row.length));
 		const lockupWidth = LOGO_WIDTH + LOCKUP_GAP + Math.max(wordmarkWidth, visibleWidth(version));
 		const art = room >= lockupWidth ? lockup(logo, version) : room >= LOGO_WIDTH ? logo : [];
 		const lines = centerBlock(art, termWidth);
@@ -425,14 +425,6 @@ const WORDMARKS: Record<string, readonly string[]> = {
 	ompd: ["                   █", "▄▀▀▄ █▀▄▀▄ █▀▀▄ ▄▀▀█", "▀▄▄▀ █ █ █ █▄▄▀ ▀▄▄█", "           █"],
 };
 
-/**
- * Brand name for this process: `ompd` when launched by the `ompd` channel
- * launcher (`OMP_CHANNEL=ompd`), otherwise {@link APP_NAME}.
- */
-function brandName(): string {
-	return process.env.OMP_CHANNEL === "ompd" ? "ompd" : APP_NAME;
-}
-
 /** Columns between the logo and the wordmark. */
 const LOCKUP_GAP = 4;
 
@@ -444,7 +436,7 @@ const TIP_MIN_COLUMNS = 50;
 
 /** Logo frame `logo` with the wordmark beside it and `version` (styled) under the wordmark. */
 function lockup(logo: readonly string[], version: string): string[] {
-	const rows = WORDMARKS[brandName()] ?? WORDMARKS.omp!;
+	const rows = WORDMARKS[BRAND_NAME] ?? WORDMARKS.omp!;
 	const beside = [...rows.map(row => (row ? theme.bold(theme.fg("text", row)) : row)), version];
 	return logo.map((row, index) => `${row}${padding(LOCKUP_GAP)}${beside[index] ?? ""}`);
 }
