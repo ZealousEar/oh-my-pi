@@ -23,8 +23,8 @@ import { updatePercent, updateTone, type VersionUpdate, type WelcomeLook } from 
 
 /** Columns between the logo and the wordmark. */
 const LOCKUP_GAP = 4;
-/** Lockup row holding the version: under the wordmark, which starts on the logo's second row. */
-const VERSION_ROW = WORDMARK.length + 1;
+/** Lockup row holding the version: under the four wordmark rows. */
+const VERSION_ROW = WORDMARK.length;
 /** Cells of the download bar. */
 const UPDATE_BAR = 10;
 /** Widest a tip wraps. */
@@ -120,7 +120,7 @@ function paintWelcome(node: UiNode, cx: PaintContext): Block {
 	const hasLockup = room >= LOGO_WIDTH + LOCKUP_GAP + Math.max(WORDMARK_WIDTH, visibleWidth(version));
 	let art: readonly string[] = [];
 	if (hasLockup) {
-		const beside = ["", ...WORDMARK.map(row => theme.style("text strong", row)), version];
+		const beside = [...WORDMARK.map(row => (row ? theme.style("text strong", row) : row)), version];
 		art = logo.map((row, index) => `${row}${spaces(LOCKUP_GAP)}${beside[index] ?? ""}`);
 	} else if (room >= LOGO_WIDTH) art = logo;
 	const rows = centered(art, width);

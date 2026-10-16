@@ -11,11 +11,29 @@ export const LOGO: readonly string[] = ["████████████", 
 /** Columns of {@link LOGO}. */
 export const LOGO_WIDTH = 12;
 
-/** The `omp` wordmark in half-blocks, set beside the logo from its second row (the `p` descends a row). */
-export const WORDMARK: readonly string[] = ["▄▀▀▄ █▀▄▀▄ █▀▀▄", "▀▄▄▀ █ █ █ █▄▄▀", "           █"];
+/**
+ * Brand name for this process: `ompd` when launched by the `ompd` channel
+ * launcher (`OMP_CHANNEL=ompd`), otherwise `omp`.
+ */
+export function brandName(): string {
+	return process.env.OMP_CHANNEL === "ompd" ? "ompd" : "omp";
+}
+
+/**
+ * Half-block wordmarks set beside the logo: four rows aligned to the logo's
+ * first four, the version takes the fifth. `omp` leaves the first row empty;
+ * `ompd` uses it for the `d` ascender. The `p` descends into the fourth.
+ */
+const WORDMARKS: Record<string, readonly string[]> = {
+	omp: ["", "▄▀▀▄ █▀▄▀▄ █▀▀▄", "▀▄▄▀ █ █ █ █▄▄▀", "           █"],
+	ompd: ["                   █", "▄▀▀▄ █▀▄▀▄ █▀▀▄ ▄▀▀█", "▀▄▄▀ █ █ █ █▄▄▀ ▀▄▄█", "           █"],
+};
+
+/** The wordmark for {@link brandName}, four rows starting at the logo's first row. */
+export const WORDMARK: readonly string[] = WORDMARKS[brandName()] ?? WORDMARKS.omp!;
 
 /** Columns of {@link WORDMARK}. */
-export const WORDMARK_WIDTH = 15;
+export const WORDMARK_WIDTH = Math.max(...WORDMARK.map(row => row.length));
 
 /** Gradient stops along the diagonal (truecolor). */
 const STOPS: readonly (readonly [number, number, number])[] = [

@@ -13,7 +13,7 @@ import { type Accessor, computed, type JSXNode, Show, type Signal, signal } from
 import type { TspSpan, TspText } from "@oh-my-pi/pi-wire";
 import type { VersionUpdate } from "../../modes/view-model/prompt/welcome";
 import "../styles/welcome";
-import { INTRO_MS } from "./logo";
+import { brandName, INTRO_MS } from "./logo";
 import { isNewTip, type TipKeyStyle, tipText } from "./tips";
 
 export type { VersionUpdate };
@@ -79,12 +79,12 @@ export function Welcome(props: WelcomeProps): JSXNode {
 	return (
 		<card role="omp.welcome" term={look}>
 			<row key="lockup" role="omp.welcome.lockup" align="center" gap="md">
-				<image key="logo" role="omp.welcome.logo" builtin="omp" alt="omp" w={128} />
+				<image key="logo" role="omp.welcome.logo" builtin="omp" alt={brandName()} w={128} />
 				<col key="mark" role="omp.welcome.mark">
 					<text
 						key="omp.welcome.wordmark"
 						role="omp.welcome.wordmark"
-						spans={[{ t: "omp", s: "strong" }]}
+						spans={[{ t: brandName(), s: "strong" }]}
 						wrap="none"
 					/>
 					<text
