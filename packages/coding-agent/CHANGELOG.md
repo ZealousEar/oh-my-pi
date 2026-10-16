@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Under the `ompd` channel, the startup "Update Available" banner compares the fork's base version against the newest upstream release and says to run `ompd update` (the stock banner asked the build service for a patch, which never fires for a pinned fork build).
+
 ## [18.20.2] - 2026-11-14
 
 ### Added
