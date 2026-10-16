@@ -21,6 +21,16 @@ import { isEnoent, isEnotdir } from "./fs-error";
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
 
+/**
+ * True when the process was started by the `ompd` channel launcher
+ * (`OMP_CHANNEL=ompd`): the frozen fork build, updated through the
+ * `ompd update` procedure rather than `omp update`.
+ */
+export const IS_OMPD_CHANNEL: boolean = process.env.OMP_CHANNEL === "ompd";
+
+/** Brand shown for this process: `ompd` under the ompd launcher, else {@link APP_NAME}. */
+export const BRAND_NAME: string = IS_OMPD_CHANNEL ? "ompd" : APP_NAME;
+
 /** Public homepage that inference gateways (OpenRouter, Vercel AI Gateway) credit omp traffic to. */
 export const APP_URL: string = "https://omp.sh/";
 

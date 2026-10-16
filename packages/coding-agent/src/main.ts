@@ -16,6 +16,7 @@ import {
 	directoryIsMissing,
 	getLogPath,
 	getProjectDir,
+	IS_OMPD_CHANNEL,
 	normalizePathForComparison,
 	setProjectDir,
 	VERSION,
@@ -248,9 +249,13 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 		const channel = cfgUpdateChannel.get(settings);
 		// A compiled binary updates from the build service; naming the running
 		// version lets the service prepare the patch `omp update` will then use.
-		const { version } = isCompiledBinary()
-			? await fetchBuild({ channel }, { timeoutMs: 5_000, fromVersion: currentVersion })
-			: await getLatestRelease({ timeoutMs: 5_000, channel });
+		// The ompd fork build is pinned at its upstream base version and never
+		// self-updates: compare against the newest upstream release so the banner
+		// says when `ompd update` has something to rebase onto.
+		const { version } =
+			isCompiledBinary() && !IS_OMPD_CHANNEL
+				? await fetchBuild({ channel }, { timeoutMs: 5_000, fromVersion: currentVersion })
+				: await getLatestRelease({ timeoutMs: 5_000, channel });
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
