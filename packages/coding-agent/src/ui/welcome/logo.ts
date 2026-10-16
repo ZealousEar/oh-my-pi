@@ -4,6 +4,7 @@
  * intro animation (the gradient sweeping round while a highlight crosses it).
  */
 import type { ColorDepth } from "@oh-my-pi/pi-tui/theme/color";
+import { BRAND_NAME } from "@oh-my-pi/pi-utils/dirs";
 
 /** The block-grid logo. */
 export const LOGO: readonly string[] = ["████████████", "   ██  ██   ", "   ██  ██   ", "   ▒▒  ██   ", "       ██   "];
@@ -11,12 +12,9 @@ export const LOGO: readonly string[] = ["████████████", 
 /** Columns of {@link LOGO}. */
 export const LOGO_WIDTH = 12;
 
-/**
- * Brand name for this process: `ompd` when launched by the `ompd` channel
- * launcher (`OMP_CHANNEL=ompd`), otherwise `omp`.
- */
+/** Brand name for this process: `ompd` under the ompd channel launcher, otherwise `omp`. */
 export function brandName(): string {
-	return process.env.OMP_CHANNEL === "ompd" ? "ompd" : "omp";
+	return BRAND_NAME;
 }
 
 /**

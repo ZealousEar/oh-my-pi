@@ -611,6 +611,9 @@
 - Fixed Tern and WebKit browser calls that incorrectly exposed unsupported page event-listener APIs; errors now identify the supported alternatives.
 - Fixed browser timeout and busy-page errors to include the current URL, affected tab, and actionable recovery guidance.
 - Fixed Mnemopi embedding failures being silently downgraded to keyword search; provider errors now produce a warning, including in print mode on stderr.
+### Added
+
+- Under the `ompd` channel, the startup "Update Available" banner compares the fork's base version against the newest upstream release and says to run `ompd update` (the stock banner asked the build service for a patch, which never fires for a pinned fork build).
 
 ## [18.20.2] - 2026-11-14
 

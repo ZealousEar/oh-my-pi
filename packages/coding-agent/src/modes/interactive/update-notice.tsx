@@ -7,10 +7,11 @@
 import type { JSXNode } from "@oh-my-pi/pi-tui";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { bold } from "@oh-my-pi/pi-tui/theme/theme";
+import { BRAND_NAME } from "@oh-my-pi/pi-utils/dirs";
 import { AnsiText } from "../../ui/transcript/ansi-text";
 import { Notice } from "../../ui/transcript/messages/notices";
 
-const UPDATE_COMMAND = "omp update";
+const UPDATE_COMMAND = `${BRAND_NAME} update`;
 
 export function UpdateNotice(props: { readonly version: string }): JSXNode {
 	const prefix = `New version ${props.version} is available. Run: `;
