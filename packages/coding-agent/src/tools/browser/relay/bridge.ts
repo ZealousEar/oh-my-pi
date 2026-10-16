@@ -1055,7 +1055,8 @@ export class RelayBridge {
 			const message = err instanceof Error ? err.message : String(err);
 			// Chrome fails the root session's command in flight before it reports the detach. Hold the failure
 			// until the detach is reported, so the client gets `OMP.debuggerDetached` first and knows why.
-			if (realSessionId === undefined && tab.attached && DETACHED_COMMAND_ERROR.test(message)) {
+			const tab = this.#tabs.get(tabId);
+			if (realSessionId === undefined && tab?.attached && DETACHED_COMMAND_ERROR.test(message)) {
 				await Promise.race([tab.chromeDetach.promise, Bun.sleep(CHROME_DETACH_REPORT_MS)]);
 			}
 			this.#replyError(conn, msg, message);

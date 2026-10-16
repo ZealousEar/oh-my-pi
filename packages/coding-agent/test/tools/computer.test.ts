@@ -2775,8 +2775,21 @@ describe("display hold follows the agent turn", () => {
 		const snapshots: ComputerSessionSnapshot[] = [];
 		const releases: number[] = [];
 		const session: ToolSession = { ...toolSession(), getEvalKernelOwnerId: () => owner };
+		grantAutomationScope(session, {
+			surface: "computer",
+			targets: ["Code", "desktop"],
+			actions: ["computer.run"],
+			consequential: false,
+			rawAccess: "broad",
+			desktopAccess: "broad",
+			task: "computer display turn fixture",
+		});
+		const focusedWindowCode = renderComputerCall([{ method: "focusedWindow", args: [] }]);
 		const prelude = createComputerPrelude(session, () => ({
-			async run(_code, _timeoutMs, runSnapshot) {
+			async run(code, _timeoutMs, runSnapshot) {
+				if (code === focusedWindowCode) {
+					return { displays: [], returnValue: { id: "42", app: "Code", title: "Editor" }, screenshots: [] };
+				}
 				snapshots.push(runSnapshot);
 				return { displays: [], returnValue: undefined, screenshots: [] };
 			},

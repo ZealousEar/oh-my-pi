@@ -1974,6 +1974,7 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 			mode: "attach",
 			browserWSEndpoint,
 			safeDir,
+			uploadDir,
 			targetId,
 			dialogs: opts.dialogs,
 			allowedDomains: opts.allowedDomains,

@@ -751,7 +751,7 @@ describe("RelayBridge Runtime sessions", () => {
 
 describe("RelayBridge attachment release", () => {
 	it("keeps a tab Chrome detached on its own adoptable, but bans it after the user cancels the debugging bar", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -760,9 +760,8 @@ describe("RelayBridge attachment release", () => {
 		await flush();
 		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
 		const created = () =>
-			cdp.messages.filter(
-				m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE${ANON}.1"`),
-			).length;
+			cdp.messages.filter(m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE1"`))
+				.length;
 		expect(created()).toBe(1);
 
 		// Another extension's frame started loading in the tab: Chrome drops the debugger on its own.
@@ -780,7 +779,7 @@ describe("RelayBridge attachment release", () => {
 		).toBe(true);
 		// Announced again at once and still listed, so an open can adopt the same tab.
 		expect(created()).toBe(2);
-		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE${ANON}.1`]);
+		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE1`]);
 		const readopted = await attachPage(bridge, ext, cdp, connId, 1);
 		expect(readopted).not.toBe(sessionId);
 
@@ -792,7 +791,7 @@ describe("RelayBridge attachment release", () => {
 		const refusedId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
-			JSON.stringify({ id: refusedId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
+			JSON.stringify({ id: refusedId, method: "Target.attachToTarget", params: { targetId: `PAGE1` } }),
 		);
 		await flush();
 		expect(ext.pending("attach")).toEqual([]);
@@ -800,7 +799,7 @@ describe("RelayBridge attachment release", () => {
 	});
 
 	it("tells the driving session why Chrome detached before failing its command in flight", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -830,7 +829,7 @@ describe("RelayBridge attachment release", () => {
 	});
 
 	it("neither reports nor re-announces the detach of a tab the relay is closing", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -839,9 +838,8 @@ describe("RelayBridge attachment release", () => {
 		await flush();
 		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
 		const created = () =>
-			cdp.messages.filter(
-				m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE${ANON}.1"`),
-			).length;
+			cdp.messages.filter(m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE1"`))
+				.length;
 		const closeId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
@@ -849,7 +847,7 @@ describe("RelayBridge attachment release", () => {
 				id: closeId,
 				sessionId,
 				method: "Target.closeTarget",
-				params: { targetId: `PAGE${ANON}.1` },
+				params: { targetId: `PAGE1` },
 			}),
 		);
 		await flush();
@@ -1462,7 +1460,7 @@ describe("RelayBridge auto-attach gating", () => {
 	});
 
 	it("announces and attaches a tab again once its URL changes after Chrome refused its reattach", async () => {
-		const bridge = new RelayBridge();
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		// Tab 2 is another relay tab in use, so the auto-attaching connection stays open throughout.
 		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
@@ -1479,7 +1477,7 @@ describe("RelayBridge auto-attach gating", () => {
 		);
 		ack(bridge, ext, "attach");
 		await flush();
-		const attachedTab1 = () => attachedIds(cdp).filter(id => id === `TAB${ANON}.1`).length;
+		const attachedTab1 = () => attachedIds(cdp).filter(id => id === `TAB1`).length;
 		expect(attachedTab1()).toBe(1);
 
 		// Another extension's frame loads in tab 1: Chrome detaches, and refuses the reattach while the frame is there.
@@ -1487,7 +1485,7 @@ describe("RelayBridge auto-attach gating", () => {
 		await flush();
 		nack(bridge, ext, "attach", "Cannot access a chrome-extension:// URL of different extension");
 		await flush();
-		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE${ANON}.2`]);
+		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE2`]);
 
 		// The frame is gone and the user navigates: the tab is announced and attached on the open connection again.
 		bridge.extMessage(
@@ -1729,7 +1727,7 @@ describe("RelayBridge file chooser interception", () => {
 	}
 
 	it("keeps interception on while another session on the tab still waits for a chooser", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -1745,7 +1743,7 @@ describe("RelayBridge file chooser interception", () => {
 	});
 
 	it("switches interception off when its last owner detaches or disconnects without disabling it", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		// The holder keeps the tab's attachment alive, as the registry connection does.
@@ -1792,7 +1790,7 @@ describe("RelayBridge file chooser interception", () => {
 	}
 
 	it("keeps a later enable when an earlier overlapping enable on the session fails", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const holderCdp = new FakeCdpSocket();
@@ -1818,7 +1816,7 @@ describe("RelayBridge file chooser interception", () => {
 	});
 
 	it("keeps interception on for an owner whose disable failed while another owner's disable succeeded", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();

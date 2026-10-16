@@ -103,6 +103,8 @@ class TaskNativeSession implements NativeDesktopSession {
 	/** Side effect of a successful press. */
 	onPerform?: (ref: string, session: TaskNativeSession) => void;
 
+	holdDisplayUntilReleased(): void {}
+	releaseDisplayAwake(): void {}
 	async listDisplays(): Promise<DesktopDisplay[]> {
 		return [];
 	}
