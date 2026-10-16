@@ -9,6 +9,7 @@ import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
 import { previewLine, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { logger } from "@oh-my-pi/pi-utils";
+import { BRAND_NAME } from "@oh-my-pi/pi-utils/dirs";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { InternalUrlRouter } from "../../internal-urls";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
@@ -1315,7 +1316,7 @@ export class UiHelpers {
 	showNewVersionNotification(newVersion: string): void {
 		const title = "Update Available";
 		const prefix = `New version ${newVersion} is available. Run: `;
-		const command = "omp update";
+		const command = `${BRAND_NAME} update`;
 		const native = noticeRow(
 			"info",
 			[
