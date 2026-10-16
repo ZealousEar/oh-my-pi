@@ -1,10 +1,12 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/banner-light.svg" />
-    <img src="assets/banner-dark.svg" alt="ompd — the daily fork of oh-my-pi" width="100%" />
-  </picture>
-</p>
+```
+                   █
+▄▀▀▄ █▀▄▀▄ █▀▀▄ ▄▀▀█
+▀▄▄▀ █ █ █ █▄▄▀ ▀▄▄█
+           █          the daily fork of oh-my-pi
+
+$ omp     # upstream release
+$ ompd    # upstream + fork stack
+```
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-personal%20fork-8B5CF6?style=flat-square" />
