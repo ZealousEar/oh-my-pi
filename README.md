@@ -44,6 +44,10 @@ Without a usable bun (or with `--binary`), the install scripts fetch the prebuil
 
 > **Alpine / musl:** the prebuilt musl binary links `libstdc++`/`libgcc` dynamically, which stock Alpine does not ship. Install them first: `apk add libstdc++ libgcc`.
 
+**Fork channels (this fork)**
+
+This fork is run through channel launchers that set `OMP_CHANNEL`: `omp` (pinned stock), `ompd` (daily fork build), `ompdev` (editable checkout). An `ompd` session shows an `ompd` wordmark in the welcome banner instead of `omp`, so a glance at the splash tells you which channel you are in; the other channels keep the stock mark.
+
 **Homebrew**
 
 ```sh

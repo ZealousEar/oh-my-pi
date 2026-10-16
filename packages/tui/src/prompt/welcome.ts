@@ -249,7 +249,7 @@ export class WelcomeComponent implements Component {
 						"image",
 						{
 							builtin: "omp",
-							alt: APP_NAME,
+							alt: brandName(),
 							w: 128,
 							role: "omp.welcome.logo",
 						},
@@ -259,7 +259,7 @@ export class WelcomeComponent implements Component {
 					keyed(
 						col(
 							[
-								art([span(APP_NAME, "strong")], "omp.welcome.wordmark"),
+								art([span(brandName(), "strong")], "omp.welcome.wordmark"),
 								art([span(`v${this.version}`, "dim mono")], "omp.welcome.version"),
 							],
 							{ role: "omp.welcome.mark" },
@@ -376,7 +376,8 @@ export class WelcomeComponent implements Component {
 		if (room < 4) return [];
 		const logo = this.#currentLogoFrame();
 		const version = theme.fg("dim", `v${this.version}`);
-		const lockupWidth = LOGO_WIDTH + LOCKUP_GAP + Math.max(WORDMARK_WIDTH, visibleWidth(version));
+		const wordmarkWidth = Math.max(...(WORDMARKS[brandName()] ?? WORDMARKS.omp!).map(row => row.length));
+		const lockupWidth = LOGO_WIDTH + LOCKUP_GAP + Math.max(wordmarkWidth, visibleWidth(version));
 		const art = room >= lockupWidth ? lockup(logo, version) : room >= LOGO_WIDTH ? logo : [];
 		const lines = centerBlock(art, termWidth);
 		const tip = termWidth >= TIP_MIN_COLUMNS ? this.#renderTip(room) : [];
@@ -415,13 +416,22 @@ export const PI_LOGO = ["████████████", "   ██  █�
 const LOGO_WIDTH = Math.max(...PI_LOGO.map(row => row.length));
 
 /**
- * The `omp` wordmark in half-blocks, set beside {@link PI_LOGO} from its second
- * row: the `p` descends into the fourth, the version takes the fifth.
+ * Half-block wordmarks set beside {@link PI_LOGO}: four rows aligned to the
+ * logo's first four, the version takes the fifth. `omp` leaves the first row
+ * empty; `ompd` uses it for the `d` ascender. The `p` descends into the fourth.
  */
-const WORDMARK = ["▄▀▀▄ █▀▄▀▄ █▀▀▄", "▀▄▄▀ █ █ █ █▄▄▀", "           █"];
+const WORDMARKS: Record<string, readonly string[]> = {
+	omp: ["", "▄▀▀▄ █▀▄▀▄ █▀▀▄", "▀▄▄▀ █ █ █ █▄▄▀", "           █"],
+	ompd: ["                   █", "▄▀▀▄ █▀▄▀▄ █▀▀▄ ▄▀▀█", "▀▄▄▀ █ █ █ █▄▄▀ ▀▄▄█", "           █"],
+};
 
-/** Columns of {@link WORDMARK}. */
-const WORDMARK_WIDTH = Math.max(...WORDMARK.map(row => row.length));
+/**
+ * Brand name for this process: `ompd` when launched by the `ompd` channel
+ * launcher (`OMP_CHANNEL=ompd`), otherwise {@link APP_NAME}.
+ */
+function brandName(): string {
+	return process.env.OMP_CHANNEL === "ompd" ? "ompd" : APP_NAME;
+}
 
 /** Columns between the logo and the wordmark. */
 const LOCKUP_GAP = 4;
@@ -434,7 +444,8 @@ const TIP_MIN_COLUMNS = 50;
 
 /** Logo frame `logo` with the wordmark beside it and `version` (styled) under the wordmark. */
 function lockup(logo: readonly string[], version: string): string[] {
-	const beside = ["", ...WORDMARK.map(row => theme.bold(theme.fg("text", row))), version];
+	const rows = WORDMARKS[brandName()] ?? WORDMARKS.omp!;
+	const beside = [...rows.map(row => (row ? theme.bold(theme.fg("text", row)) : row)), version];
 	return logo.map((row, index) => `${row}${padding(LOCKUP_GAP)}${beside[index] ?? ""}`);
 }
 
