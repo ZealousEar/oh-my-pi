@@ -4,6 +4,14 @@
 # object lives in compat.extraBody: extraBody is applied after the narrow
 # openRouterRouting object and therefore wins; never split fields between the two.
 providers:
+  mwapi:
+    baseUrl: https://api.mwapi.dev
+    api: anthropic-messages
+    apiKey: "!security find-generic-password -s mwapi-api-key -w"
+    models:
+      - id: claude-opus-5-5
+        name: Opus 5.5 (MWAPI)
+
   openrouter:
     modelOverrides:
       moonshotai/kimi-k3:
