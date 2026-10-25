@@ -1,0 +1,10 @@
+{
+  "name": "omp-opencode-free",
+  "private": true,
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.0.2",
+    "zod": "^4.0.0"
+  }
+}

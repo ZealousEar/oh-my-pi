@@ -23,6 +23,8 @@ die() { printf 'install.sh: %s\n' "$1" >&2; exit 1; }
 # The ompd/ompdev wrappers refuse to start without the layer's config overlay: check it first.
 [ -d "$LAYER/.git" ] || die "profile layer checkout missing: git clone -b $LAYER_BRANCH --single-branch https://github.com/ZealousEar/oh-my-pi.git $LAYER"
 [ -r "$LAYER/config/fork-overlay.yml" ] || die "profile layer overlay missing: $LAYER/config/fork-overlay.yml"
+[ -r "$LAYER/agent/extensions/opencode-free/node_modules/@agentclientprotocol/sdk/dist/v1/stable/acp.js" ] ||
+	die "OpenCode delegation dependency missing: run bun install --frozen-lockfile --ignore-scripts in $LAYER/agent/extensions/opencode-free"
 for name in omp ompd ompdev omp-channels omp-secret omp-mcp-share omp-relay-share; do
 	[ -f "$L/wrappers/$name" ] || die "missing wrapper source $L/wrappers/$name"
 done
@@ -191,8 +193,8 @@ for profile in daily-fork dev-fork; do
 		done
 	done
 done
-# Stock gets only the ompd update entry points (the procedure itself runs the fork tooling).
-for entry in commands/ompd-update.md rules/ompd-update.md; do
+# Stock also gets the explicit native OpenCode command; other fork extensions remain isolated.
+for entry in commands/ompd-update.md rules/ompd-update.md extensions/opencode-free; do
 	mkdir -p "$PROFILES/stock/agent/$(dirname "$entry")"
 	layer_link "$LAYER/agent/$entry" "$PROFILES/stock/agent/$entry"
 done
