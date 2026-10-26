@@ -1,0 +1,8 @@
+auth "elevenlabs" {
+	name "ElevenLabs"
+	login "api-key" {
+		auth-url "https://elevenlabs.io/app/settings/api-keys"
+		instructions "Create an API key with Text to Speech access in ElevenLabs settings"
+		prompt "Paste your ElevenLabs API key" placeholder="sk_..."
+	}
+}

@@ -2,6 +2,7 @@
  * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
+import { DEFAULT_ELEVENLABS_VOICE_ID } from "@oh-my-pi/pi-ai/speech";
 import { register } from "../config/registry";
 import {
 	DEFAULT_TTS_SPEED,
@@ -93,6 +94,19 @@ export const cfgSpeechVoice = register({
 		label: "Speech Vocalization Voice",
 		description: "Kokoro voice used when speaking the assistant's output aloud",
 		options: TTS_LOCAL_VOICE_OPTIONS,
+	},
+});
+
+export const cfgSpeechElevenLabsVoice = register({
+	id: "speech.elevenlabsVoice",
+	type: "string",
+	default: DEFAULT_ELEVENLABS_VOICE_ID,
+	ui: {
+		tab: "providers",
+		group: "Services",
+		label: "ElevenLabs Voice ID",
+		description:
+			"ElevenLabs voice ID used for read-aloud and the tts tool when the speech role selects an elevenlabs model",
 	},
 });
 
