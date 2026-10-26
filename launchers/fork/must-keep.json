@@ -28,6 +28,11 @@
           "mustNotMatch": ["^opencode-zen \\([0-9]+\\)"]
         }
       ]
+    },
+    {
+      "name": "ElevenLabs speech backend",
+      "tests": ["packages/ai/test/elevenlabs-speech.test.ts"],
+      "probes": []
     }
   ]
 }

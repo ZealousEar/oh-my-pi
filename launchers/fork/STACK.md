@@ -358,3 +358,34 @@ Files:
 - packages/coding-agent/test/tools/computer.test.ts
 - packages/coding-agent/test/tools/cua-backend.test.ts
 - packages/coding-agent/test/tools/cua-driver.test.ts
+
+## 32882f61cd feat(speech): ElevenLabs voice backend
+ElevenLabs as a speech-role provider: elevenlabs-tts transport, catalog
+provider + /login, tts tool and streaming read-aloud support, per-session
+vocalizer model source, speech.elevenlabsVoice setting.
+Must-keep: user-requested voice backend.
+
+Files:
+- docs/environment-variables.md
+- docs/settings.md
+- packages/ai/src/speech/elevenlabs-tts.ts
+- packages/ai/src/speech/index.ts
+- packages/ai/src/speech/transport.ts
+- packages/ai/test/elevenlabs-speech.test.ts
+- packages/catalog/src/compat/auth-ids.ts
+- packages/catalog/src/compat/provider-ids.ts
+- packages/catalog/src/compat/rules.json
+- packages/catalog/src/compat/rules/auth/_order.kdl
+- packages/catalog/src/compat/rules/auth/elevenlabs.kdl
+- packages/catalog/src/compat/rules/providers/elevenlabs.kdl
+- packages/catalog/src/models.json
+- packages/catalog/src/types.ts
+- packages/coding-agent/CHANGELOG.md
+- packages/coding-agent/src/modes/controllers/event-controller.ts
+- packages/coding-agent/src/priority.json
+- packages/coding-agent/src/prompts/tools/tts.md
+- packages/coding-agent/src/tools/tts.ts
+- packages/coding-agent/src/tts/cloud-stream.ts
+- packages/coding-agent/src/tts/settings.ts
+- packages/coding-agent/src/tts/tts-client.ts
+- packages/coding-agent/src/tts/vocalizer.ts
