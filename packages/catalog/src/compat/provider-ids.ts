@@ -28,6 +28,7 @@ export type KnownProvider =
 	| "deepinfra"
 	| "deepseek"
 	| "devin"
+	| "elevenlabs"
 	| "factory-droid"
 	| "firepass"
 	| "fireworks"

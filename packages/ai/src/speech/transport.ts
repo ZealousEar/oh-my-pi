@@ -11,12 +11,18 @@ export class SpeechApiError extends AIError.ProviderHttpError {
 	override readonly name = "SpeechApiError";
 }
 
+/** Builds the credential header; speech wires default to `Authorization: Bearer <key>`. */
+export type SpeechAuthHeaders = (key: string) => Record<string, string>;
+
+const bearerAuth: SpeechAuthHeaders = key => ({ Authorization: `Bearer ${key}` });
+
 export async function postSpeechRequest(
 	model: Model<Api>,
 	path: string,
 	payload: Record<string, unknown>,
 	format: SpeechFormat,
 	options: SpeechOptions,
+	authHeaders: SpeechAuthHeaders = bearerAuth,
 ): Promise<SpeechResult> {
 	const timeoutSignal = AbortSignal.timeout(SPEECH_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
@@ -30,7 +36,7 @@ export async function postSpeechRequest(
 				method: "POST",
 				headers: {
 					...configuredHeaders,
-					Authorization: `Bearer ${key}`,
+					...authHeaders(key),
 					"Content-Type": "application/json",
 					"User-Agent": USER_AGENT,
 				},

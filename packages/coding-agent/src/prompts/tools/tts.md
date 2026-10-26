@@ -8,6 +8,8 @@ Models are selected through the speech role and its fallback chain:
   - built-in voices: {{xaiVoices}}; custom voice IDs accepted
 - openai-speech: the selected model's compatible cloud endpoint; MP3 or WAV
   - voice_id is forwarded only when explicitly set
+- elevenlabs-tts: ElevenLabs; MP3 or WAV; max 10,000 characters
+  - voice_id is an ElevenLabs voice ID, default from speech.elevenlabsVoice
 
 Ordering and output:
 - MP3 request: unconfigured cloud candidates are tried before unconfigured local candidates; explicitly configured speech candidates keep their order.
