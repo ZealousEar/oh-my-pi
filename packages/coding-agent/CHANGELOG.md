@@ -661,6 +661,9 @@
 ### Removed
 
 - Removed the built-in `rs-parking-lot` rule; Rust edits using `std::sync::{Mutex, RwLock}` with `.lock().unwrap()` are no longer steered to `parking_lot`
+### Added
+
+- Added ElevenLabs speech: `elevenlabs/eleven_multilingual_v2` and `elevenlabs/eleven_flash_v2_5` serve the speech role for the `tts` tool and read-aloud (`speech.enabled`), with the voice set by `speech.elevenlabsVoice`; authenticate with `/login elevenlabs` or `ELEVENLABS_API_KEY`
 
 ## [18.11.2] - 2026-10-16
 

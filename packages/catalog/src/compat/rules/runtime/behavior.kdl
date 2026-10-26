@@ -497,6 +497,8 @@ behavior {
 		model "local/kokoro"
 		model "xai/grok-tts"
 		model "xai-oauth/grok-tts"
+		model "elevenlabs/eleven_flash_v2_5"
+		model "elevenlabs/eleven_multilingual_v2"
 	}
 	role-defaults "dictation" {
 		model "local/parakeet-tdt-0.6b-v3"

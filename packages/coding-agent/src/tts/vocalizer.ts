@@ -37,18 +37,26 @@
  * questions); the event controller wires the per-session model source and
  * enhancer via {@link Vocalizer.setModelSource} and {@link Vocalizer.setEnhancer}.
  */
-import type { ModelBrowserRegistry } from "@oh-my-pi/pi-tui/overlays/model-browser";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { type Settings, settings } from "../config/settings";
+import { createCloudSpeechStream } from "./cloud-stream";
 import { DEFAULT_TTS_VOICE, TTS_LOCAL_MODELS } from "./models";
 import { SpeakableStream } from "./speakable";
 import { BlockAccumulator, type SpeechEnhancer } from "./speech-enhancer";
 import { createStreamingPlayer, DUCK_GAIN } from "./streaming-player";
 import { type TtsStreamHandle, ttsClient } from "./tts-client";
 
-import { cfgSpeechEnabled, cfgSpeechEnhanced, cfgSpeechSpeed, cfgSpeechVoice } from "./settings";
+import {
+	cfgSpeechElevenLabsVoice,
+	cfgSpeechEnabled,
+	cfgSpeechEnhanced,
+	cfgSpeechSpeed,
+	cfgSpeechVoice,
+} from "./settings";
 
 /** Quiet time on the delta stream before the buffered partial is spoken. */
 const IDLE_FLUSH_MS = 1000;
@@ -59,7 +67,9 @@ const MAX_REWRITES_IN_FLIGHT = 2;
 
 export interface VocalizerModelSource {
 	settings: Settings;
-	registry: ModelBrowserRegistry;
+	registry: ModelRegistry;
+	/** Session whose credentials cloud speech requests use. */
+	sessionId?: string;
 }
 
 /** Resolve the first speech-role candidate that the local streaming worker can run. */
@@ -69,6 +79,17 @@ export function resolveLocalSpeechModelId(source: VocalizerModelSource): string 
 		candidate => candidate.model.api === "local-inference",
 	);
 	return local?.model.id ?? TTS_LOCAL_MODELS[0].key;
+}
+
+/**
+ * The speech-role model read-aloud streams through: the first candidate that is
+ * either local (Kokoro worker) or ElevenLabs (cloud PCM). Undefined → local default.
+ */
+function resolveVocalizerModel(source: VocalizerModelSource): Model | undefined {
+	const pool = roleCandidatePool("speech", source.settings, source.registry);
+	return resolveRoleChain("speech", source.settings, pool).find(
+		candidate => candidate.model.api === "local-inference" || candidate.model.api === "elevenlabs-tts",
+	)?.model;
 }
 
 export interface VocalizerPlayer {
@@ -379,11 +400,22 @@ export class Vocalizer {
 	 */
 	#openSession(abort: AbortController): TtsStreamHandle {
 		const source = this.#modelSource;
-		const modelKey = source ? resolveLocalSpeechModelId(source) : TTS_LOCAL_MODELS[0].key;
 		const sessionSettings = source?.settings ?? settings;
-		const voice = cfgSpeechVoice.get(sessionSettings) || DEFAULT_TTS_VOICE;
 		const speed = cfgSpeechSpeed.get(sessionSettings);
-		const handle = ttsClient.synthesizeStream(modelKey, { voice, speed, signal: abort.signal });
+		const model = source ? resolveVocalizerModel(source) : undefined;
+		const handle =
+			source && model?.api === "elevenlabs-tts"
+				? createCloudSpeechStream(model, {
+						apiKey: source.registry.resolver(model, source.sessionId),
+						voice: cfgSpeechElevenLabsVoice.get(sessionSettings),
+						speed,
+						signal: abort.signal,
+					})
+				: ttsClient.synthesizeStream(model?.id ?? TTS_LOCAL_MODELS[0].key, {
+						voice: cfgSpeechVoice.get(sessionSettings) || DEFAULT_TTS_VOICE,
+						speed,
+						signal: abort.signal,
+					});
 		const player = this.#createPlayer();
 		player.setGain(this.#ducked ? DUCK_GAIN : 1);
 		this.#liveAborts.add(abort);

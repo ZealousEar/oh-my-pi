@@ -5,7 +5,13 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { MissingApiKeyError, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
-import { DEFAULT_XAI_VOICE_ID, synthesizeSpeech, XAI_MAX_TEXT_LENGTH } from "@oh-my-pi/pi-ai/speech";
+import {
+	DEFAULT_XAI_VOICE_ID,
+	isSpeechApi,
+	type SpeechApi,
+	synthesizeSpeech,
+	XAI_MAX_TEXT_LENGTH,
+} from "@oh-my-pi/pi-ai/speech";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
@@ -18,7 +24,7 @@ import { ttsClient } from "../tts/tts-client";
 import { encodeWav } from "../tts/wav";
 import { formatPathRelativeToCwd, resolveToCwd } from "./path-utils";
 
-import { cfgTtsLocalSpeed, cfgTtsLocalVoice } from "../tts/settings";
+import { cfgSpeechElevenLabsVoice, cfgTtsLocalSpeed, cfgTtsLocalVoice } from "../tts/settings";
 
 // Built-in voices per xAI Tier-1 docs (2026-05-16). xAI also accepts custom voice IDs,
 // so the schema does NOT enum-restrict voice_id; this constant only drives the description.
@@ -28,7 +34,7 @@ const formatVoiceList = (): string =>
 	XAI_BUILTIN_VOICES.map(v => (v === DEFAULT_XAI_VOICE_ID ? `${v} (default)` : v)).join(", ");
 
 type TtsCodec = "mp3" | "wav";
-type TtsBackend = "local-inference" | "xai-tts" | "openai-speech";
+type TtsBackend = "local-inference" | SpeechApi;
 
 const ttsSchema = type({
 	text: "1 <= string <= 15000",
@@ -103,12 +109,19 @@ async function synthesizeCloud(
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<TtsToolDetails, TtsSchemaType>> {
 	const sessionId = ctx.sessionManager.getSessionId();
+	const voiceId =
+		params.voice_id ??
+		(model.api === "elevenlabs-tts"
+			? cfgSpeechElevenLabsVoice.get(ctx.settings ?? settings)
+			: model.api === "xai-tts"
+				? DEFAULT_XAI_VOICE_ID
+				: undefined);
 	const result = await synthesizeSpeech(
 		model,
 		{
 			text: params.text,
 			format: codec,
-			...(params.voice_id !== undefined ? { voice: params.voice_id } : {}),
+			...(voiceId !== undefined ? { voice: voiceId } : {}),
 			...(model.api === "xai-tts" && params.sample_rate !== undefined ? { sampleRate: params.sample_rate } : {}),
 			...(model.api === "xai-tts" && params.bit_rate !== undefined ? { bitRate: params.bit_rate } : {}),
 		},
@@ -119,16 +132,15 @@ async function synthesizeCloud(
 		},
 	);
 	await Bun.write(outputPath, result.audio);
-	const voiceId = params.voice_id ?? (model.api === "xai-tts" ? DEFAULT_XAI_VOICE_ID : "default");
-	const backend: Exclude<TtsBackend, "local-inference"> = model.api === "xai-tts" ? "xai-tts" : "openai-speech";
+	const backend = model.api as SpeechApi;
 	return {
 		content: [
 			{
 				type: "text",
-				text: `Saved ${result.audio.length} bytes to ${displayPath} (model=${model.provider}/${model.id}, voice=${voiceId}, codec=${codec}).`,
+				text: `Saved ${result.audio.length} bytes to ${displayPath} (model=${model.provider}/${model.id}, voice=${voiceId ?? "default"}, codec=${codec}).`,
 			},
 		],
-		details: { bytes: result.audio.length, voiceId, codec, backend },
+		details: { bytes: result.audio.length, voiceId: voiceId ?? "default", codec, backend },
 	};
 }
 
@@ -211,7 +223,7 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 				if (model.api === "local-inference") {
 					return await synthesizeLocal(model, params, settingsInstance, cwd, outputPath, signal);
 				}
-				if (model.api === "xai-tts" || model.api === "openai-speech") {
+				if (isSpeechApi(model.api)) {
 					return await synthesizeCloud(model, params, ctx, outputPath, displayPath, codec, signal);
 				}
 				throw new Error(`Unsupported speech model API: ${model.api}`);

@@ -364,6 +364,11 @@ export class EventController {
 					})
 				: null,
 		);
+		vocalizer.setModelSource(
+			session?.modelRegistry && session.settings
+				? { settings: session.settings, registry: session.modelRegistry, sessionId: session.sessionId }
+				: null,
+		);
 		this.#streamingReveal = new StreamingRevealController({
 			getSmoothStreaming: () => cfgDisplaySmoothStreaming.get(this.ctx.settings),
 			getHideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,

@@ -1,0 +1,30 @@
+// Catalog entry for "elevenlabs": speech-only provider; no chat models.
+
+provider "elevenlabs" {
+	default-model "eleven_multilingual_v2"
+	env "ELEVENLABS_API_KEY"
+	kind-apis {
+		tts "elevenlabs-tts"
+	}
+
+	seed api="elevenlabs-tts" base-url="https://api.elevenlabs.io/v1" bundle="always" {
+		model "eleven_multilingual_v2" name="ElevenLabs Multilingual v2" {
+			reasoning #false
+			input "text"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits
+			supports-tools #false
+		}
+		model "eleven_flash_v2_5" name="ElevenLabs Flash v2.5" {
+			reasoning #false
+			input "text"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits
+			supports-tools #false
+		}
+	}
+
+	models "eleven_multilingual_v2" "eleven_flash_v2_5" {
+		kind "tts"
+	}
+}

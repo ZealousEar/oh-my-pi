@@ -1,21 +1,23 @@
 import type { Api, Model } from "@oh-my-pi/pi-catalog/types";
 import * as AIError from "../error";
+import { synthesizeElevenLabsSpeech } from "./elevenlabs-tts";
 import { synthesizeOpenAiSpeech } from "./openai-speech";
 import type { SpeechOptions, SpeechRequest, SpeechResult } from "./types";
 import { synthesizeXaiSpeech } from "./xai-tts";
 
+export * from "./elevenlabs-tts";
 export * from "./openai-speech";
 export * from "./transport";
 export * from "./types";
 export * from "./xai-tts";
 
 /** Catalog APIs {@link synthesizeSpeech} serves; the `tts` tool and the gateway gate on these. */
-export const SPEECH_APIS = ["xai-tts", "openai-speech"] as const;
+export const SPEECH_APIS = ["xai-tts", "openai-speech", "elevenlabs-tts"] as const;
 export type SpeechApi = (typeof SPEECH_APIS)[number];
 
 /** Whether a catalog API synthesizes speech through a cloud transport (local inference is tool-only). */
 export function isSpeechApi(api: Api): api is SpeechApi {
-	return api === "xai-tts" || api === "openai-speech";
+	return (SPEECH_APIS as readonly Api[]).includes(api);
 }
 
 /** Synthesize speech through the transport selected by the catalog model's `api`. */
@@ -29,6 +31,8 @@ export function synthesizeSpeech(
 			return synthesizeXaiSpeech(model, request, options);
 		case "openai-speech":
 			return synthesizeOpenAiSpeech(model, request, options);
+		case "elevenlabs-tts":
+			return synthesizeElevenLabsSpeech(model, request, options);
 		default:
 			throw new AIError.ConfigurationError(`Unsupported speech API: ${model.api}`);
 	}
