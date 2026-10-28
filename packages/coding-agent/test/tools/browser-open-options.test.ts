@@ -28,23 +28,30 @@ import { chromiumAvailable } from "./chromium-probe";
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const tempDirs: string[] = [];
 
-function browserHost(cwd: string = process.cwd(), settings: Record<string, unknown> = {}) {
-	const session: ToolSession = grantBrowserFixtureScope({
-		cwd,
-		hasUI: false,
-		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
-		settings: Settings.isolated({
-			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
-			"browser.webkit": false,
-			"browser.enabled": true,
-			"browser.headless": true,
-			"browser.cmux": false,
-			"browser.tern": false,
-			"tools.maxTimeout": 0,
-			...settings,
-		}),
-	});
+function browserHost(
+	cwd: string = process.cwd(),
+	settings: Record<string, unknown> = {},
+	extraTargets: readonly string[] = [],
+) {
+	const session: ToolSession = grantBrowserFixtureScope(
+		{
+			cwd,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({
+				// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+				"browser.webkit": false,
+				"browser.enabled": true,
+				"browser.headless": true,
+				"browser.cmux": false,
+				"browser.tern": false,
+				"tools.maxTimeout": 0,
+				...settings,
+			}),
+		},
+		extraTargets,
+	);
 	const prelude = createBrowserPrelude(session);
 	return (parameters: unknown, signal?: AbortSignal) =>
 		prelude.invoke(parameters, { session, toolCallId: `browser-open-options-${crypto.randomUUID()}`, signal });
@@ -517,7 +524,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		try {
 			const [page] = await browser.pages();
 			if (!page) throw new Error("Expected the launched browser to expose a page");
-			const invoke = browserHost();
+			// The tab opens and navigates on the two TLS fixture origins.
+			const invoke = browserHost(process.cwd(), {}, [server.url.origin, recycled.url.origin]);
 			const name = `tls-${crypto.randomUUID()}`;
 			await invoke({
 				action: "open",
