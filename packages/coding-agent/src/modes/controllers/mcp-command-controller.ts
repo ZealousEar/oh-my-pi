@@ -550,7 +550,6 @@ export class MCPCommandController {
 					...callbacks,
 				}),
 			);
-
 		} finally {
 			release();
 		}
@@ -1488,7 +1487,6 @@ export class MCPCommandController {
 			} finally {
 				release();
 			}
-
 		} catch (error) {
 			if (error instanceof MCPOAuthCancelledError) {
 				if (!options.silent) this.ctx.showStatus(`Reauthorization cancelled for "${name}"`);

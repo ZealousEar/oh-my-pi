@@ -27,7 +27,11 @@ import {
 	relayLiveMarkersForTest,
 	type WorkerTabSession,
 } from "./tab-supervisor";
-import { TEST_HELLO_IDENTITY, TEST_INSTALL_ID, writeRelayBindingFixture } from "../../../test/tools/relay-binding-fixture";
+import {
+	TEST_HELLO_IDENTITY,
+	TEST_INSTALL_ID,
+	writeRelayBindingFixture,
+} from "../../../test/tools/relay-binding-fixture";
 
 const GENERATION = "gen-relay-test";
 const MARKER = "11111111-2222-4333-8444-555555555555";
