@@ -1375,9 +1375,11 @@ describe("prepareCompaction retained history", () => {
 		// compact() budgets the summary from this reserve: 15% of the window.
 		expect(gated.settings.reserveTokens).toBe(4_915);
 
+		// Upstream's recovery band (#16904) already bounds the tail on any window; the gate is what
+		// resizes the summary reserve.
 		const ungated = prepareCompaction(entries, settings, model);
 		if (!ungated) throw new Error("Expected compaction without the gate");
-		expect(tokenizer.countMessages(ungated.recentMessages)).toBeGreaterThan(8_192);
+		expect(ungated.settings.reserveTokens).toBe(settings.reserveTokens);
 	});
 });
 

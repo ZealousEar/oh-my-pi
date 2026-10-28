@@ -77,12 +77,12 @@ describe("findToolRenderer", () => {
 	it("uses raw DEC-byte filenames only in file hyperlink targets", async () => {
 		applyHyperlinkSetting("always");
 		const uiTheme = (await getThemeByName("dark"))!;
-		const rawDetails: FindToolDetails = {
+		const rawDetails: FindCascadeDetails = {
 			...details,
 			cwd: "/repo/\x1b[1m",
 			hits: [{ ...details.hits[0]!, rel: "src/\x1b[31mretry.ts" }],
 		};
-		const safeDetails: FindToolDetails = {
+		const safeDetails: FindCascadeDetails = {
 			...rawDetails,
 			cwd: sanitizeText(rawDetails.cwd),
 			hits: [{ ...rawDetails.hits[0]!, rel: sanitizeText(rawDetails.hits[0]!.rel) }],

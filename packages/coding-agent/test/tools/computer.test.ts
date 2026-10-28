@@ -2429,7 +2429,8 @@ const CLICK = {
 function escapeHarness() {
 	const native = new EscapeNativeSession();
 	const ownerId = `escape-owner-${crypto.randomUUID()}`;
-	const session: ToolSession = { ...toolSession(), getEvalKernelOwnerId: () => ownerId };
+	// Granted on this very object: automation scopes belong to the session object, so a spread copy has none.
+	const session = toolSession({ getEvalKernelOwnerId: () => ownerId });
 	const runListeners = new Set<() => void>();
 	const sent = {
 		types: [] as string[],
@@ -2791,7 +2792,11 @@ describe("expanded computer APIs", () => {
 					try { await next(); } catch {}
 				}
 				return 1;`;
-			const reads = native.capabilityReads;
+			// Counted from the Escape: the focused-window authorization run before the script reads them once.
+			let reads = -1;
+			native.onEscape = () => {
+				reads = native.capabilityReads;
+			};
 			await expect(prelude.invoke({ action: "run", code }, context)).rejects.toThrow(ESCAPE_STOPPED_MESSAGE);
 			expect(native.clickCount).toBe(0);
 			expect(native.operations).toEqual([]);

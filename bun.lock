@@ -55,7 +55,7 @@
     },
     "packages/browser-relay": {
       "name": "@oh-my-pi/browser-relay",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "devDependencies": {
         "@types/bun": "catalog:",
         "puppeteer-core": "catalog:",

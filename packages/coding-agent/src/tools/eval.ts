@@ -1076,44 +1076,21 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					tailBuffer.append(cellOutput);
 				}
 
-				if (result.cancelled) {
-					cellResult.status = "error";
-					pushUpdate();
-					const errorMsg = result.output || "Command aborted";
-					const combinedOutput = cellOutputs.join("\n\n");
-					// Backends already annotate the timeout in their own terms (kernel
-					// interrupted, worker reset); state which limit fired on top so the
-					// model does not read it as the per-cell timeout.
-					const outputText = wallCap?.fired
-						? `${combinedOutput ? `${combinedOutput}\n\n` : ""}[${formatEvalWallCapNotice(wallCap.capMs)}]`
-						: combinedOutput || errorMsg;
-
-					const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
-					commitDisplaySpills(summaryForMeta);
-					const details: EvalToolDetails = {
-						language: languages[0],
-						languages,
-						cells: cellResults,
-						jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-						statusEvents: callStatus.statusEvents,
-						statusEventsElided: callStatus.statusEventsElided,
-						isError: true,
-					};
-					if (notice) details.notice = notice;
-
-					return toolResult(details)
-						.content([{ type: "text", text: outputText }, ...images])
-						.truncationFromSummary(summaryForMeta, { direction: "tail" })
-						.error()
-						.done();
-				}
-
-				if (result.exitCode !== 0 && result.exitCode !== undefined) {
+				if (result.cancelled || (result.exitCode !== 0 && result.exitCode !== undefined)) {
 					cellResult.status = "error";
 					pushUpdate();
 					const combinedOutput = cellOutputs.join("\n\n");
 					const exitLine = `Command exited with code ${result.exitCode}`;
-					const outputText = combinedOutput ? `${combinedOutput}\n\n${exitLine}` : exitLine;
+					// Backends already annotate the timeout in their own terms (kernel
+					// interrupted, worker reset); state which limit fired on top so the
+					// model does not read it as the per-cell timeout.
+					const outputText = result.cancelled
+						? wallCap?.fired
+							? `${combinedOutput ? `${combinedOutput}\n\n` : ""}[${formatEvalWallCapNotice(wallCap.capMs)}]`
+							: combinedOutput || result.output || "Command aborted"
+						: combinedOutput
+							? `${combinedOutput}\n\n${exitLine}`
+							: exitLine;
 
 					const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 					const details: EvalToolDetails = {

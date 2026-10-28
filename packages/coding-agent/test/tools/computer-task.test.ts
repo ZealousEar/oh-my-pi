@@ -20,6 +20,8 @@ import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-codi
 import type {
 	AxNode,
 	AxQuery,
+	AxSelectTextOptions,
+	AxTextSelection,
 	AxSnapshotOptions,
 	CaptureRegion,
 	DesktopCapabilities,
@@ -28,6 +30,7 @@ import type {
 	DesktopPoint,
 	DesktopScreenState,
 	DesktopWindow,
+	PointerOptions,
 } from "@oh-my-pi/pi-natives";
 
 const capabilities: DesktopCapabilities = {
@@ -96,6 +99,7 @@ class TaskNativeSession implements NativeDesktopSession {
 	readonly performed: Array<{ ref: string; action: string }> = [];
 	readonly setValues: Array<{ ref: string; value: string }> = [];
 	queries = 0;
+	escapeStops = 0;
 	/** Mutates the tree before the nth query answers, simulating a live window. */
 	beforeQuery?: (query: number, session: TaskNativeSession) => void;
 	/** Returns an error to throw instead of performing, simulating a failed dispatch. */
@@ -205,6 +209,12 @@ class TaskNativeSession implements NativeDesktopSession {
 	}
 	async axFocus(): Promise<void> {}
 	async axClick(): Promise<void> {}
+	async axSelectText(_ref: string, text: string, _opts?: AxSelectTextOptions | null): Promise<AxTextSelection> {
+		return { start: 0, length: text.length, text, focused: true };
+	}
+	async axType(_ref: string, _text: string, _opts?: PointerOptions | null): Promise<void> {}
+	async axKeyChord(_ref: string, _keys: string[], _opts?: PointerOptions | null): Promise<void> {}
+	setRunDeadline(_remainingMs: number): void {}
 	async close(): Promise<void> {}
 }
 
@@ -252,7 +262,14 @@ function workerController(native: TaskNativeSession): ComputerController {
 		async run(code: string, timeoutMs: number, snapshot: ComputerSessionSnapshot) {
 			sequence += 1;
 			const id = "task-" + sequence;
-			transport.inbound({ type: "run", id, code, timeoutMs, session: snapshot });
+			transport.inbound({
+				type: "run",
+				id,
+				code,
+				timeoutMs,
+				session: snapshot,
+				escape: { key: `computer-task-test-${id}`, acknowledged: 0 },
+			});
 			const message = await transport.waitFor(entry => entry.type === "result" && entry.id === id);
 			if (message.type !== "result") throw new Error("unexpected worker message");
 			if (!message.ok) throw new Error(message.error.message);

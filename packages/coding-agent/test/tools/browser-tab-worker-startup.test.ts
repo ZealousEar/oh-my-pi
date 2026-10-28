@@ -330,12 +330,13 @@ describe("OMP-owned browser evaluation", () => {
 		async () => {
 			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 			const name = `parallel-calls-${process.pid}`;
-			const session = {
+			// `tab.run` is raw automation; the data: page reports `about:blank`, a fixture default target.
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, browser, { url: `data:text/html,<title>${name}</title>`, timeoutMs: 30_000 });
 				const results = await Promise.allSettled([

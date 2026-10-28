@@ -450,7 +450,9 @@ function renderCascade(details: FindCascadeDetails, options: RenderResultContext
 			uiTheme,
 		);
 		const empty =
-			details.coverage === "partial" ? "No relevant passages found in the judged files" : "No relevant passages found";
+			details.coverage === "partial"
+				? "No relevant passages found in the judged files"
+				: "No relevant passages found";
 		const lines = [header, formatEmptyMessage(empty, uiTheme)];
 		for (const failure of stats.failures) lines.push(uiTheme.fg("warning", failure));
 		return new Text(lines.join("\n"), 0, 0);

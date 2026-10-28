@@ -319,8 +319,10 @@ describe("jfind cascade", () => {
 			});
 			const result = await tool.execute("x", { query: "token refresh", grep_keywords: ["refreshToken"] });
 			expect(result.isError).toBe(true);
-			expect(result.details?.coverage).toBe("unavailable");
-			expect(result.details?.stats.failed).toBe(result.details?.stats.requests);
+			const details = result.details;
+			if (details?.mode !== "cascade") throw new Error("expected cascade details");
+			expect(details.coverage).toBe("unavailable");
+			expect(details.stats.failed).toBe(details.stats.requests);
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 			expect(text).toStartWith('find unavailable for "token refresh"');
 			expect(text).not.toContain("no hits");
