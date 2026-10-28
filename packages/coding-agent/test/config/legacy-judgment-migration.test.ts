@@ -87,11 +87,11 @@ describe("legacy fork judgment settings migration", () => {
 		expect(judgePin(settings)).toBeUndefined();
 	});
 
-	it("fails closed on jev-latest when only the fallback was disabled", async () => {
+	it("fails closed on the default native judge when only the fallback was disabled", async () => {
 		const settings = await load({ providers: { judgmentFallback: "none" } });
-		expect(cfgModelRoles.get(settings)).toEqual({ judge: "typesafe/jev-latest" });
+		expect(cfgModelRoles.get(settings)).toEqual({ judge: "typesafe/jev-1.14.0" });
 		expect(cfgRetryFallbackChains.get(settings)).toEqual({ judge: [] });
-		expect(judgePin(settings)).toBe("typesafe/jev-latest");
+		expect(judgePin(settings)).toBe("typesafe/jev-1.14.0");
 	});
 
 	it("drops the fork keys without touching an explicitly configured judge role", async () => {

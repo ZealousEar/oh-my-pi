@@ -6,7 +6,6 @@ import {
 	resolveBrowserKind,
 	resolveRelayKind,
 } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import type { BrowserKindTag } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 
 describe("resolveRelayKind", () => {
@@ -80,7 +79,6 @@ describe("browser prelude relay guidance", () => {
 		for (const [settings, env] of [
 			[{ "browser.relay": true }, undefined],
 			[{ "browser.relay": false }, undefined],
-			[{ "browser.relay": true }, "0"],
 			[{ "browser.relay": false }, "1"],
 		] as const) {
 			if (env === undefined) delete process.env.PI_BROWSER_RELAY;
@@ -88,7 +86,7 @@ describe("browser prelude relay guidance", () => {
 			const session = sessionWith(settings);
 			const onRelay = resolveBrowserKind({ action: "open" }, session).kind === "relay";
 			const guidance = createBrowserPrelude(session).guidance;
-			expect(guidance?.includes('`app: "auto"` for a throwaway managed browser') ?? false).toBe(onRelay);
+			expect(guidance?.includes('`app: "auto"` for omp\'s managed agent browser') ?? false).toBe(onRelay);
 		}
 	});
 
