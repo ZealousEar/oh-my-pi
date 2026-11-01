@@ -1,0 +1,57 @@
+// https://docs.refuseless.com/models (2026-11-01). OpenAI-compatible gateway
+// for refusal-removed ("abliterated") open weights at api.refuseless.com/v1.
+// Prices, output caps, and the DeepSeek row are the list values LiteLLM
+// published for Refuseless on 2026-11-01; refuseless.com itself sits behind a
+// bot challenge and cannot be fetched unattended.
+provider "refuseless" {
+	default-model "glm-5.3-abliterated"
+	env "REFUSELESS_API_KEY"
+	dynamic-models-authoritative #true
+	discovery label="Refuseless"
+
+	// Bundled so the provider is usable before a first credentialed discovery.
+	// `/v1/models` is authoritative once it runs. Reasoning ladders come from
+	// the GLM and DeepSeek lineage rules (low/high/max, matching the gateway's
+	// accepted `reasoning_effort` values).
+	seed api="openai-completions" base-url="https://api.refuseless.com/v1" bundle="fallback" {
+		model "glm-5.3-abliterated" name="GLM 5.3 Abliterated" {
+			reasoning #true
+			input "text"
+			cost input=1 output=2 cache-read=0.15 cache-write=0
+			limits context=1048576 max-tokens=131072
+		}
+		model "glm-5.3-flash-abliterated" name="GLM 5.3 Flash Abliterated" {
+			reasoning #true
+			input "text" "image"
+			cost input=0.12 output=0.5 cache-read=0.04 cache-write=0
+			limits context=1048576 max-tokens=131072
+		}
+		model "deepseek-v4.1-flash-abliterated" name="DeepSeek V4.1 Flash Abliterated" {
+			reasoning #true
+			input "text"
+			cost input=0.14 output=0.5 cache-read=0.035 cache-write=0
+			limits context=1048576 max-tokens=130000
+		}
+	}
+
+	supports-developer-role #false
+	supports-store #false
+
+	// Abliterated weights are modified: their reasoning trace is not carried
+	// to or from the unmodified lineage they derive from. The gateway also
+	// serves stock weights (e.g. `deepseek-v4.1-flash-fast`), which keep the
+	// lineage default.
+	models "*-abliterated" priority=20 {
+		portable-reasoning #false
+	}
+
+	// The `*glm-5.3*` lineage ladder keys on plain Z.ai ids and misses the
+	// `-abliterated` suffix, so the gateway's accepted `reasoning_effort`
+	// values (off|low|high|max; GLM does not advertise `off`) are pinned here.
+	// Omitted effort runs at `low` on the gateway.
+	models "glm-5.3-abliterated" "glm-5.3-flash-abliterated" priority=20 {
+		thinking-efforts "low" "high" "max"
+		thinking-default-level "low"
+		thinking-requires-effort #true
+	}
+}
