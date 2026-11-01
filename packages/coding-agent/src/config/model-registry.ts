@@ -140,7 +140,7 @@ import {
 import type { ModelOverride, ModelsConfig, ProviderAuthMode } from "./models-config-schema";
 import { type Settings, settings } from "./settings";
 
-import { cfgDisabledProviders } from "./model-settings";
+import { cfgDisabledModels, cfgDisabledProviders } from "./model-settings";
 import {
 	cfgCompactionModelThresholds,
 	cfgCompactionModelThresholdsEnabled,
@@ -225,6 +225,31 @@ function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<st
 	} catch {
 		return new Set();
 	}
+}
+
+/**
+ * Predicate keeping models not removed by the `disabledModels` setting, or
+ * `undefined` when nothing is disabled. Patterns match `provider/modelId`; a
+ * `!` pattern re-allows what another pattern removed.
+ */
+function getDisabledModelFilter(settingsInstance?: Settings): ((model: Model<Api>) => boolean) | undefined {
+	let patterns: readonly string[];
+	try {
+		patterns = cfgDisabledModels.get(settingsInstance ?? settings);
+	} catch {
+		return undefined;
+	}
+	const deny: Bun.Glob[] = [];
+	const allow: Bun.Glob[] = [];
+	for (const pattern of patterns) {
+		if (pattern.startsWith("!")) allow.push(new Bun.Glob(pattern.slice(1)));
+		else deny.push(new Bun.Glob(pattern));
+	}
+	if (deny.length === 0) return undefined;
+	return model => {
+		const key = `${model.provider}/${model.id}`;
+		return !deny.some(glob => glob.match(key)) || allow.some(glob => glob.match(key));
+	};
 }
 
 /**
@@ -473,9 +498,14 @@ export class ModelRegistry {
 		if (fresh.length > 0) this.#catalogMetricRows = [...this.#catalogMetricRows, ...fresh];
 	}
 
-	/** Final pass over every published model list: catalog metrics, then implicit local providers last. */
+	/**
+	 * Final pass over every published model list: `disabledModels`, catalog
+	 * metrics, then implicit local providers last.
+	 */
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		return this.#orderImplicitProvidersLast(applyCatalogMetrics(models, this.#catalogMetrics));
+		const keep = getDisabledModelFilter(this.#settings);
+		const visible = keep ? models.filter(keep) : models;
+		return this.#orderImplicitProvidersLast(applyCatalogMetrics(visible, this.#catalogMetrics));
 	}
 
 	/**

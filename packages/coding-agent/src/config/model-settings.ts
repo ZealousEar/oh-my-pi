@@ -130,6 +130,18 @@ export const cfgDisabledProviders = register({
 	pathScoped: { valuesKey: "providers" },
 });
 
+/**
+ * `provider/modelId` glob patterns removed from the model registry (`Bun.Glob`
+ * syntax; `*` stays inside one path segment). A `!` entry re-allows ids an
+ * earlier pattern removed, so exceptions win: `openrouter/openai/*` plus
+ * `!openrouter/openai/*-pro*` hides every OpenRouter OpenAI model except Pro.
+ */
+export const cfgDisabledModels = register({
+	id: "disabledModels",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
 export const cfgModelRoleStorage = register({
 	id: "modelRoleStorage",
 	type: "enum",

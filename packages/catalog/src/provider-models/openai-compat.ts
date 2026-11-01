@@ -4954,9 +4954,6 @@ export function inceptionModelManagerOptions(config?: ModelManagerConfig): Model
 }
 
 // ---------------------------------------------------------------------------
-// 15.5 CoreWeave Serverless Inference
-// ---------------------------------------------------------------------------
-
 // Refuseless (refuseless.com)
 // ---------------------------------------------------------------------------
 
@@ -4986,6 +4983,9 @@ export function refuselessModelManagerOptions(config?: ModelManagerConfig): Mode
 }
 
 // ---------------------------------------------------------------------------
+// 15.5 CoreWeave Serverless Inference
+// ---------------------------------------------------------------------------
+
 export interface CoreWeaveModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
