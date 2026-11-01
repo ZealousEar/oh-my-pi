@@ -911,6 +911,15 @@ disabledProviders:
 
 String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels`, `providers` for either provider setting, or `values` for any of them.
 
+`disabledModels` removes individual models from the registry, so they never appear in `/model`, role resolution, or `omp models`. Entries are `provider/modelId` globs (`*` stays inside one `/` segment); an entry starting with `!` re-allows what another entry removed. The list is read when the registry builds its catalog, so edits apply on the next start or model refresh.
+
+```yaml
+disabledModels:
+  - openrouter/anthropic/*
+  - openrouter/openai/*
+  - "!openrouter/openai/*-pro*" # keep OpenAI Pro tiers
+```
+
 ## Model presets
 
 A **model preset** is a saved, named permutation of your model-role setup. It captures the routing knobs you tune together — which model fills each role, the per-role fallback chains, the quick-switch cycle order, and the default thinking level — so you can flip between whole configurations (for example a "cheap/fast" set and a "max-quality" set) in one action.

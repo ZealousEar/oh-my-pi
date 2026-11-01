@@ -378,6 +378,27 @@ describe("ModelRegistry", () => {
 				).toBe(false);
 			}
 		});
+
+		test("disabledModels removes matching provider/model ids, with ! exceptions winning", () => {
+			authStorage.keys.setRuntime("openrouter", "openrouter-test-key");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+				settings: Settings.isolated({
+					disabledModels: ["openrouter/openai/*", "!openrouter/openai/*-pro*", "openrouter/anthropic/*"],
+				}),
+			});
+			const ids = registry
+				.getAll("all")
+				.filter(model => model.provider === "openrouter")
+				.map(model => model.id);
+			expect(ids).toContain("openai/gpt-6-sol-pro");
+			expect(ids).toContain("openai/o3-pro:batch");
+			expect(ids).toContain("z-ai/glm-5.3");
+			expect(ids.some(id => id.startsWith("anthropic/"))).toBe(false);
+			expect(ids.filter(id => id.startsWith("openai/")).every(id => id.includes("-pro"))).toBe(true);
+			expect(registry.find("openrouter", "openai/gpt-6-sol")).toBeUndefined();
+			// The same vendors on their own providers stay listed.
+			expect(registry.find("anthropic", "claude-fable-5-1")).toBeDefined();
+		});
 	});
 
 	describe("Bedrock inference profile ARN fallback", () => {
