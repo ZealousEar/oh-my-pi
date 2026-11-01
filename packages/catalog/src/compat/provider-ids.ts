@@ -74,6 +74,7 @@ export type KnownProvider =
 	| "otari"
 	| "qianfan"
 	| "qwen-portal"
+	| "refuseless"
 	| "sakana"
 	| "sambanova"
 	| "scaleway"

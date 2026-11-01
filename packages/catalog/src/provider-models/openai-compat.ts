@@ -4968,6 +4968,35 @@ export function inceptionModelManagerOptions(config?: ModelManagerConfig): Model
 // 15.5 CoreWeave Serverless Inference
 // ---------------------------------------------------------------------------
 
+// Refuseless (refuseless.com)
+// ---------------------------------------------------------------------------
+
+export function refuselessModelManagerOptions(config?: ModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	return {
+		...createOpenAICompatibleModelManagerOptions({
+			api: "openai-completions",
+			providerId: "refuseless",
+			defaultBaseUrl: "https://api.refuseless.com/v1",
+			config,
+			requireApiKey: true,
+			dynamicModelsAuthoritative: true,
+			mapModel: (entry, defaults, reference) => {
+				const model = mapWithBundledReference(entry, defaults, reference);
+				// `/v1/models` publishes `reasoning_efforts` only for models that
+				// reason; an unseeded id would otherwise lose its effort dial.
+				const reasons = Array.isArray(entry.reasoning_efforts) && entry.reasoning_efforts.length > 0;
+				return {
+					...model,
+					contextWindow: toPositiveNumber(entry.context_length, model.contextWindow),
+					...(!reference && reasons && { reasoning: true }),
+				};
+			},
+		}),
+		staticModels: seedModels<"openai-completions">("refuseless"),
+	};
+}
+
+// ---------------------------------------------------------------------------
 export interface CoreWeaveModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
