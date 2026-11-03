@@ -9,6 +9,7 @@ import {
 	detectBrowserPlatform,
 	getDownloadUrl,
 	install,
+	newestInstalledBuildId,
 } from "../src/browsers";
 
 const BUILD_ID = "123.0.6312.58";
@@ -246,6 +247,21 @@ test("a timed-out download releases its lock and partial archive so installation
 		timeout.mockRestore();
 		server.stop(true);
 	}
+});
+
+test("newestInstalledBuildId orders builds numerically and skips other platforms and incomplete installs", async () => {
+	const cacheDir = await makeRoot();
+	const seed = async (platform: BrowserPlatform, buildId: string) => {
+		await Bun.write(computeExecutablePath({ platform, buildId, cacheDir }), "#!/bin/sh\n");
+	};
+	await seed(BrowserPlatform.MAC_ARM, "156.0.8078.9");
+	await seed(BrowserPlatform.MAC_ARM, "156.0.8078.80");
+	await seed(BrowserPlatform.MAC, "157.0.1.1");
+	// Interrupted install: directory present, executable missing.
+	await fs.mkdir(path.join(cacheDir, "chrome", "mac_arm-158.0.1.1"), { recursive: true });
+
+	expect(await newestInstalledBuildId(cacheDir, BrowserPlatform.MAC_ARM)).toBe("156.0.8078.80");
+	expect(await newestInstalledBuildId(path.join(cacheDir, "absent"), BrowserPlatform.MAC_ARM)).toBeUndefined();
 });
 
 const networkTest = process.env.OMP_TEST_BROWSER_INSTALL ? test : test.skip;
