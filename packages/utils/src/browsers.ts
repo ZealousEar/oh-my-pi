@@ -6,9 +6,15 @@ import { type ArchiveLimits, extractArchive } from "./ar";
 import { withFileLock } from "./file-lock";
 
 const CHROME_FOR_TESTING_BASE_URL = "https://storage.googleapis.com/chrome-for-testing-public";
+const CHROME_FOR_TESTING_VERSIONS_URL =
+	"https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json";
 // Installation is outside browser/Eval operation deadlines, but a stalled CDN
 // must still release the cached install promise and permit a later attempt.
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
+// The Stable lookup runs inside the first browser open; an unreachable endpoint
+// falls back to an installed build instead of holding the open.
+const VERSION_LOOKUP_TIMEOUT_MS = 10_000;
+const BUILD_ID_PATTERN = /^\d+\.\d+\.\d+\.\d+$/;
 
 /**
  * Archive ceilings for managed browser downloads (Chrome for Testing, omp's
@@ -116,6 +122,55 @@ export function computeExecutablePath(options: ComputeExecutablePathOptions): st
 		case BrowserPlatform.WIN64:
 			return path.join(installDir, "chrome-win64", "chrome.exe");
 	}
+}
+
+/**
+ * Current Chrome-for-Testing Stable build id (e.g. `156.0.8078.80`). Stable
+ * carries Chrome's latest security fixes; a build pinned at package release
+ * time falls behind them within weeks.
+ */
+export async function resolveStableBuildId(url = CHROME_FOR_TESTING_VERSIONS_URL): Promise<string> {
+	const response = await fetch(url, { signal: AbortSignal.timeout(VERSION_LOOKUP_TIMEOUT_MS) });
+	if (!response.ok) {
+		throw new Error(
+			`Chrome for Testing version lookup failed (${response.status} ${response.statusText}) from ${url}`,
+		);
+	}
+	const body = (await response.json()) as { channels?: { Stable?: { version?: unknown } } };
+	const version = body.channels?.Stable?.version;
+	if (typeof version !== "string" || !BUILD_ID_PATTERN.test(version)) {
+		throw new Error(`Chrome for Testing version lookup returned no Stable build from ${url}`);
+	}
+	return version;
+}
+
+/** Newest build installed under `cacheDir` for `platform`, by numeric version order; undefined when none is. */
+export async function newestInstalledBuildId(cacheDir: string, platform: BrowserPlatform): Promise<string | undefined> {
+	let entries: string[];
+	try {
+		entries = await fsp.readdir(path.join(cacheDir, "chrome"));
+	} catch (error) {
+		if (isMissingPath(error)) return undefined;
+		throw error;
+	}
+	const prefix = `${platform}-`;
+	let newest: { buildId: string; parts: number[] } | undefined;
+	for (const entry of entries) {
+		if (!entry.startsWith(prefix)) continue;
+		const buildId = entry.slice(prefix.length);
+		if (!BUILD_ID_PATTERN.test(buildId)) continue;
+		if (!(await pathExists(computeExecutablePath({ buildId, cacheDir, platform })))) continue;
+		const parts = buildId.split(".").map(Number);
+		if (!newest || compareBuildParts(parts, newest.parts) > 0) newest = { buildId, parts };
+	}
+	return newest?.buildId;
+}
+
+function compareBuildParts(a: number[], b: number[]): number {
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return a[i] - b[i];
+	}
+	return 0;
 }
 
 /** Download and unpack Chrome into Puppeteer's existing cache layout. */

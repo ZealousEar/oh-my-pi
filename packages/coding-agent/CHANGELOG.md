@@ -889,6 +889,10 @@
 - Improved macOS computer-use behavior for applications without windows by opening the app and inspecting its returned window in one operation.
 - Added the `disabledModels` setting: `provider/modelId` globs hide individual models everywhere, with `!` entries as exceptions
 
+### Fixed
+
+- The managed agent browser now runs the current Chrome for Testing Stable build (pin one with `PUPPETEER_CHROME_VERSION`) and keeps Chromium's sandbox on macOS and Windows, instead of an outdated Chromium with the sandbox disabled
+
 ## [18.13.3] - 2026-10-28
 
 ### Added

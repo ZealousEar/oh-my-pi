@@ -427,14 +427,17 @@ async function managedChromiumLocation() {
 	const platform = browsers.detectBrowserPlatform();
 	if (!platform) return undefined;
 	const cacheDir = getPuppeteerDir();
-	const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
-	const buildId = PUPPETEER_REVISIONS.chrome;
+	const buildId = await resolveManagedBuildId(browsers, cacheDir, platform);
 	const executablePath = browsers.computeExecutablePath({ buildId, cacheDir, platform });
 	return { browsers, platform, cacheDir, buildId, executablePath };
 }
 
 let managedChromiumPromise: Promise<string | undefined> | undefined;
-/** Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails. */
+/**
+ * Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails.
+ * Tracks the current Chrome-for-Testing Stable build rather than puppeteer-core's pinned revision, which
+ * lags Chrome's security releases.
+ */
 function ensureManagedChromium(): Promise<string | undefined> {
 	managedChromiumPromise ??= (async () => {
 		const managed = await managedChromiumLocation();
@@ -475,6 +478,30 @@ function ensureManagedChromium(): Promise<string | undefined> {
 		throw err;
 	});
 	return managedChromiumPromise;
+}
+
+/**
+ * Build to run: `PUPPETEER_CHROME_VERSION` pins one explicitly; otherwise the current Stable.
+ * An unreachable lookup falls back to the newest installed build, so an offline host keeps its browser.
+ */
+async function resolveManagedBuildId(
+	browsers: typeof BrowsersNs,
+	cacheDir: string,
+	platform: BrowsersNs.BrowserPlatform,
+): Promise<string> {
+	const pinned = process.env.PUPPETEER_CHROME_VERSION;
+	if (pinned) return pinned;
+	try {
+		return await browsers.resolveStableBuildId();
+	} catch (err) {
+		const installed = await browsers.newestInstalledBuildId(cacheDir, platform);
+		if (!installed) throw err;
+		logger.warn("Chrome for Testing Stable lookup failed; using the newest installed build", {
+			buildId: installed,
+			error: (err as Error).message,
+		});
+		return installed;
+	}
 }
 
 let resolvedChromium: string | null | undefined; // undefined = unchecked; null = not found
@@ -664,8 +691,10 @@ export function buildHeadlessLaunchArgs(
 	features: HeadlessLaunchFeatures = {},
 ): string[] {
 	const launchArgs = [
-		"--no-sandbox",
-		"--disable-setuid-sandbox",
+		// Linux hosts often cannot provide Chromium's sandbox (root, containers, AppArmor-restricted
+		// user namespaces), so it stays off there. macOS and Windows always provide it, and without
+		// it a renderer exploit on an untrusted page runs with the user's full privileges.
+		...(process.platform === "linux" ? ["--no-sandbox", "--disable-setuid-sandbox"] : []),
 		DISABLE_AUTOMATION_CONTROLLED_ARG,
 		"--allow-file-access-from-files",
 		"--hide-scrollbars",

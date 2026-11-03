@@ -314,6 +314,7 @@ describe("browser executable selection", () => {
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
 					OMP_BROWSER_PROBE_PLATFORM: "darwin",
 					PUPPETEER_EXECUTABLE_PATH: "",
+					PUPPETEER_CHROME_VERSION: PUPPETEER_REVISIONS.chrome,
 				};
 
 				// System Google Chrome bundle (com.google.Chrome) — the LaunchServices
@@ -373,6 +374,7 @@ describe("browser executable selection", () => {
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
 					PUPPETEER_EXECUTABLE_PATH: edge,
+					PUPPETEER_CHROME_VERSION: PUPPETEER_REVISIONS.chrome,
 				};
 				const probe = (purpose: string) => {
 					const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
