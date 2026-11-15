@@ -170,9 +170,9 @@ async function attachPage(
 	return sessionId;
 }
 
-/** The page target id of `tabId` in `instanceId`'s browser. */
-function pageId(tabId: number, instanceId = "anon"): string {
-	return `PAGE${instanceCode(instanceId)}.${tabId}`;
+/** The page target id of `tabId` in the fixture install's browser. */
+function pageId(tabId: number): string {
+	return `PAGE${ANON}.${tabId}`;
 }
 
 /** Emulate the omp tab worker adopting a tab: connect claiming it (`/cdp?claim=`), then attach to its page. */
@@ -400,7 +400,7 @@ describe("RelayBridge tab grouping", () => {
 	});
 
 	it("ungroups a tab whose claiming client closed while its group RPC was in flight", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		// A worker's socket claims the tab as it connects and closes before the group RPC answers.
@@ -498,7 +498,7 @@ describe("RelayBridge child targets", () => {
 	];
 
 	it("owns an explicitly attached child without arming auto-attach", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -620,7 +620,7 @@ describe("RelayBridge child targets", () => {
 	});
 
 	it("revokes automatic children when the last local page is released while another connection remains armed", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -666,7 +666,7 @@ describe("RelayBridge child targets", () => {
 	it.each(["disconnect", "release"])(
 		"isolates opt-out and disarms Chrome when the final armed holder leaves by %s",
 		async leave => {
-			const bridge = new RelayBridge({});
+			const bridge = bridgeWith();
 			const ext = new FakeExtSocket();
 			connect(bridge, ext, [tab({ tabId: 1 })]);
 			const firstCdp = new FakeCdpSocket();
@@ -750,7 +750,7 @@ describe("RelayBridge child targets", () => {
 	);
 
 	it("disarms Chrome after another holder's in-flight enable fails", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const firstCdp = new FakeCdpSocket();
@@ -788,7 +788,7 @@ describe("RelayBridge child targets", () => {
 	});
 
 	it.each(["disconnect", "release"])("retries a failed disable after its holder leaves by %s", async leave => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -826,7 +826,7 @@ describe("RelayBridge child targets", () => {
 	});
 
 	it("rejects a queued auto-attach after its page session is released", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -1159,7 +1159,7 @@ describe("RelayBridge Runtime sessions", () => {
 describe("RelayBridge command deadlines", () => {
 	/** Send one command on a fresh page session and let `ms` pass with Chrome not answering; returns its reply, if any. */
 	async function unansweredFor(method: string, params: Record<string, unknown>, ms: number) {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -2157,7 +2157,7 @@ describe("RelayBridge auto-attach gating", () => {
 	});
 
 	it("attaches and groups a tab Chrome refused over another extension's frame once a worker claims it", async () => {
-		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const bridge = bridgeWith({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
 		const cdp = new FakeCdpSocket();
@@ -2432,7 +2432,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 
 	it("holds the app that was in front at omp's input to a tab in front once that tab's page opens a window", async () => {
 		const { holds, frontApp } = frontAppRecorder();
-		const bridge = new RelayBridge();
+		const bridge = bridgeWith();
 		bridge.keepFrontAppWith(frontApp);
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 }), tab({ tabId: 9, active: true })]);
@@ -2477,7 +2477,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 		jest.useFakeTimers();
 		try {
 			const { holds, frontApp } = frontAppRecorder();
-			const bridge = new RelayBridge();
+			const bridge = bridgeWith();
 			bridge.keepFrontAppWith(frontApp);
 			const ext = new FakeExtSocket();
 			connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
@@ -2497,7 +2497,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 
 	it("reads the front app only on omp's inputs that can open a window, not on moves, key-ups or inserted text", async () => {
 		const { holds, frontApp } = frontAppRecorder();
-		const bridge = new RelayBridge();
+		const bridge = bridgeWith();
 		bridge.keepFrontAppWith(frontApp);
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
@@ -2525,7 +2525,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 
 	it("still forwards omp's input when reading the front app throws, and stops reading it", async () => {
 		let reads = 0;
-		const bridge = new RelayBridge();
+		const bridge = bridgeWith();
 		bridge.keepFrontAppWith(() => {
 			reads++;
 			throw new Error("macOSFrontApp is missing from this native addon");
@@ -2548,7 +2548,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 		let reads = 0;
 		const holds: number[] = [];
 		const ends: Array<() => void> = [];
-		const bridge = new RelayBridge();
+		const bridge = bridgeWith();
 		bridge.keepFrontAppWith(() => {
 			const app = ++reads;
 			return {
@@ -2586,7 +2586,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 		try {
 			let reads = 0;
 			const holds: number[] = [];
-			const bridge = new RelayBridge();
+			const bridge = bridgeWith();
 			// The native hold is still queued behind other native work: it never settles here.
 			bridge.keepFrontAppWith(() => {
 				const app = ++reads;
@@ -2621,7 +2621,7 @@ describe("RelayBridge front app on a window omp's input opens", () => {
 		try {
 			let reads = 0;
 			const holds: number[] = [];
-			const bridge = new RelayBridge();
+			const bridge = bridgeWith();
 			bridge.keepFrontAppWith(() => {
 				const app = ++reads;
 				return {
@@ -2818,7 +2818,7 @@ describe("RelayBridge file chooser interception", () => {
 
 describe("RelayBridge focus emulation", () => {
 	it("finishes focus reset before detaching a released tab and re-adopting it", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -2835,9 +2835,12 @@ describe("RelayBridge focus emulation", () => {
 		const nextConn = bridge.cdpConnected(next);
 		const targetsId = ++msgSeq;
 		bridge.cdpMessage(nextConn, JSON.stringify({ id: targetsId, method: "Target.getTargets" }));
-		expect(next.messages.find(message => message.id === targetsId)).toMatchObject({
-			result: { targetInfos: [{ attached: false }] },
-		});
+		// The fork lists the tab's TAB target beside its page; neither is attached any more.
+		const listed = next.messages.find(message => message.id === targetsId)?.result as
+			| { targetInfos: Array<{ targetId: string; attached: boolean }> }
+			| undefined;
+		expect(listed?.targetInfos.map(info => info.targetId)).toContain(`PAGE${ANON}.1`);
+		expect(listed?.targetInfos.filter(info => info.attached)).toEqual([]);
 		const reattachId = ++msgSeq;
 		bridge.cdpMessage(
 			nextConn,
@@ -2862,7 +2865,7 @@ describe("RelayBridge focus emulation", () => {
 	});
 
 	it("keeps a tab focus-emulated while any session asks, and ends it when the last client goes away", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		// The long-lived registry connection keeps the debugger attached throughout.
@@ -2889,7 +2892,7 @@ describe("RelayBridge focus emulation", () => {
 	});
 
 	it("restores a tab's switches after a service-worker restart drops the attachment", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -2906,7 +2909,7 @@ describe("RelayBridge focus emulation", () => {
 	});
 
 	it("brings a surviving attachment's switches to the live sessions' wishes when the extension reconnects", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const registry = new FakeCdpSocket();
@@ -2935,7 +2938,7 @@ describe("RelayBridge focus emulation", () => {
 
 	it("switches off what a vanished client left on when the relay restarts under a live extension", async () => {
 		// A fresh bridge: the extension kept tab 1's attachment, and whatever switches the old relay's clients set.
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })], [1]);
 		await flush();
@@ -2946,7 +2949,7 @@ describe("RelayBridge focus emulation", () => {
 	});
 
 	it("settles a switch whose reply was lost with the extension socket", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -2966,7 +2969,7 @@ describe("RelayBridge focus emulation", () => {
 
 describe("RelayBridge foreign extension frames", () => {
 	it("lets the extension empty another extension's frames only in a tab a client claimed", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
 		const cdp = new FakeCdpSocket();
@@ -2988,7 +2991,7 @@ describe("RelayBridge foreign extension frames", () => {
 	});
 
 	it("takes the claim an older omp worker sends on its page session", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const cdp = new FakeCdpSocket();
@@ -3018,7 +3021,7 @@ describe("RelayBridge download paths", () => {
 				t: "hello",
 				userAgent: "test",
 				browserVersion: "Chrome/151.0.0.0",
-				discardedTabsProtocol: 1,
+				...TEST_HELLO_IDENTITY,
 				downloadsProtocol,
 				tabs: [tab({ tabId: 1 })],
 				attachedTabIds: [],
@@ -3040,7 +3043,7 @@ describe("RelayBridge download paths", () => {
 	}
 
 	it("looks up where Chrome saved a completed download", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		hello(bridge, ext, 1);
 		const { cdp, id } = await askPath(bridge, ext);
@@ -3063,7 +3066,7 @@ describe("RelayBridge download paths", () => {
 	});
 
 	it("tells an extension installed before download tracking to update, without asking it", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		hello(bridge, ext);
 		const { cdp, id } = await askPath(bridge, ext);

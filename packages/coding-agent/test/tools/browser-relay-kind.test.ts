@@ -6,6 +6,7 @@ import {
 	resolveBrowserKind,
 	resolveRelayKind,
 } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import type { BrowserKindTag } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 
 describe("resolveRelayKind", () => {

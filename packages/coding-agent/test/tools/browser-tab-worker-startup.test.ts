@@ -153,12 +153,12 @@ describe("OMP-owned browser evaluation", () => {
 		"keeps delayed-caught frame selector timeouts inside the run",
 		async () => {
 			const name = `frame-delayed-catch-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, headless(), {
 					url: 'data:text/html,<iframe name="child" srcdoc="<button>frame</button>"></iframe>',
@@ -188,12 +188,12 @@ describe("OMP-owned browser evaluation", () => {
 		"completes public detached waits when navigation removes the element",
 		async () => {
 			const name = `selector-navigation-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, headless(), {
 					url: "data:text/html,<button id=present>old document</button>",
@@ -259,12 +259,12 @@ describe("OMP-owned browser evaluation", () => {
 		"accepts selector wait states on tabs and frames",
 		async () => {
 			const name = `selector-states-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				const html =
 					'<button id="visible">shown</button><div id="hidden" style="display:none">hidden</div><iframe name="child" srcdoc="<div id=hidden style=display:none>hidden</div><div id=visible>shown</div>"></iframe>';
@@ -371,12 +371,12 @@ describe("OMP-owned browser evaluation", () => {
 		"rejects unknown selector wait options instead of waiting",
 		async () => {
 			const name = `selector-options-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			try {
 				await acquireTab(name, headless(), {
 					url: "data:text/html,<div id=present>present</div>",
@@ -493,12 +493,12 @@ describe("OMP-owned browser evaluation", () => {
 	);
 	async function runPageContract(code: string): Promise<unknown> {
 		const name = `run-page-contract-${crypto.randomUUID()}`;
-		const session = {
+		const session = grantBrowserFixtureScope({
 			cwd: process.cwd(),
 			hasUI: false,
 			settings: Settings.isolated(),
 			getSessionFile: () => null,
-		} as unknown as ToolSession;
+		} as unknown as ToolSession);
 		const fixture = `<script>
 			globalThis.__ompPageMarker = 47;
 			customElements.define("x-answer", class extends HTMLElement { get answer() { return 42; } });
@@ -870,12 +870,12 @@ describe("OMP-owned browser evaluation", () => {
 		async () => {
 			const browser = headless();
 			const name = `run-page-global-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			const failure = async (code: string): Promise<string> => {
 				try {
 					await runInTab(name, { code, timeoutMs: 10_000, session });
@@ -951,12 +951,12 @@ describe("OMP-owned browser input", () => {
 		async () => {
 			const browser = headless();
 			const name = `hover-layout-${process.pid}`;
-			const session = {
+			const session = grantBrowserFixtureScope({
 				cwd: process.cwd(),
 				hasUI: false,
 				settings: Settings.isolated(),
 				getSessionFile: () => null,
-			} as unknown as ToolSession;
+			} as unknown as ToolSession);
 			const mark = `onmouseover="this.dataset.hovered = 'yes'"`;
 			// Responsive markup: the first `.menu` is the hidden desktop copy. A row's actions show only on hover.
 			const fixture = `<style>.del { opacity: 0 } .row:hover .del { opacity: 1 }

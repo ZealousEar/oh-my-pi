@@ -442,6 +442,8 @@ export interface AsyncJobManagerApi {
 	waitForAll(): Promise<void>;
 	/** Route completions of jobs owned by `ownerId` to `sink`; returns the unregister. */
 	registerDeliverySink(ownerId: string, sink: AsyncJobDeliverySink): () => void;
+	/** Route running-job notices (no-progress warnings) of jobs owned by `ownerId` to `sink`; returns the unregister. */
+	registerNoticeSink(ownerId: string, sink: AsyncJobNoticeSink, policy: AsyncJobNoticePolicy): () => void;
 	/** Wait until every job owned by `ownerId` settled; false when `timeoutMs` elapses first. */
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean>;
 	/** Cancel every job owned by `ownerId`, then wait until `deadlineAt`. */

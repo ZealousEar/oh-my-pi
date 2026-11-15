@@ -2814,7 +2814,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				{ noProgressWarnMs: Math.max(0, cfgAsyncNoProgressWarnMs.get(this.settings)) },
 			);
 			this.yieldQueue.register<AsyncNoticeEntry>(ASYNC_NOTICE_MESSAGE_TYPE, {
-				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || entry.job.status !== "running",
+				// Ask the manager: a subagent's job row is a snapshot of main's at notice time.
+				isStale: entry =>
+					entry.epoch !== this.#asyncDeliveryEpoch || manager.getJob(entry.jobId)?.status !== "running",
 				build: buildAsyncNoticeBatchMessage,
 			});
 		}

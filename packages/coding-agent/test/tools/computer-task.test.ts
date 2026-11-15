@@ -52,6 +52,7 @@ const capabilities: DesktopCapabilities = {
 	spaces: false,
 	screenLocked: false,
 	displayAsleep: false,
+	secureInput: false,
 };
 
 const driverAbsent: CuaDriverDetection = { installed: false, searched: ["cua-driver (PATH)"] };
@@ -278,6 +279,7 @@ function workerController(native: TaskNativeSession): ComputerController {
 		async capabilities() {
 			return capabilities;
 		},
+		async reset() {},
 		async close() {},
 	};
 }

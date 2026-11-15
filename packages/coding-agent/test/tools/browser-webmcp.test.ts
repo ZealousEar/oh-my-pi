@@ -95,7 +95,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 	it(
 		"discovers, invokes, bounds trust, and reports native registrations",
 		async () => {
-			const invoke = createBrowserHost();
 			// localhost is a secure context, so Chromium exposes its own modelContext.
 			using server = servePage(`<title>loading</title>
 <form toolname="search_form" tooldescription="Searches the page."><input name="q"></form>
@@ -127,6 +126,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
   document.title = "registered";
 })();
 </script>`);
+			const invoke = createBrowserHost(loopbackOrigins(server.port));
 			await invoke({ action: "open", name: "webmcp", url: `http://localhost:${server.port}/` });
 			expect(valueFrom<string>(await invoke(call("webmcp", "evaluate", ["document.title"])))).toBe("registered");
 
@@ -242,7 +242,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser WebMCP helpers", () => {
 	it(
 		"lists and invokes a tool a cross-origin iframe registers in its own process",
 		async () => {
-			const invoke = createBrowserHost();
 			// 127.0.0.1 and localhost are different sites, so the iframe gets its own renderer and CDP session.
 			using child = Bun.serve({
 				port: 0,
@@ -263,6 +262,7 @@ document.modelContext.registerTool({
 			using parent = servePage(
 				`<title>parent</title><iframe allow="tools" src="http://127.0.0.1:${child.port}/" onload="document.title = 'loaded'"></iframe>`,
 			);
+			const invoke = createBrowserHost([...loopbackOrigins(parent.port), ...loopbackOrigins(child.port)]);
 			await invoke({ action: "open", name: "webmcp-oopif", url: `http://localhost:${parent.port}/` });
 			expect(valueFrom<string>(await invoke(call("webmcp-oopif", "evaluate", ["document.title"])))).toBe("loaded");
 			const listed = valueFrom<WebMcpListResult>(await invoke(call("webmcp-oopif", "webmcpList")));
@@ -428,7 +428,6 @@ document.modelContext.registerTool({ name: "rename_page", description: "Renames.
 	it(
 		"lists a same-process iframe's tools, registered before the first call, until the iframe navigates",
 		async () => {
-			const invoke = createBrowserHost();
 			// Same site, other port: the iframe shares the page's renderer and CDP session.
 			using child = Bun.serve({
 				port: 0,
@@ -446,6 +445,7 @@ document.modelContext.registerTool({ name: "child_tool", description: "Answers f
 			using parent = servePage(
 				`<title>parent</title><iframe allow="tools" src="http://localhost:${child.port}/" onload="document.title = 'loaded'"></iframe>`,
 			);
+			const invoke = createBrowserHost([...loopbackOrigins(parent.port), ...loopbackOrigins(child.port)]);
 			await invoke({ action: "open", name: "webmcp-child", url: `http://localhost:${parent.port}/` });
 			expect(valueFrom<string>(await invoke(call("webmcp-child", "evaluate", ["document.title"])))).toBe("loaded");
 			const listed = valueFrom<WebMcpListResult>(await invoke(call("webmcp-child", "webmcpList")));

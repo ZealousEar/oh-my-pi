@@ -1500,6 +1500,7 @@ export class SessionMaintenance {
 						return true;
 					case "handoff":
 					case "shake":
+					case "semantic-shake":
 						return false;
 				}
 			};

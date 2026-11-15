@@ -676,16 +676,18 @@ describe("jfind cascade", () => {
 				return result;
 			});
 			const result = await findTool(dir).execute("x", { query: "token refresh", grep_keywords: [] });
-			expect(result.details?.hits.map(hit => hit.rel)).toEqual(["a.ts"]);
-			expect(result.details?.coverage).toBe("partial");
-			expect(result.details?.timeout).toEqual({ verified: 1, passages: 3 });
+			const details = result.details;
+			if (details?.mode !== "cascade") throw new Error("expected cascade details");
+			expect(details.hits.map(hit => hit.rel)).toEqual(["a.ts"]);
+			expect(details.coverage).toBe("partial");
+			expect(details.timeout).toEqual({ verified: 1, passages: 3 });
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 			expect(text).toContain("1 of 3 passages verified");
 			expect(text).toContain("Narrow `path`");
-			const stats = structuredClone(result.details?.stats);
+			const stats = structuredClone(details.stats);
 			late.resolve();
 			await macrotask();
-			expect(result.details?.stats).toEqual(stats);
+			expect(details.stats).toEqual(stats);
 		} finally {
 			await removeWithRetries(dir);
 		}

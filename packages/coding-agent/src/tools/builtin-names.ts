@@ -69,6 +69,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	lsp: { summary: "Language server queries (code intelligence)", defaultState: "on" },
 	ast_edit: { summary: "Rewrite code with AST patterns", defaultState: "on" },
 	debug: { summary: "Debug a running process over DAP", defaultState: "on" },
+	recommend_skills: { summary: "Rank installed skills by fit for a task", defaultState: "on" },
 	ida: {
 		summary: "Open, edit, and script IDA Pro databases",
 		defaultState: "detected",

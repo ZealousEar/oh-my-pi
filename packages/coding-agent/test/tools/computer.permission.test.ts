@@ -48,6 +48,8 @@ class PermissionController implements ComputerController {
 		return undefined;
 	}
 
+	async reset(): Promise<void> {}
+
 	async close(): Promise<void> {}
 }
 
