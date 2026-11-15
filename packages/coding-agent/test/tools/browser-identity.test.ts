@@ -48,9 +48,7 @@ describe("browser identity resolution", () => {
 				session({ "browser.relay": true, "browser.cdpUrl": "http://127.0.0.1:9222" }),
 			),
 		).toThrow(RELAY_DISABLED_MESSAGE);
-		expect(() => resolveBrowserKind({ action: "open", app: "relay" }, session({}))).toThrow(
-			RELAY_DISABLED_MESSAGE,
-		);
+		expect(() => resolveBrowserKind({ action: "open", app: "relay" }, session({}))).toThrow(RELAY_DISABLED_MESSAGE);
 	});
 
 	it("reaches the managed profile only through the explicit per-call choice", () => {

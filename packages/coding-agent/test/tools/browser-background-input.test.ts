@@ -22,16 +22,11 @@ import {
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import puppeteer, { type Browser, type Page, type WebWorker } from "puppeteer-core";
 import { type FixtureRelayExtension, prepareRelayExtension } from "./browser-relay-fixture";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
+import { removeRelayBindingFixture, TEST_INSTALL_ID, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
-
-const session = {
-	cwd: process.cwd(),
-	hasUI: false,
-	settings: Settings.isolated(),
-	getSessionFile: () => null,
-} as unknown as ToolSession;
 
 const site = Bun.serve({
 	port: 0,
@@ -45,6 +40,16 @@ const site = Bun.serve({
 });
 const origin = `http://127.0.0.1:${site.port}`;
 afterAll(() => site.stop(true));
+
+const session = grantBrowserFixtureScope(
+	{
+		cwd: process.cwd(),
+		hasUI: false,
+		settings: Settings.isolated(),
+		getSessionFile: () => null,
+	} as unknown as ToolSession,
+	loopbackOrigins(site.port),
+);
 
 /** Opens the user's tab selected and the tab omp will drive in the background, which therefore reads hidden. */
 async function openTabs(browser: Browser, openBackground: (url: string) => Promise<unknown>): Promise<Page> {

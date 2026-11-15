@@ -616,6 +616,10 @@
 - Under the `ompd` channel, the startup "Update Available" banner compares the fork's base version against the newest upstream release and says to run `ompd update` (the stock banner asked the build service for a patch, which never fires for a pinned fork build).
 - Added ElevenLabs speech: `elevenlabs/eleven_multilingual_v2` and `elevenlabs/eleven_flash_v2_5` serve the speech role for the `tts` tool and read-aloud (`speech.enabled`), with the voice set by `speech.elevenlabsVoice`; authenticate with `/login elevenlabs` or `ELEVENLABS_API_KEY`
 
+### Fixed
+
+- WebMCP helpers work in the managed agent browser again on the current Chrome Stable build, which exposes `document.modelContext` only with Chrome's `WebMCP` feature enabled
+
 ## [18.20.2] - 2026-11-14
 
 ### Added

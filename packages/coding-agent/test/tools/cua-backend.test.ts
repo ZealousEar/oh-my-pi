@@ -366,6 +366,7 @@ function sentinelController(): ComputerController {
 		async capabilities() {
 			throw new Error("native controller reached");
 		},
+		async reset() {},
 		async close() {},
 	};
 }

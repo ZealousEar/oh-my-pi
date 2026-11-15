@@ -68,6 +68,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	lsp: { summary: "Language server queries (code intelligence)", defaultState: "on" },
 	ast_edit: { summary: "Rewrite code with AST patterns", defaultState: "on" },
 	debug: { summary: "Debug a running process over DAP", defaultState: "on" },
+	recommend_skills: { summary: "Rank installed skills by fit for a task", defaultState: "on" },
 	ast_grep: { summary: "Search code with AST patterns", defaultState: "off" },
 	github: { summary: "Query and act on GitHub repositories, issues, and PRs", defaultState: "off" },
 	checkpoint: { summary: "Save a git-based checkpoint of session state", defaultState: "off" },

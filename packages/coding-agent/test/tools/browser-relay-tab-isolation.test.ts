@@ -804,7 +804,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			if (message === "tab detached" && typeof data?.tabKey === "string" && data.tabKey.endsWith(`:${ownedTabId}`))
 				detached.resolve();
 		});
-		const { session } = fixture;
 		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
 		const name = `relay-detached-${process.pid}`;
 		const otherName = `relay-detached-other-${process.pid}`;
@@ -841,7 +840,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 		}
 	}, 60_000);
 
-	async function waitForDownload(name: string): Promise<BrowserDownload> {
+	async function waitForDownload(name: string, session: ToolSession): Promise<BrowserDownload> {
 		const result = await runInTab(name, {
 			code: "return await tab.waitForDownload({ timeout: 10000 });",
 			timeoutMs: 20_000,
@@ -861,12 +860,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 				timeoutMs: 15_000,
 			});
 			// Clicked before any wait: the tab tracks downloads from the moment it opens.
-			await runInTab(name, {
-				code: "await tab.click('#report');",
-				timeoutMs: 20_000,
-				session,
-			});
-			const download = await waitForDownload(name);
+			await runInTab(name, { code: "await tab.click('#report');", timeoutMs: 20_000, session });
+			const download = await waitForDownload(name, session);
 			expect(download).toEqual({
 				path: path.join(fixture.downloads, "report.csv"),
 				suggestedFilename: "report.csv",
@@ -880,7 +875,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 				timeoutMs: 20_000,
 				session,
 			});
-			const framed = await waitForDownload(name);
+			const framed = await waitForDownload(name, session);
 			expect(framed.url).toBe(`http://localhost:${new URL(fixture.origin).port}/report.csv`);
 			expect(framed.path).toBe(path.join(fixture.downloads, "report (1).csv"));
 			const listed = await runInTab(name, {
@@ -920,10 +915,10 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			const second = await fixture.heldDownload(1);
 			// Chrome names the first `held.csv` and the second `held (1).csv`; the second finishes first.
 			second.resolve();
-			const later = await waitForDownload(name);
+			const later = await waitForDownload(name, session);
 			expect(later.path).toBe(path.join(fixture.downloads, "held (1).csv"));
 			first.resolve();
-			const earlier = await waitForDownload(name);
+			const earlier = await waitForDownload(name, session);
 			expect(earlier.path).toBe(path.join(fixture.downloads, "held.csv"));
 			expect(await Bun.file(earlier.path).text()).toBe("a,b\n1,2\n");
 		} finally {

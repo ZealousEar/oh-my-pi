@@ -1617,6 +1617,7 @@ export class SessionMaintenance {
 					case "handoff":
 						return compactMode?.name === "handoff";
 					case "shake":
+					case "semantic-shake":
 						return false;
 				}
 			};

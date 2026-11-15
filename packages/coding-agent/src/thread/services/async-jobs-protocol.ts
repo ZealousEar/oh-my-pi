@@ -23,6 +23,7 @@ import {
 	type AsyncJobDeliveryState,
 	type AsyncJobDetails,
 	type AsyncJobFilter,
+	type AsyncJobNoticePolicy,
 	type AsyncJobReapResult,
 	type AsyncJobRunResult,
 	type AsyncJobType,
@@ -115,6 +116,9 @@ export type WireJobRun = (ctx: WireRunContext) => Promise<string | AsyncJobRunRe
 /** A worker delivery sink as main calls it. */
 export type WireDeliverySink = (jobId: string, text: string, job?: AsyncJobWire) => void | Promise<void>;
 
+/** A worker notice sink as main calls it. */
+export type WireNoticeSink = (jobId: string, text: string, job: AsyncJobWire) => void | Promise<void>;
+
 /** Remote-object protocol of kind {@link ASYNC_JOB_MANAGER_KIND}; sync methods are served synchronously on main. */
 export type AsyncJobManagerProtocol = {
 	hasWidgets: RpcMethod<[], boolean>;
@@ -163,6 +167,10 @@ export type AsyncJobManagerProtocol = {
 	getEvictedJobs: RpcMethod<[filter: AsyncJobFilter | undefined], EvictedJob[]>;
 	waitForAll: RpcMethod<[], void>;
 	registerDeliverySink: RpcMethod<[ownerId: string, sink: WireDeliverySink], WireUnsubscribe>;
+	registerNoticeSink: RpcMethod<
+		[ownerId: string, sink: WireNoticeSink, policy: AsyncJobNoticePolicy],
+		WireUnsubscribe
+	>;
 	waitForOwnerJobs: RpcMethod<
 		[ownerId: string, options: { timeoutMs?: number; excludeSuppressed?: boolean } | undefined],
 		boolean
