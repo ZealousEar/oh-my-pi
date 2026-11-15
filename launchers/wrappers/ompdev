@@ -323,7 +323,7 @@ TIMING_PRELOAD=$CHECKOUT/packages/utils/src/module-timer.ts
 # anything inside it (a planted bunfig.toml preload, .env) would run before the
 # channel code, so a non-empty launch dir fails closed.
 launch_dir=$ROOT/.dev-cwd
-mkdir -p "$launch_dir" || fail "cannot create launch dir: $launch_dir" 73
+[ -d "$launch_dir" ] || mkdir -p "$launch_dir" || fail "cannot create launch dir: $launch_dir" 73
 for entry in "$launch_dir"/* "$launch_dir"/.[!.]* "$launch_dir"/..?*; do
 	[ -e "$entry" ] && fail "launch dir is not empty ($entry); it must contain nothing, remove the stray file" 78
 done
