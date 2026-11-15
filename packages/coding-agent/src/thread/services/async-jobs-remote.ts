@@ -27,6 +27,8 @@ import type {
 	AsyncJobDetails,
 	AsyncJobFilter,
 	AsyncJobManagerApi,
+	AsyncJobNoticePolicy,
+	AsyncJobNoticeSink,
 	AsyncJobProcess,
 	AsyncJobReapResult,
 	AsyncJobRegisterOptions,
@@ -370,6 +372,17 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return localUnsubscribe(
 			this.#remote.callSync("registerDeliverySink", ownerId, (jobId, text, job) =>
 				sink(jobId, text, job ? this.#row(job) : undefined),
+			),
+		);
+	}
+
+	registerNoticeSink(ownerId: string, sink: AsyncJobNoticeSink, policy: AsyncJobNoticePolicy): () => void {
+		return localUnsubscribe(
+			this.#remote.callSync(
+				"registerNoticeSink",
+				ownerId,
+				(jobId, text, job) => sink(jobId, text, this.#row(job)),
+				policy,
 			),
 		);
 	}

@@ -21,17 +21,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import puppeteer, { type Browser, type Page, type WebWorker } from "puppeteer-core";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
+import { removeRelayBindingFixture, TEST_INSTALL_ID, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const ASSETS = path.resolve(import.meta.dir, "../../src/tools/browser/relay/extension-assets");
-
-const session = {
-	cwd: process.cwd(),
-	hasUI: false,
-	settings: Settings.isolated(),
-	getSessionFile: () => null,
-} as unknown as ToolSession;
 
 const site = Bun.serve({
 	port: 0,
@@ -45,6 +40,16 @@ const site = Bun.serve({
 });
 const origin = `http://127.0.0.1:${site.port}`;
 afterAll(() => site.stop(true));
+
+const session = grantBrowserFixtureScope(
+	{
+		cwd: process.cwd(),
+		hasUI: false,
+		settings: Settings.isolated(),
+		getSessionFile: () => null,
+	} as unknown as ToolSession,
+	loopbackOrigins(site.port),
+);
 
 /** Opens the user's tab selected and the tab omp will drive in the background, which therefore reads hidden. */
 async function openTabs(browser: Browser, openBackground: (url: string) => Promise<unknown>): Promise<Page> {
@@ -97,7 +102,9 @@ interface RelayFixture {
 /** Headless Chromium running the real relay extension against a relay on a free port, with the tabs of {@link openTabs}. */
 async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise<void> {
 	const port = await findFreeCdpPort();
-	const server = startRelayServer({ port, group: false });
+	// The relay serves only the profile install its binding names: bind it to the id the extension is seeded with.
+	const bindingPath = await writeRelayBindingFixture(TEST_INSTALL_ID);
+	const server = startRelayServer({ port, group: false, bindingPath });
 	const extensionDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-background-"));
 	let browser: Browser | undefined;
 	try {
@@ -108,7 +115,7 @@ async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise
 		// Point the disposable extension at this relay before its code can dial a user's default relay.
 		await Bun.write(
 			path.join(extensionDir, "background.js"),
-			`chrome.storage.local.set({ port: ${port} }).then(() => {\n${background}\n});`,
+			`chrome.storage.local.set({ port: ${port}, ompInstallId: ${JSON.stringify(TEST_INSTALL_ID)} }).then(() => {\n${background}\n});`,
 		);
 		browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
@@ -122,7 +129,7 @@ async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise
 		).worker();
 		if (!extension) throw new Error("Missing relay extension worker");
 		const cdpUrl = `http://127.0.0.1:${port}`;
-		expect(await waitForRelayExtension(cdpUrl)).toBe("ready");
+		expect((await waitForRelayExtension(cdpUrl)).kind).toBe("ready");
 		const target = await openTabs(browser, url =>
 			extension.evaluate(`chrome.tabs.create({ url: ${JSON.stringify(url)}, active: false })`),
 		);
@@ -131,6 +138,7 @@ async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise
 		await browser?.close();
 		server.stop();
 		await fs.rm(extensionDir, { recursive: true, force: true });
+		await removeRelayBindingFixture(bindingPath);
 	}
 }
 

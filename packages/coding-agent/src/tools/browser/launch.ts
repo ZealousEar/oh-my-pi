@@ -747,10 +747,11 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	// (issue #7058). `removeUserDataDir` cleans a TEMP profile up on our terms;
 	// a durable `profileDir` is never removed.
 	let userDataDir: string | undefined;
-	let profileDir = opts.profileDir ?? findUserDataDirInArgs(launchArgs);
+	let profileDir = findUserDataDirInArgs(launchArgs);
 	if (opts.profileDir) {
-		await fs.promises.mkdir(opts.profileDir, { recursive: true, mode: 0o700 });
-		launchArgs.push(`--user-data-dir=${opts.profileDir}`);
+		profileDir = opts.profileDir;
+		await fs.promises.mkdir(profileDir, { recursive: true, mode: 0o700 });
+		launchArgs.push(`--user-data-dir=${profileDir}`);
 	} else if (!profileDir) {
 		userDataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-chrome-profile-"));
 		profileDir = userDataDir;

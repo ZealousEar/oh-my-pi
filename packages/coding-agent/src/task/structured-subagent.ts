@@ -1059,7 +1059,7 @@ async function runPaneBackendIfRequested(args: {
 		nestedSpawn:
 			Array.isArray(effectiveAgent.spawns) &&
 			canSpawnAtDepth(cfgTaskMaxRecursionDepth.get(request.session.settings), request.session.taskDepth ?? 0),
-		mcpProxies: options.enableMCP === true && (options.mcpManager?.getAllServerNames().length ?? 0) > 0,
+		mcpProxies: options.enableMCP === true && (options.mcpManager?.getConnectedServers().length ?? 0) > 0,
 		advisor: Boolean(effectiveAgent.advisor),
 		prewalk: Boolean(effectiveAgent.prewalk),
 		restrictedSession: options.restrictToolNames === true,

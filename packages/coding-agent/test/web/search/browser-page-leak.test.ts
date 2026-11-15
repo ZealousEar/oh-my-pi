@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getDaemonRuntimeDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { withTimeout } from "@oh-my-pi/pi-utils";
 import * as launch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	forgetSharedTarget,
@@ -35,7 +35,7 @@ const scopes: SharedTargetScope[] = [];
 /** Unique per-test scope; `afterEach` removes its registry dir even when a test fails. */
 function trackedScope(): SharedTargetScope {
 	const scope = {
-		projectDir: path.join("/tmp", `omp-search-leak-test-${crypto.randomUUID()}`),
+		runtimeDir: path.join("/tmp", `omp-search-leak-test-${crypto.randomUUID()}`),
 		daemonName: DAEMON_NAME,
 	};
 	scopes.push(scope);
@@ -49,9 +49,7 @@ async function ownedTargets(scope: SharedTargetScope): Promise<string[]> {
 	const probe = `chain-probe-${crypto.randomUUID()}`;
 	await recordSharedTarget(scope, probe);
 	await forgetSharedTarget(scope, probe);
-	const file = Bun.file(
-		path.join(getDaemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`, `${process.pid}.json`),
-	);
+	const file = Bun.file(path.join(scope.runtimeDir, `${scope.daemonName}.targets`, `${process.pid}.json`));
 	if (!(await file.exists())) return [];
 	return ((await file.json()) as { targets: string[] }).targets;
 }
@@ -169,7 +167,7 @@ function fakeChromium(scope: SharedTargetScope, options: FakeChromiumOptions = {
 		kind: { kind: "headless", headless: true },
 		refCount: 0,
 		browser,
-		sharedDaemon: { name: scope.daemonName, projectDir: scope.projectDir },
+		sharedDaemon: { name: scope.daemonName, runtimeDir: scope.runtimeDir },
 		stealth: { browserSession: null, override: null },
 	} as unknown as PuppeteerBrowserHandle;
 
@@ -215,7 +213,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	resetOrphanRegistryForTest();
 	for (const scope of scopes.splice(0)) {
-		await fs.rm(getDaemonRuntimeDir(scope.projectDir), { recursive: true, force: true }).catch(() => undefined);
+		await fs.rm(scope.runtimeDir, { recursive: true, force: true }).catch(() => undefined);
 	}
 });
 

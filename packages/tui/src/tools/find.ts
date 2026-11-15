@@ -471,7 +471,8 @@ function renderCascade(details: FindCascadeDetails, options: RenderResultContext
 	const failed = stats.failed > 0 ? `${stats.failed}/${stats.requests} requests failed` : undefined;
 	if (failed) meta.push(uiTheme.fg("warning", failed));
 	const { timeout } = details;
-	if (timeout) meta.push(uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`));
+	if (timeout)
+		meta.push(uiTheme.fg("warning", `timed out, ${timeout.verified}/${timeout.passages} passages verified`));
 
 	if (hits.length === 0) {
 		const emptyMeta = ["0 hits", ...scope, `$${stats.cost.toFixed(4)}`, formatDuration(details.elapsedMs)];

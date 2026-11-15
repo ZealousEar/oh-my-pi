@@ -256,6 +256,11 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 					sink(jobId, text, job ? toJobWire(job) : undefined),
 				),
 			),
+		registerNoticeSink: (manager, ownerId, sink, policy) =>
+			cleanups.track(
+				threadId,
+				manager.registerNoticeSink(ownerId, (jobId, text, job) => sink(jobId, text, toJobWire(job)), policy),
+			),
 		waitForOwnerJobs: (manager, ownerId, options) => manager.waitForOwnerJobs(ownerId, options),
 		cancelAndReapOwnerJobs: (manager, ownerId, deadlineAt) => manager.cancelAndReapOwnerJobs(ownerId, deadlineAt),
 		drainDeliveries: (manager, options) => manager.drainDeliveries(options),
