@@ -233,7 +233,8 @@ def report(bots, last, show_hands):
         print(f"\n=== {name} ({prof['status']}, activated {str(prof.get('activated_at'))[:16]}) "
               f"rating {prof['rating']:.0f} -> {'#' if listed else '~#'}{rank} of {len(ladder) + (not listed)} "
               f"{'' if listed else '(not listed on the public ladder) '}| {prof['wins']}-{prof['losses']}, "
-              f"{prof['bb_per_100']:+.1f} bb/100 over {prof['bb_hands_counted']} hands"
+              + (f"{prof['bb_per_100']:+.1f} bb/100" if prof.get('bb_per_100') is not None else "bb/100 n/a")
+              + f" over {prof['bb_hands_counted']} hands"
               f"{' (provisional)' if prof.get('bb_per_100_provisional') else ''}")
         if season:
             row = next((r for r in season["rows"] if r["bot_id"] == bid), None)
