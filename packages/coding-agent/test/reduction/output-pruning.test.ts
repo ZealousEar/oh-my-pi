@@ -359,7 +359,7 @@ describe("bash output pruning", () => {
 		expect(result.visible).toContain("warning: preserve this compiler diagnostic");
 		expect(result.visible).toContain("319 pass, 1 fail");
 		expect(result.visible).toContain("[pruned output:");
-		expect(result.visible).toContain("original: artifact://77]");
+		expect(result.visible).toContain("original: local://77.log]");
 		expect(result.receipt?.source.contentHash).toHaveLength(64);
 		expect(result.receipt?.source.originalArtifactId).toBe("77");
 		expect(result.receipt?.baselineTokens).toBeGreaterThan(result.receipt?.visibleTokens ?? 0);

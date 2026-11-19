@@ -4,5 +4,5 @@ Background {{type}} job {{jobId}}{{#if label}} ({{label}}){{/if}} has reported n
 ```
 {{lastOutput}}
 ```
-{{/if}}Inspect its status/output once (`read proc://{{jobId}}`; `artifact://` for captured output). If it is waiting on input or stuck, stop it now with `write proc://{{jobId}}/kill` (omit `content`) rather than waiting on it.
+{{/if}}Inspect its status/output once (`read proc://{{jobId}}`; `local://N.log` for spilled output). If it is waiting on input or stuck, stop it now with `write proc://{{jobId}}/kill` (omit `content`) rather than waiting on it.
 </system-notice>

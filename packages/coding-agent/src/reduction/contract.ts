@@ -36,7 +36,7 @@
  *    the bounded task context, after {@link prepareEgressText}; and only when
  *    the profile opted in (`reduction.egress = "selected"`). Nothing is sent
  *    when egress is off (`egress-disabled`).
- *  - Recovery reads (`artifact://…`) are never reduced again.
+ *  - Recovery reads (`local://N.log`) are never reduced again.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../config/model-registry";
@@ -131,7 +131,7 @@ export interface ReductionReceipt {
 	/** Spans kept verbatim after selection. */
 	keptSpans: ReductionSpan[];
 	omittedSpans: OmittedSpan[];
-	/** Single native recovery locator for the lossless original, e.g. `artifact://12`. */
+	/** Single native recovery locator for the lossless original, e.g. `local://12.log`. */
 	recovery: { locator: string };
 	/** Set when no stage changed the visible text; `stages` still record what ran. */
 	skipped?: ReductionSkip;

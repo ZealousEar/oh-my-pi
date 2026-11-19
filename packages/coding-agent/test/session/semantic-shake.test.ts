@@ -300,7 +300,7 @@ describe("AgentSession shake semantic", () => {
 		const [kept, elided] = branchToolResults();
 		expectUntouched(kept, NEEDED);
 		expect(elided.prunedAt).toBeGreaterThan(0);
-		expect(resultText(elided)).toContain(`artifact://${result.artifactId}`);
+		expect(resultText(elided)).toContain(`local://${result.artifactId}.log`);
 		expect(resultText(elided)).toContain("shaken");
 		const archived = await archivedText(result.artifactId);
 		expect(archived).toContain(CONSUMED);
@@ -312,7 +312,7 @@ describe("AgentSession shake semantic", () => {
 		expect(elidedReceipt).toMatchObject({
 			version: 1,
 			source: { kind: "tool-result", originalArtifactId: result.artifactId },
-			recovery: { locator: `artifact://${result.artifactId}` },
+			recovery: { locator: `local://${result.artifactId}.log` },
 			keptSpans: [],
 			omittedSpans: [{ start: 0, end: CONSUMED.length, reason: "judge", probability: 0.3 }],
 		});
@@ -650,12 +650,12 @@ describe("AgentSession shake semantic", () => {
 		appendUser("finish the TLS listener");
 		seedToolResult(`skill ${"s ".repeat(500)}`, "skill", { name: "deploy" });
 		seedToolResult(`skill read ${"r ".repeat(500)}`, "read", { path: "skill://deploy/SKILL.md" });
-		seedToolResult(`recovered ${"a ".repeat(500)}`, "read", { path: "artifact://3" });
+		seedToolResult(`recovered ${"a ".repeat(500)}`, "read", { path: "local://3.log" });
 		seedToolResult(
 			`recovered by meta ${"m ".repeat(500)}`,
 			"read",
 			{ path: "/tmp/artifacts/3.shake.log" },
-			{ details: { meta: { source: { type: "internal", value: "artifact://3" } } } },
+			{ details: { meta: { source: { type: "internal", value: "local://3.log" } } } },
 		);
 		seedToolResult(CONSUMED);
 		appendUser(`newer context\n${"tail ".repeat(2_000)}`);

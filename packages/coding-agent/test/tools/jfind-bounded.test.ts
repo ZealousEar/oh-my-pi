@@ -198,7 +198,8 @@ describe("find bounded mode", () => {
 		await Bun.write(bigPath, "the answer is here\n".repeat(20_000));
 		const binaryPath = path.join(tmpDir, "blob.bin");
 		await Bun.write(binaryPath, new Uint8Array([104, 105, 0, 1, 2, 3]));
-		await Bun.write(path.join(artifactDir, "0.bash.log"), "selector target\nsecond\n");
+		await fs.mkdir(path.join(artifactDir, "local"), { recursive: true });
+		await Bun.write(path.join(artifactDir, "local", "0.log"), "selector target\nsecond\n");
 
 		const judge = new FixtureJudge({}, 0.9);
 		const result = await run(
@@ -211,7 +212,7 @@ describe("find bounded mode", () => {
 					binaryPath,
 					path.join(tmpDir, "missing.txt"),
 					tmpDir,
-					"artifact://0:1-1",
+					"local://0.log:1-1",
 				],
 			},
 			{ "semanticFind.maxBytesPerFile": 4096 },
@@ -222,7 +223,7 @@ describe("find bounded mode", () => {
 		expect(reasons.get(binaryPath)).toBe("binary content");
 		expect(reasons.get(path.join(tmpDir, "missing.txt"))).toContain("unreadable");
 		expect(reasons.get(tmpDir)).toBe(`directory — name files or a glob such as ${tmpDir}/*`);
-		expect(reasons.get("artifact://0:1-1")).toContain("line-range selectors are not supported");
+		expect(reasons.get("local://0.log:1-1")).toContain("line-range selectors are not supported");
 		expect(result.details?.coverage.files).toBe(1);
 		const text = getText(result);
 		expect(text).toContain("skipped");
@@ -341,20 +342,21 @@ describe("find bounded mode", () => {
 	});
 
 	it("resolves internal URLs and keeps their locations addressable by the same URL", async () => {
+		await fs.mkdir(path.join(artifactDir, "local"), { recursive: true });
 		await Bun.write(
-			path.join(artifactDir, "0.bash.log"),
+			path.join(artifactDir, "local", "0.log"),
 			["prelude", "the spill threshold is decided in getSpillConfig", "epilogue"].join("\n"),
 		);
-		const judge = new FixtureJudge({ "artifact://0:2-2": 30 }, 0.92);
+		const judge = new FixtureJudge({ "local://0.log:2-2": 30 }, 0.92);
 		const result = await run(judge, {
 			query: "where is the spill threshold decided?",
-			paths: ["artifact://0"],
+			paths: ["local://0.log"],
 			limit: 2,
 		});
 
-		expect(result.details?.results[0]).toMatchObject({ path: "artifact://0", startLine: 2, endLine: 2 });
-		expect(getText(result)).toContain("artifact://0:2-2  score ");
-		expect(judge.requests[0]?.sources).toContain("artifact://0:2-2");
+		expect(result.details?.results[0]).toMatchObject({ path: "local://0.log", startLine: 2, endLine: 2 });
+		expect(getText(result)).toContain("local://0.log:2-2  score ");
+		expect(judge.requests[0]?.sources).toContain("local://0.log:2-2");
 		expect(result.details?.verification.verified).toBe(true);
 	});
 

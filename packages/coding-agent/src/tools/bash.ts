@@ -20,7 +20,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { PipeStreams, repairHeredocContinuations, type ShellCommands, shellBuiltins } from "@oh-my-pi/pi-natives";
-import { $which, isEnoent, logger, prompt, spillUrl } from "@oh-my-pi/pi-utils";
+import { $which, isEnoent, logger, prompt, spillUrl, spillUrlIds } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
@@ -1947,7 +1947,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const sessionEnv = this.#sessionEnv(toolCallId);
 		// A recovery read of a pruned original must never be pruned again.
-		const recoveryRead = rawCommand.includes("artifact://");
+		const recoveryRead = spillUrlIds(rawCommand).length > 0;
 
 		// Extract a leading `cd <path> && ...` / `cd <path>; ...` into cwd when the
 		// model ignores the cwd parameter. The scanner captures only a single path

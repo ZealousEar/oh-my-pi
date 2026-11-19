@@ -3274,7 +3274,7 @@ describe("RelayBridge download paths", () => {
 
 describe("RelayBridge hidden frames", () => {
 	it("holds what the extension hid for the worker driving the tab, and past a Chrome detach for the next one", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const take = async (cdp: FakeCdpSocket, connId: number, sessionId: string) => {
@@ -3307,7 +3307,7 @@ describe("RelayBridge hidden frames", () => {
 	});
 
 	it("keeps each hidden frame once, on one line, and only the latest while no worker takes them", async () => {
-		const bridge = new RelayBridge({});
+		const bridge = bridgeWith();
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, [tab({ tabId: 1 })]);
 		const frame = (n: number) => ({ extensionId: "a".repeat(32), path: `inline/${n}.html` });

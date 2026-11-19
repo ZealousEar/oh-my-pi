@@ -309,13 +309,6 @@ async function activeChromeTabUrl(fixture: RelayFixture): Promise<unknown> {
 	);
 }
 
-const session = {
-	cwd: process.cwd(),
-	hasUI: false,
-	settings: Settings.isolated(),
-	getSessionFile: () => null,
-} as unknown as ToolSession;
-
 /**
  * A stand-in password manager running `contentScript` on the fixture site, which may draw its `menu.html` and
  * `notification.html` into the page as chrome-extension:// frames.
@@ -359,12 +352,13 @@ const occurrences = (text: string, part: string) => text.split(part).length - 1;
  * What the calls on tab `name` showed, starting with what `told` holds so far, until one names `extensionId` and then
  * one more: the relay reports what it hid while the calls go on, so a later call may carry it. At most 20 more calls.
  */
-async function untilNamed(name: string, extensionId: string, ...told: string[]): Promise<string[]> {
-	const titleCall = {
-		code: "return await tab.title();",
-		timeoutMs: 10_000,
-		session,
-	};
+async function untilNamed(
+	session: ToolSession,
+	name: string,
+	extensionId: string,
+	...told: string[]
+): Promise<string[]> {
+	const titleCall = { code: "return await tab.title();", timeoutMs: 10_000, session };
 	for (let call = 0; call < 20 && !told.some(text => text.includes(extensionId)); call++) {
 		told.push(shown(await runInTab(name, titleCall)));
 	}
@@ -713,7 +707,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			const vaultId = await unpackedExtensionId(vaultDir);
 			if (!vaultId) throw new Error("Missing stand-in vault directory");
 			if ((await emptiedFrames(driven)) > 0) {
-				const told = await untilNamed(name, vaultId, failed, shown(filled));
+				const told = await untilNamed(session, name, vaultId, failed, shown(filled));
 				expect(occurrences(told.join("\n"), vaultId)).toBe(1);
 				expect(told.join("\n")).toContain(`"menu.html"`);
 				expect(told.at(-1)).not.toContain(vaultId);
@@ -744,6 +738,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 }, true);`,
 		);
 		const fixture = await launchRelayFixture(undefined, [vaultDir]);
+		const { session } = fixture;
 		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
 		const name = `relay-vault-submit-${process.pid}`;
 		const title = {
@@ -777,7 +772,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			}).then(shown, (error: unknown) => String(error));
 			const after = await runInTab(name, title);
 			expect(after.returnValue).toBe("Signed in");
-			const told = await untilNamed(name, vaultId, submitted, shown(after));
+			const told = await untilNamed(session, name, vaultId, submitted, shown(after));
 			// The card's page, once, by the title the vault gave it.
 			expect(occurrences(told.join("\n"), vaultId)).toBe(1);
 			expect(told.join("\n")).toContain(`"notification.html"`);

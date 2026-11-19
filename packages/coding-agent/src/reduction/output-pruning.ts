@@ -1,5 +1,5 @@
 import type { JudgmentState, Model, NoulAnswer, NoulQuestion, Questions } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { prompt, spillUrl } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import { cfgBashOutputPruning } from "../exec/settings";
@@ -105,7 +105,7 @@ export const SEMANTIC_SEGMENT_CHARS = 40_000;
 const PATH_REFERENCE_RE = /(?:^|\s)(?:[A-Za-z]:[\\/]|\.{0,2}[\\/]|[A-Za-z0-9_.-]+[\\/])?[^\s:]+:\d+(?::\d+)?(?:\b|$)/u;
 const RESULT_COUNT_RE = /\b\d+\s+(?:pass|passed|fail|failed|tests?|files?|packages?|errors?|warnings?)\b/iu;
 const STATUS_RE =
-	/(?:Command exited|exit(?:ed)?(?:\s+code|\s+status)?|status:|wall time:|elapsed:|timed out|aborted|cancelled|output truncated|raw output:|artifact:\/\/)/iu;
+	/(?:Command exited|exit(?:ed)?(?:\s+code|\s+status)?|status:|wall time:|elapsed:|timed out|aborted|cancelled|output truncated|raw output:|local:\/\/\d+\.log)/iu;
 const URL_RE = /\b(?:https?|file):\/\/\S+/iu;
 const ABSOLUTE_PATH_RE = /(?:^|\s)(?:\/[^\s]|[A-Za-z]:[\\/])/u;
 const NOISE_RE =
@@ -534,7 +534,7 @@ function unchangedReceipt(
 			contentHash: contentHash(input.baseline),
 		},
 		tokens,
-		input.existingArtifactId ? `artifact://${input.existingArtifactId}` : "inline",
+		input.existingArtifactId ? spillUrl(input.existingArtifactId) : "inline",
 		skipped,
 		stages,
 		admission?.meter.attempts.slice() ?? [],
@@ -665,7 +665,7 @@ export async function pruneBashOutput(input: PruneBashOutputInput): Promise<Prun
 			),
 		};
 	const body = render(input.baseline, omissions);
-	const estimate = `${body}\n[pruned output: ${baselineTokens}→0 tokens; original: artifact://00000000]`;
+	const estimate = `${body}\n[pruned output: ${baselineTokens}→0 tokens; original: ${spillUrl("00000000")}]`;
 	if (!useful(baselineTokens, input.tokenizer.countTokens(estimate)))
 		return {
 			visible: input.baseline,
@@ -705,7 +705,7 @@ export async function pruneBashOutput(input: PruneBashOutputInput): Promise<Prun
 	let visibleTokens = input.tokenizer.countTokens(body);
 	let visible = "";
 	for (let iteration = 0; iteration < 8; iteration++) {
-		visible = `${body}\n[pruned output: ${baselineTokens}→${visibleTokens} tokens; original: artifact://${artifactId}]`;
+		visible = `${body}\n[pruned output: ${baselineTokens}→${visibleTokens} tokens; original: ${spillUrl(artifactId)}]`;
 		const measured = input.tokenizer.countTokens(visible);
 		if (measured === visibleTokens) break;
 		visibleTokens = measured;
@@ -729,7 +729,7 @@ export async function pruneBashOutput(input: PruneBashOutputInput): Promise<Prun
 				.map(segment => ({ start: segment.start, end: segment.end })),
 			keptSpans: complement(input.baseline.length, omissions),
 			omittedSpans: omissions,
-			recovery: { locator: `artifact://${artifactId}` },
+			recovery: { locator: spillUrl(artifactId) },
 			decisions: admission?.meter.attempts.slice() ?? [],
 			cost: reductionCost(admission?.meter, performance.now() - started),
 		},

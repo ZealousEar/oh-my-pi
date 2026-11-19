@@ -2239,7 +2239,8 @@ export class UnitTable {
 				: await UnitLog.open(unitLogDir(entry.snapshot.id), false);
 		runtime.stopRequested = false;
 		runtime.lifetimeExpired = false;
-		if (freshRun && entry.proc?.lifetimeMs !== undefined) entry.snapshot.deadlineAt = Date.now() + entry.proc.lifetimeMs;
+		if (freshRun && entry.proc?.lifetimeMs !== undefined)
+			entry.snapshot.deadlineAt = Date.now() + entry.proc.lifetimeMs;
 		const owner = entry.snapshot.owner;
 		entry.completion = {
 			capable: owner !== undefined && this.#subscriptions.has(owner),
