@@ -5,6 +5,7 @@
 # key held by the shared authority; refuseless owner-approved 2026-11-01, key held by the shared
 # authority via /login; web/local = 18.3 search backends and
 # on-device models).
+# google (API key) owner-approved 2026-11-19.
 # Every other catalog provider and the keyless local discoverables are
 # disabled so an API key inherited from the shell environment (e.g. FIREWORKS_API_KEY from
 # ~/.zshenv) can never become the silently selected default. With no login yet, no model
@@ -39,7 +40,6 @@ disabledProviders:
   - gitlab-duo
   - gitlab-duo-agent
   - gmi-cloud
-  - google
   - google-antigravity
   - google-gemini-cli
   - google-vertex

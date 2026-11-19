@@ -45,7 +45,6 @@ disabledProviders:
   - gitlab-duo
   - gitlab-duo-agent
   - gmi-cloud
-  - google
   - google-antigravity
   - google-gemini-cli
   - google-vertex
