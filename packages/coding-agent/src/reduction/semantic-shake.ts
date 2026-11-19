@@ -16,7 +16,7 @@
 import type { AgentToolCall } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultShakeRegion } from "@oh-my-pi/pi-agent-core/compaction";
 import type { JudgmentState, Model, NoulQuestion, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { logger, prompt, spillUrl } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import { type DecisionProvenance, judgeWithMeter, LoopBudgetExceeded } from "../judgment/decision";
@@ -474,7 +474,7 @@ export function shakeRegionReceipt(input: {
 						...(decision.probability === undefined ? {} : { probability: decision.probability }),
 					},
 				],
-		recovery: { locator: input.artifactId === undefined ? "" : `artifact://${input.artifactId}` },
+		recovery: { locator: input.artifactId === undefined ? "" : spillUrl(input.artifactId) },
 		...(decision.keep ? { skipped: kept } : {}),
 		decisions: decision.attempts,
 		cost: {

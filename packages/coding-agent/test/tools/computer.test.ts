@@ -530,7 +530,8 @@ describe("computer prelude", () => {
 
 	it("keeps partial failure evidence through JavaScript Eval", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		// Grants attach to the session object, so the override goes through toolSession, not a spread copy.
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const supervisor = new ComputerSupervisor(
 			session,
 			() => liveWorker(new FakeNativeSession()),
@@ -567,7 +568,7 @@ describe("computer prelude", () => {
 
 	it("keeps partial failure evidence through Python Eval", async () => {
 		let definitions: readonly EvalPreludeDefinition[] = [];
-		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const session = toolSession({ getEvalPreludes: () => definitions });
 		const supervisor = new ComputerSupervisor(
 			session,
 			() => liveWorker(new FakeNativeSession()),

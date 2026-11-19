@@ -3,6 +3,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	createBrowserPrelude,
 	DEFAULT_RELAY_URL,
+	RELAY_DISABLED_MESSAGE,
 	resolveBrowserKind,
 	resolveRelayKind,
 } from "@oh-my-pi/pi-coding-agent/tools/browser";
@@ -182,9 +183,10 @@ describe("resolveBrowserKind in a subagent", () => {
 		expect(resolveBrowserKind({ action: "open", app: "relay" }, session, pane).kind).toBe("relay");
 		expect(resolveBrowserKind({ action: "open", app: "tern" }, session, pane).kind).toBe("tern");
 		expect(resolveBrowserKind({ action: "open", target: "docs" }, session, pane).kind).toBe("tern");
-		expect(
-			resolveBrowserKind({ action: "open", app: "relay" }, session, { ...pane, PI_BROWSER_RELAY: "0" }).kind,
-		).toBe("headless");
+		// The fork fails closed: a killed relay never re-points an explicit relay open at another profile.
+		expect(() =>
+			resolveBrowserKind({ action: "open", app: "relay" }, session, { ...pane, PI_BROWSER_RELAY: "0" }),
+		).toThrow(RELAY_DISABLED_MESSAGE);
 	});
 
 	it("gets no relay guidance, since its open without app stays out of the user's Chrome", () => {

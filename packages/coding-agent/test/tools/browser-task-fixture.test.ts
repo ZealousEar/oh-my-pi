@@ -34,6 +34,8 @@ function makeSession(): ToolSession {
 			"browser.headless": true,
 			"browser.relay": false,
 			"browser.cmux": false,
+			// browser.task needs a Puppeteer page; an installed WebKit host would take the headless open.
+			"browser.webkit": false,
 		}),
 	};
 }

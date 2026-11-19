@@ -177,6 +177,16 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("adopted user tab — steering denied witho
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-adopted-"));
 		const port = await findFreeCdpPort();
 		const cdpUrl = `http://127.0.0.1:${port}`;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				new Response("<!doctype html><title>local B</title><p id=b>b</p>", {
+					headers: { "Content-Type": "text/html" },
+				}),
+		});
+		const localA = `http://127.0.0.1:${server.port}/user-a`;
+		const localB = `http://127.0.0.1:${server.port}/b`;
 		const child = Bun.spawn(
 			[
 				exe,
@@ -188,18 +198,10 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("adopted user tab — steering denied witho
 				"--password-store=basic",
 				`--user-data-dir=${path.join(root, "profile")}`,
 				`--remote-debugging-port=${port}`,
+				localA,
 			],
 			{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
 		);
-		const server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch: () =>
-				new Response("<!doctype html><title>local B</title><p id=b>b</p>", {
-					headers: { "Content-Type": "text/html" },
-				}),
-		});
-		const localB = `http://127.0.0.1:${server.port}/b`;
 		const s = session();
 		const prelude = createBrowserPrelude(s);
 		const invoke = (parameters: unknown) => prelude.invoke(parameters, { session: s, toolCallId: "adopted-fixture" });
@@ -211,11 +213,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("adopted user tab — steering denied witho
 		const owned = `owned-${crypto.randomUUID()}`;
 		try {
 			await waitForCdp(cdpUrl, 15_000);
-			const [userPage] = await pages();
+			const userPage = (await pages()).find(p => p.url === localA);
 			if (!userPage) throw new Error("Expected the launched browser to expose its startup page");
 
-			// Bare adoption reads only: allowed with no grant.
-			const open = await invoke({ action: "open", name: adopted, app: cdpUrl });
+			// Bare adoption (each CDP open gets its own page unless `target` names one) reads only: allowed with no grant.
+			const open = await invoke({ action: "open", name: adopted, app: cdpUrl, target: "/user-a" });
 			expect(open.details).toMatchObject({ owned: false });
 
 			// focus/hover live on element handles (`tab.ref(id).focus()`); the gate

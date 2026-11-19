@@ -62,6 +62,8 @@ describe("browser identity resolution", () => {
 				"browser.cdpUrl": "http://127.0.0.1:9222",
 				"browser.cmux": true,
 				"browser.headless": true,
+				// The WebKit host takes a headless open when installed; keep the result host-independent.
+				"browser.webkit": false,
 			}),
 		);
 		expect(kind).toEqual({ kind: "headless", headless: true });

@@ -4,12 +4,10 @@
  * spawning its own build, and a supervised `serve` takes the port over from a
  * foreign relay once it exits. Every port here is ephemeral.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { bindRelayPort } from "@oh-my-pi/pi-coding-agent/cli/browser-relay-cli";
-import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import * as daemonClientModule from "@oh-my-pi/pi-coding-agent/daemon/client";
+import type { DaemonClient } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { ensureRelayDaemon } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/daemon";
 import {
@@ -19,7 +17,6 @@ import {
 	resolveRelayKind,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/kind";
 import type { RelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
-import { refreshDirsFromEnv } from "@oh-my-pi/pi-utils";
 import { removeRelayBindingFixture, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 /** 503 body of a stock/legacy relay (18.2.6 / 18.1.10): no protocol field at all. */
@@ -93,42 +90,30 @@ describe("resolveRelayKind pinning env", () => {
 });
 
 describe("ensureRelayDaemon", () => {
-	let tempHome = "";
-	const savedEnv: Record<string, string | undefined> = {};
 	const servers: Bun.Server<undefined>[] = [];
+	/** Every daemon connection ensureRelayDaemon asks for; the stub knows no units and opens none. */
+	let daemonConnects = 0;
 
-	// Every test gets its own HOME so "no broker dir" assertions never depend on order.
-	// The dirs resolver freezes the base config root at construction, so it is
-	// rebuilt after the homedir mock (and again after restoring it).
-	beforeEach(async () => {
-		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-pinning-home-"));
-		for (const key of ["HOME", "USERPROFILE", "PI_CONFIG_DIR", "OMP_DAEMON_IDLE_GRACE_MS"]) {
-			savedEnv[key] = process.env[key];
-		}
-		process.env.HOME = tempHome;
-		process.env.USERPROFILE = tempHome;
-		process.env.PI_CONFIG_DIR = ".omp";
-		process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
-		spyOn(os, "homedir").mockReturnValue(tempHome);
-		refreshDirsFromEnv();
+	beforeEach(() => {
+		daemonConnects = 0;
+		const stub = {
+			request: async () => {
+				throw new Error("unknown unit");
+			},
+			open: async () => {
+				throw new Error("stub daemon opens no units");
+			},
+		} as unknown as DaemonClient;
+		spyOn(daemonClientModule, "daemonClient").mockImplementation(async () => {
+			daemonConnects++;
+			return stub;
+		});
 	});
 
-	afterEach(async () => {
+	afterEach(() => {
 		for (const server of servers.splice(0)) server.stop(true);
-		await closeDaemonClients();
-		spyOn(os, "homedir").mockRestore();
-		for (const key in savedEnv) {
-			const value = savedEnv[key];
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-		refreshDirsFromEnv();
-		// Real broker process: its idle grace (200 ms) must elapse before its runtime dir disappears.
-		await Bun.sleep(400);
-		await fs.rm(tempHome, { recursive: true, force: true });
+		vi.restoreAllMocks();
 	});
-
-	const globalBrokerDir = () => path.join(tempHome, ".omp", "run", "daemons", "global", "browser-relay");
 
 	it("refuses a legacy/stock relay when a protocol is required, before touching any broker", async () => {
 		const legacy = serveJson(LEGACY_UNAVAILABLE);
@@ -144,7 +129,7 @@ describe("ensureRelayDaemon", () => {
 				supervisor: { kind: "launchd", label: "ai.omp.browser-relay" },
 			}),
 		).rejects.toThrow("launchctl kickstart -k gui/");
-		expect(await fs.exists(globalBrokerDir())).toBe(false);
+		expect(daemonConnects).toBe(0);
 	});
 
 	it("supervised: nothing serving and the supervisor cannot be kicked → fails closed without spawning a broker", async () => {
@@ -161,7 +146,7 @@ describe("ensureRelayDaemon", () => {
 			}),
 		).rejects.toThrow("pinned browser relay service ai.omp.browser-relay is not loaded or did not start");
 		expect(kicked).toEqual(["ai.omp.browser-relay"]);
-		expect(await fs.exists(globalBrokerDir())).toBe(false);
+		expect(daemonConnects).toBe(0);
 	});
 
 	it("supervised: a kickstart that brings up the pinned relay is adopted", async () => {
@@ -176,8 +161,9 @@ describe("ensureRelayDaemon", () => {
 				return true;
 			},
 		});
-		expect(result).toBe(true);
-		expect(await fs.exists(globalBrokerDir())).toBe(false);
+		// The supervisor owns the relay: no daemon unit, no lease.
+		expect(result).toBeNull();
+		expect(daemonConnects).toBe(0);
 	});
 
 	it("adopt-only (supervisor none): nothing serving → exact error, no kickstart, no broker", async () => {
@@ -197,16 +183,16 @@ describe("ensureRelayDaemon", () => {
 			`no omp browser relay is serving ${cdpUrl} and this channel is adopt-only (${RELAY_SUPERVISOR_ENV}=none); start the legacy relay or run the launcher cutover.`,
 		);
 		expect(kicks).toBe(0);
-		expect(await fs.exists(globalBrokerDir())).toBe(false);
+		expect(daemonConnects).toBe(0);
 	});
 
 	it("adopt-only (supervisor none): an already-serving legacy relay is adopted without a broker lease", async () => {
 		const legacy = serveJson(LEGACY_UNAVAILABLE);
 		servers.push(legacy);
-		expect(await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${legacy.port}`, supervisor: { kind: "none" } })).toBe(
-			true,
-		);
-		expect(await fs.exists(globalBrokerDir())).toBe(false);
+		expect(
+			await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${legacy.port}`, supervisor: { kind: "none" } }),
+		).toBeNull();
+		expect(daemonConnects).toBe(0);
 		// A downgrade is still refused under the requirement, without a launchctl hint.
 		await expect(
 			ensureRelayDaemon({
@@ -233,18 +219,18 @@ describe("ensureRelayDaemon", () => {
 					return true;
 				},
 			}),
-		).toBe(true);
+		).toBeNull();
 		expect(kicks).toBe(0);
 	});
 
-	it("adopts a legacy relay when nothing is required, and a pinned-shaped relay under the requirement (broker lease held)", async () => {
+	it("adopts a legacy relay when nothing is required, and a pinned-shaped relay under the requirement (no unit of ours, so no lease)", async () => {
 		const legacy = serveJson(LEGACY_UNAVAILABLE);
 		const pinned = serveJson(PINNED_UNAVAILABLE);
 		servers.push(legacy, pinned);
-		expect(await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${legacy.port}` })).toBe(true);
-		expect(await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${pinned.port}`, requireProtocol: 2 })).toBe(true);
-		// Upstream semantics: adoption goes through the machine-global broker lease.
-		expect(await fs.exists(globalBrokerDir())).toBe(true);
+		expect(await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${legacy.port}` })).toBeNull();
+		expect(await ensureRelayDaemon({ cdpUrl: `http://127.0.0.1:${pinned.port}`, requireProtocol: 2 })).toBeNull();
+		// Unsupervised adoption consults the daemon for a relay unit of its own before leasing.
+		expect(daemonConnects).toBe(2);
 	}, 30_000);
 });
 

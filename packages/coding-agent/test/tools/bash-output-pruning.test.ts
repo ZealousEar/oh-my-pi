@@ -110,9 +110,10 @@ async function harness(
 		asyncJobManager: manager,
 		...(sessionManager === undefined ? {} : { sessionManager }),
 		getAgentId: () => "Main",
-		allocateOutputArtifact: async (prefix: string) => {
+		allocateOutputArtifact: async () => {
 			const id = String(++nextId);
-			const artifactPath = path.join(cwd, `${id}.${prefix}.txt`);
+			await fs.mkdir(path.join(cwd, "local"), { recursive: true });
+			const artifactPath = path.join(cwd, "local", `${id}.log`);
 			paths.set(id, artifactPath);
 			return { id, path: artifactPath };
 		},
@@ -153,7 +154,7 @@ describe("BashTool output pruning", () => {
 		expect(archived).toContain("Compiling 2500");
 		expect(archived).toContain("warning: middle diagnostic");
 		expect(archived).toContain("2499 pass, 1 fail");
-		const recovered = await tool.execute("recover-call", { command: `cat artifact://${artifactId}` });
+		const recovered = await tool.execute("recover-call", { command: `cat local://${artifactId}.log` });
 		const recoveredText = recovered.content.find(block => block.type === "text")?.text ?? "";
 		expect(recovered.details?.reduction?.skipped?.reason).toBe("already-reduced");
 		expect(recoveredText).toContain(archived);
@@ -162,10 +163,10 @@ describe("BashTool output pruning", () => {
 
 	it("keeps the raw-stream locator and pruning recovery footer exactly once above 50KB", async () => {
 		const { tool } = await harness("deterministic");
-		const command = `for i in $(seq 1 6000); do printf 'Compiling %s with enough routine progress detail to exceed the inline output budget\\n' "$i"; done; printf '[raw output: artifact:%s%s999]\\n' '/' '/'`;
+		const command = `for i in $(seq 1 6000); do printf 'Compiling %s with enough routine progress detail to exceed the inline output budget\\n' "$i"; done; printf '[raw output: local:%s%s999.log]\\n' '/' '/'`;
 		const result = await tool.execute("large-prune-call", { command });
 		const text = result.content.find(block => block.type === "text")?.text ?? "";
-		expect(text.match(/\[raw output: artifact:\/\//gu)).toHaveLength(1);
+		expect(text.match(/\[raw output: local:\/\//gu)).toHaveLength(1);
 		expect(text.match(/\[pruned output:/gu)).toHaveLength(1);
 		expect(result.details?.reduction?.source.originalArtifactId).toBeString();
 		expect(result.details?.meta?.truncation?.artifactId).toBeString();

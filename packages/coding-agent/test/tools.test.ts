@@ -1380,7 +1380,7 @@ describe("Coding Agent Tools", () => {
 		it("should tell the model the elided bytes are gone when the spill artifact save fails", async () => {
 			// A failed `saveArtifact` (disk full, permissions) still truncates past
 			// the threshold, but without a failure notice the bare elision reads
-			// like a recoverable artifact: the model hunts for `artifact://` or
+			// like a recoverable spill: the model hunts for `local://N.log` or
 			// assumes the output survived. The failure must reach the notice the
 			// same way a streaming capture failure does.
 			const spillSettings = Settings.isolated({
@@ -1412,7 +1412,7 @@ describe("Coding Agent Tools", () => {
 			expect(result.isError).toBeFalsy();
 			expect(Buffer.byteLength(output, "utf-8")).toBeLessThan(Buffer.byteLength(payload, "utf-8"));
 			expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
-			expect(output).not.toContain("artifact://");
+			expect(output).not.toContain("local://");
 			expect(output).toContain("Full output was not saved completely (artifact write failed)");
 		});
 

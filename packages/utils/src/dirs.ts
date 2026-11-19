@@ -1168,6 +1168,18 @@ export function getDaemonRuntimeDir(projectDir: string): string {
 }
 
 /**
+ * Profile-independent state directory of a machine-global service (~/.omp/run/daemons/global/<service>; XDG
+ * default: $XDG_STATE_HOME/omp/run/daemons/global/<service>). Shared across profiles and channels: the shared
+ * agent browser's target registry, the relay's, and desktop-input automation grants live here.
+ */
+export function getGlobalDaemonRuntimeDir(service: string): string {
+	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(service)) {
+		throw new Error(`Invalid global daemon service name: ${JSON.stringify(service)}`);
+	}
+	return path.join(dirs.baseRootSubdir(path.join("run", "daemons", "global"), "state"), service);
+}
+
+/**
  * Directory naming session ownership leases (~/.omp/run/session-owners; XDG
  * default: $XDG_STATE_HOME/omp/run/session-owners). Shared across profiles:
  * every omp process that opens a session must meet the same lease.

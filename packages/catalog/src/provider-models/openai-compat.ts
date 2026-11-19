@@ -4980,12 +4980,13 @@ export function refuselessModelManagerOptions(config?: ModelManagerConfig): Mode
 			mapModel: (entry, defaults, reference) => {
 				const model = mapWithBundledReference(entry, defaults, reference);
 				// `/v1/models` publishes `reasoning_efforts` only for models that
-				// reason; an unseeded id would otherwise lose its effort dial.
+				// reason, so its absence is a definite "no": an unseeded id gets an
+				// explicit flag either way rather than an unknown that triggers probing.
 				const reasons = Array.isArray(entry.reasoning_efforts) && entry.reasoning_efforts.length > 0;
 				return {
 					...model,
 					contextWindow: toPositiveNumber(entry.context_length, model.contextWindow),
-					...(!reference && reasons && { reasoning: true }),
+					...(!reference && { reasoning: reasons }),
 				};
 			},
 		}),

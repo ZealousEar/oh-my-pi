@@ -421,7 +421,7 @@ describe("jfind cascade", () => {
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 			expect(text).toStartWith('find unavailable for "token refresh"');
 			expect(text).not.toContain("no hits");
-			expect(result.details?.lexicalFallback).toEqual([
+			expect(details.lexicalFallback).toEqual([
 				{ rel: "auth.ts", line: 1, snippet: "export function refreshToken() { return 1; }" },
 			]);
 			expect(text).toContain("unranked literal keyword matches (not semantically judged):");
@@ -448,8 +448,10 @@ describe("jfind cascade", () => {
 			});
 			const result = await tool.execute("x", { query: "token refresh", grep_keywords: ["refreshToken"] });
 			expect(result.isError).toBe(true);
-			expect(result.details?.coverage).toBe("unavailable");
-			const fallback = result.details?.lexicalFallback ?? [];
+			const details = result.details;
+			if (details?.mode !== "cascade") throw new Error("expected cascade details");
+			expect(details.coverage).toBe("unavailable");
+			const fallback = details.lexicalFallback ?? [];
 			// 51 matching lines across two files fill the 20-row cap, and both files contribute.
 			expect(fallback).toHaveLength(20);
 			expect(new Set(fallback.map(match => match.rel))).toEqual(new Set(["dense.ts", "sparse.ts"]));
@@ -740,8 +742,10 @@ describe("jfind cascade", () => {
 				throw new Error("request aborted");
 			});
 			const result = await findTool(dir).execute("x", { query: "token refresh", grep_keywords: [] });
-			expect(result.details?.timeout).toEqual({ verified: 0, passages: 0 });
-			expect(result.details?.lexicalFallback).toEqual([
+			const details = result.details;
+			if (details?.mode !== "cascade") throw new Error("expected cascade details");
+			expect(details.timeout).toEqual({ verified: 0, passages: 0 });
+			expect(details.lexicalFallback).toEqual([
 				{ rel: "a.ts", line: 1, snippet: "export function refreshToken() { return 1; }" },
 			]);
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
