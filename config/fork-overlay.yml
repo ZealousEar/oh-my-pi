@@ -11,12 +11,13 @@ modelRoles:
   # 18.3 seeds only typesafe/jev-latest; authenticated /v1/models discovery must offer jev-1.13.0,
   # and the launcher policy must allow the typesafe provider (gen-disabled-providers-next.py).
   judge: typesafe/jev-1.13.0
-  converge-openai: openai-codex/gpt-6-astra:medium
-  converge-openai-esc: openai-codex/gpt-6-astra:high
-  converge-anthropic: anthropic/claude-fable-5-1:high
-  converge-anthropic-esc: anthropic/claude-fable-5-1:xhigh
-  converge-judge-kimi: openrouter/moonshotai/kimi-k3:max
-  converge-judge-glm: openrouter/z-ai/glm-5.3:max
+  # TEMPORARY 2026-11-20 preprint-selection run (revert: git checkout config/fork-overlay.yml)
+  converge-openai: openai-codex/gpt-6.2-astra:xhigh
+  converge-openai-esc: openai-codex/gpt-6.2-astra:max
+  converge-anthropic: anthropic/claude-fable-5-2:xhigh
+  converge-anthropic-esc: anthropic/claude-fable-5-2:max
+  converge-judge-kimi: opencode-go/kimi-k3:max
+  converge-judge-glm: opencode-go/glm-5.3:max
 
 # converge never substitutes a model: a failed role fails the spawn instead of falling back.
 # judge: [] is the no-silent-fallback guarantee for jev (replaces the r13 providers.judgmentFallback: none).
