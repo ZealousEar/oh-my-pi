@@ -1,8 +1,9 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
-import { previewLine, replaceTabs, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { previewLine, TRUNCATE_LENGTHS } from "../utils/render-utils";
+import { replaceTabs } from "../utils/text-width";
+import { ToolError } from "./tool-errors";
 import { cfgSkillsEnabled, cfgSkillsRecommendEnabled } from "../extensibility/settings";
 import {
 	JUDGE_DESCRIPTION_CHARS,

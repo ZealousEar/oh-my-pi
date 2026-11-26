@@ -600,7 +600,6 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			scope?: string;
 			error?: string;
 			error_description?: string;
-			scope?: string;
 		};
 
 		// Some providers (e.g. the Slack Web API) signal failure with HTTP 200 and

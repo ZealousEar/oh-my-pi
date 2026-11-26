@@ -9,20 +9,18 @@ import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { RELAY_DISABLED_MESSAGE, resolveBrowserKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { acquireBrowser, getBrowsersMapForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { discoverRelayEndpoints } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/discovery";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 
 const savedEnv = process.env.PI_BROWSER_RELAY;
-const savedSupervisor = process.env.OMP_BROWSER_RELAY_SUPERVISOR;
 const savedProtocol = process.env.OMP_BROWSER_RELAY_REQUIRE_PROTOCOL;
-// Identity resolution only: the launcher pins (supervisor/protocol) are the relay-binding suite's subject.
-delete process.env.OMP_BROWSER_RELAY_SUPERVISOR;
+// Identity resolution only: the launcher's protocol pin is the relay-binding suite's subject.
 delete process.env.OMP_BROWSER_RELAY_REQUIRE_PROTOCOL;
 afterEach(() => {
 	if (savedEnv === undefined) delete process.env.PI_BROWSER_RELAY;
 	else process.env.PI_BROWSER_RELAY = savedEnv;
 });
 afterAll(() => {
-	if (savedSupervisor !== undefined) process.env.OMP_BROWSER_RELAY_SUPERVISOR = savedSupervisor;
 	if (savedProtocol !== undefined) process.env.OMP_BROWSER_RELAY_REQUIRE_PROTOCOL = savedProtocol;
 });
 
@@ -34,9 +32,11 @@ function session(values: Record<string, unknown>): ToolSession {
 describe("browser identity resolution", () => {
 	it("drives the relay by default when browser.relay is pinned", () => {
 		delete process.env.PI_BROWSER_RELAY;
+		// No fixed port: the relay is whichever native host Chrome runs, discovered per user (none: an empty URL the
+		// registry refuses at open).
 		expect(resolveBrowserKind({ action: "open" }, session({ "browser.relay": true }))).toEqual({
 			kind: "relay",
-			cdpUrl: "http://127.0.0.1:9224",
+			cdpUrl: discoverRelayEndpoints()[0] ?? "",
 		});
 	});
 
@@ -80,7 +80,7 @@ describe("unreachable relay", () => {
 			session({ "browser.relay": true, "browser.relayUrl": `http://127.0.0.1:${port}` }),
 		);
 		expect(kind.kind).toBe("relay");
-		await expect(acquireBrowser(kind, { cwd: "/tmp" })).rejects.toThrow(/relay is not reachable/);
+		await expect(acquireBrowser(kind, { cwd: "/tmp" })).rejects.toThrow(/Nothing serves the omp browser relay/);
 		expect([...getBrowsersMapForTest().values()].filter(handle => handle.kind.kind === "headless")).toEqual([]);
 	});
 });

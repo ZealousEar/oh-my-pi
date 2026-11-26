@@ -130,14 +130,12 @@ function paintFind(node: UiNode, cx: PaintContext): Block {
 			);
 		return { rows: [...rows, ...failures] };
 	}
-	const items = node
-		.children()
-		.flatMap(child => {
-			const role = (child.props() as { role?: string }).role;
-			if (role === "omp.tool.find.hit") return [hitItem(cx, child, term.cwd)];
-			if (role === "omp.tool.find.result") return [resultItem(cx, child, term.cwd)];
-			return [];
-		});
+	const items = node.children().flatMap(child => {
+		const role = (child.props() as { role?: string }).role;
+		if (role === "omp.tool.find.hit") return [hitItem(cx, child, term.cwd)];
+		if (role === "omp.tool.find.result") return [resultItem(cx, child, term.cwd)];
+		return [];
+	});
 	if (term.more) items.push(moreItem(theme, term.more, term.notes ? "results" : "hits"));
 	rows.push(...treeRows(theme, items, cx.width));
 	if (props.collapsed === false) {

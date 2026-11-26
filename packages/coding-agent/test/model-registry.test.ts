@@ -392,7 +392,7 @@ describe("ModelRegistry", () => {
 				.filter(model => model.provider === "openrouter")
 				.map(model => model.id);
 			expect(ids).toContain("openai/gpt-6-sol-pro");
-			expect(ids).toContain("openai/o3-pro:batch");
+			expect(ids).toContain("openai/gpt-5.6-sol-pro:batch");
 			expect(ids).toContain("z-ai/glm-5.3");
 			expect(ids.some(id => id.startsWith("anthropic/"))).toBe(false);
 			expect(ids.filter(id => id.startsWith("openai/")).every(id => id.includes("-pro"))).toBe(true);

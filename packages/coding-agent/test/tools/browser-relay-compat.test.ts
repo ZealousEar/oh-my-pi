@@ -408,10 +408,7 @@ describe("relay protocol requirement in the registry", () => {
 		try {
 			const cdpUrl = `http://127.0.0.1:${stock.port}`;
 			await expect(
-				acquireBrowser(
-					{ kind: "relay", cdpUrl, requireProtocol: 2 },
-					{ cwd: process.cwd(), restartRelay: false },
-				),
+				acquireBrowser({ kind: "relay", cdpUrl, requireProtocol: 2 }, { cwd: process.cwd(), restartRelay: false }),
 			).rejects.toThrow(
 				`omp browser relay at ${cdpUrl} is a legacy/stock relay (protocol 1); this omp requires protocol 2.`,
 			);
@@ -486,6 +483,7 @@ describe("relay protocol requirement in the registry", () => {
 			"is a legacy/stock relay (protocol 1); this omp requires protocol 2.",
 		],
 		["a protocol-2 relay that is unbound", `omp-relay/2;binding=unbound;fp=`, "it is unbound, not bound"],
+		["a protocol-2 relay that runs without a binding", `omp-relay/2;binding=off;fp=`, "it is off, not bound"],
 		[
 			"a protocol-2 relay bound to another Chrome profile",
 			`omp-relay/2;binding=bound;fp=${FP_B}`,
@@ -525,6 +523,26 @@ describe("relay protocol requirement in the registry", () => {
 			}
 		} finally {
 			fake.stop();
+		}
+	});
+
+	it("accepts a relay that runs without a binding, which advertised none and proves none over the connection", async () => {
+		const relay = startRelayServer({ port: 0, bindingPath: null });
+		const extension = new FakeExtension(relay.port, { instanceId: INSTALL_A });
+		try {
+			await extension.opened;
+			const handle = await acquireBrowser(
+				{ kind: "relay", cdpUrl: `http://127.0.0.1:${relay.port}`, requireProtocol: 2 },
+				{ cwd: process.cwd(), restartRelay: false },
+			);
+			try {
+				expect(relay.bridge.cdpClientCount).toBe(1);
+			} finally {
+				await releaseBrowser(handle, { kill: false });
+			}
+		} finally {
+			extension.close();
+			relay.stop();
 		}
 	});
 });

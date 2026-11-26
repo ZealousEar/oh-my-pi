@@ -129,6 +129,7 @@ class TaskNativeSession implements NativeDesktopSession {
 			displays: [],
 			backend: "fake",
 			screenLocked: false,
+			covered: false,
 		};
 	}
 	async captureRegion(_target: string, _region: CaptureRegion): Promise<DesktopCapture> {
@@ -149,7 +150,7 @@ class TaskNativeSession implements NativeDesktopSession {
 	async observe(target: string) {
 		return {
 			capture: await this.capture(target),
-			accessibility: { text: "- window [ref=e0]", nodeCount: 0, truncated: false },
+			accessibility: { text: "- window [ref=e0]", nodeCount: 0, truncated: false, covered: false },
 		};
 	}
 	async holdKeys(): Promise<void> {}

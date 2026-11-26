@@ -17,6 +17,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -347,20 +348,24 @@ describe("relay tabs Chrome detaches omp from", () => {
 		const port = await findFreeCdpPort();
 		relay = startRelayServer({ port, group: false, bindingPath: null });
 		extension = await ChromeBackedExtension.connect(port, chromium.wsEndpoint(), target._targetId, pageUrl);
-		tool = {
-			cwd: "/tmp",
-			hasUI: false,
-			getSessionFile: () => null,
-			getSessionSpawns: () => null,
-			settings: Settings.isolated({
-				"browser.enabled": true,
-				"browser.relay": true,
-				"browser.relayUrl": `http://127.0.0.1:${port}`,
-				"browser.cmux": false,
-				"browser.tern": false,
-				"tools.maxTimeout": 0,
-			}),
-		};
+		// The runs are raw code on the fixture site, which the automation gate lets through only with a grant.
+		tool = grantBrowserFixtureScope(
+			{
+				cwd: "/tmp",
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+				settings: Settings.isolated({
+					"browser.enabled": true,
+					"browser.relay": true,
+					"browser.relayUrl": `http://127.0.0.1:${port}`,
+					"browser.cmux": false,
+					"browser.tern": false,
+					"tools.maxTimeout": 0,
+				}),
+			},
+			loopbackOrigins(site.port),
+		);
 		await invoke({ action: "open", app: "relay", ...(owned ? { url: pageUrl } : { target: "case=" }), timeout: 20 });
 		if (owned) {
 			page = (await chromium.pages()).find(candidate => {
@@ -437,6 +442,7 @@ describe("relay tabs Chrome detaches omp from", () => {
 					});
 				},
 			});
+			grantBrowserFixtureScope(tool, loopbackOrigins(login.port));
 			const settled = Promise.withResolvers<void>();
 			const acquire = tabSupervisor.acquireTab;
 			const acquiring = spyOn(tabSupervisor, "acquireTab").mockImplementation(async (...args) => {

@@ -32,7 +32,6 @@ import puppeteer, { type Browser, type Page, type Protocol } from "puppeteer-cor
 import { type FixtureRelayExtension, prepareRelayExtension } from "./browser-relay-fixture";
 import { grantBrowserFixtureScope } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
-import { removeRelayBindingFixture, TEST_INSTALL_ID, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -260,7 +259,7 @@ ${background}`,
 		const cdpUrl = `http://127.0.0.1:${server.port}`;
 		// Finish the extension hello before the native CDP client attaches to the sentinel.
 		const outcome = await waitForRelayExtension(cdpUrl);
-		if (outcome.kind !== "ready") throw new Error(`Relay fixture handshake failed: ${outcome.kind}`);
+		if (outcome !== "ready") throw new Error(`Relay fixture handshake failed: ${outcome}`);
 		const origin = `http://127.0.0.1:${pages.port}`;
 		return {
 			browser,

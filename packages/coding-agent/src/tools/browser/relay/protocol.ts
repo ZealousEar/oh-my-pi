@@ -37,6 +37,9 @@ export function installFingerprint(installId: string): string {
 	return new Bun.CryptoHasher("sha256").update(installId).digest("hex").slice(0, 12);
 }
 
+/** Binding state a relay that runs without a binding (`bindingPath: null`) reports in {@link relayRevision}. */
+export const RELAY_BINDING_OFF = "off";
+
 /**
  * `Browser.getVersion.revision` a protocol-2 relay answers over a CDP
  * connection: `omp-relay/2;binding=<state>;fp=<fingerprint>`. Chrome's own

@@ -35,7 +35,7 @@ import {
 	UPDATE_RELAY_EXTENSION,
 	waitForRelayExtension,
 } from "./relay/probe";
-import { parseRelayRevision } from "./relay/protocol";
+import { parseRelayRevision, RELAY_BINDING_OFF } from "./relay/protocol";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
@@ -381,10 +381,13 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		}
 		let generation: string | undefined;
 		let expectedFingerprint: string | undefined;
+		// A relay that runs without a binding (a side-panel relay, a test relay) advertises none.
+		let expectedBinding: string = RELAY_BINDING_OFF;
 		try {
 			const parsed: unknown = version ? JSON.parse(version.body) : undefined;
 			if (isRecord(parsed)) {
 				if (typeof parsed["OMP-Browser-Generation"] === "string") generation = parsed["OMP-Browser-Generation"];
+				if (typeof parsed["OMP-Profile-Binding"] === "string") expectedBinding = parsed["OMP-Profile-Binding"];
 				if (typeof parsed["OMP-Profile-Fingerprint"] === "string") {
 					expectedFingerprint = parsed["OMP-Profile-Fingerprint"];
 				}
@@ -412,7 +415,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			// The proof that counts is bound to THIS connection: puppeteer's own
 			// discovery lookup and websocket may have reached a different process
 			// than the probes above. Only a protocol-2 relay stamps `revision`, and
-			// it must be the same bound install the pre-connect answer named.
+			// it must name the binding state, and when bound the install, the pre-connect answer did.
 			let revision: unknown;
 			try {
 				revision = (await browserConnection(browser).send("Browser.getVersion")).revision;
@@ -430,9 +433,9 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				);
 			}
 			const mismatch =
-				proven.binding !== "bound"
-					? `it is ${proven.binding || "unbound"}, not bound`
-					: proven.fingerprint !== expectedFingerprint
+				proven.binding !== expectedBinding
+					? `it is ${proven.binding || "unbound"}, not ${expectedBinding}`
+					: proven.binding === "bound" && proven.fingerprint !== expectedFingerprint
 						? `it serves Chrome profile install ${proven.fingerprint || "(none)"}, not ${expectedFingerprint ?? "(none)"}`
 						: null;
 			if (mismatch) {

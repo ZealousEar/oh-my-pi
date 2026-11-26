@@ -24,7 +24,6 @@ import puppeteer, { type Browser, type Page, type WebWorker } from "puppeteer-co
 import { type FixtureRelayExtension, prepareRelayExtension } from "./browser-relay-fixture";
 import { grantBrowserFixtureScope, loopbackOrigins } from "./browser-scope";
 import { chromiumAvailable } from "./chromium-probe";
-import { removeRelayBindingFixture, TEST_INSTALL_ID, writeRelayBindingFixture } from "./relay-binding-fixture";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -109,6 +108,8 @@ async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-background-"));
 	const server = startRelayServer({
 		port: 0,
+		// The extension mints its own install id; profile pinning is the relay-binding suite's subject.
+		bindingPath: null,
 		group: false,
 		installRegistryFile: path.join(root, "omp", "installs.json"),
 	});

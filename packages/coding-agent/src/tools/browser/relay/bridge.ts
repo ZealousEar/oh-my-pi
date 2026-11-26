@@ -52,6 +52,7 @@ import {
 	isOlderOmpVersion,
 	isOmpVersion,
 	OVERLAY_PROTOCOL_VERSION,
+	RELAY_BINDING_OFF,
 	RELAY_CLOSE_PROFILE_MISMATCH,
 	RELAY_PROTOCOL_VERSION,
 	relayRevision,
@@ -77,10 +78,7 @@ export type ProfileBindingInfo =
 	| { state: "invalid"; error: string };
 
 /** Why `/json/version` answers 503 (absent: no extension has connected). */
-export type RelayUnavailableReason =
-	| "profile-unbound"
-	| "profile-mismatch"
-	| "profile-invalid";
+export type RelayUnavailableReason = "profile-unbound" | "profile-mismatch" | "profile-invalid";
 
 /** Mismatch warnings are rate-limited per install id. */
 const MISMATCH_LOG_INTERVAL_MS = 60_000;
@@ -2025,7 +2023,10 @@ export class RelayBridge {
 					// Proof bound to THIS connection that a protocol-2 relay answered
 					// (an HTTP probe can be answered by a different process than the
 					// one puppeteer ended up talking to). Other fields stay Chrome-like.
-					revision: relayRevision(this.profileBinding().state, last?.info ? last.instanceId : undefined),
+					revision: relayRevision(
+						this.#bindingPath === null ? RELAY_BINDING_OFF : this.#binding.state,
+						last?.info ? last.instanceId : undefined,
+					),
 					userAgent: last?.info?.userAgent ?? "",
 					jsVersion: "",
 				});

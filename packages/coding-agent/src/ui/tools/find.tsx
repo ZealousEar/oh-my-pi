@@ -281,8 +281,12 @@ function boundedView(details: FindBoundedDetails, args: FindArgs | undefined, ex
 	if (details.verification.detail) notes.push(details.verification.detail);
 	const skipped = coverage.skipped.map(skip => `skipped ${skip.path}: ${skip.reason}`);
 	const noticeNodes = [
-		notes.map((note, i) => <text key={`note${i}`} role="omp.tool.notice" spans={[{ s: "muted", t: note }]} wrap="word" />),
-		skipped.map((note, i) => <text key={`skip${i}`} role="omp.tool.notice" spans={[{ s: "warning", t: note }]} wrap="word" />),
+		notes.map((note, i) => (
+			<text key={`note${i}`} role="omp.tool.notice" spans={[{ s: "muted", t: note }]} wrap="word" />
+		)),
+		skipped.map((note, i) => (
+			<text key={`skip${i}`} role="omp.tool.notice" spans={[{ s: "warning", t: note }]} wrap="word" />
+		)),
 	];
 	const base = {
 		look: "find" as const,

@@ -1540,6 +1540,7 @@ export class UnitTable {
 		entry.procRuntime = {
 			launch: 1,
 			stopRequested: false,
+			lifetimeExpired: false,
 			logReady: true,
 			portReady: true,
 			readinessBuffer: "",

@@ -21,6 +21,10 @@ class RelayBridge extends RelayBridgeImpl {
 	}
 }
 
+function bridgeWith(opts: { group?: { title: string; color: string } } = {}): RelayBridge {
+	return new RelayBridge(opts);
+}
+
 /** Same derivation as the bridge: target ids embed this per-instance code. */
 function instanceCode(instanceId: string): string {
 	return createHash("sha256").update(instanceId).digest("base64url").slice(0, 8);
@@ -179,9 +183,9 @@ async function attachPage(
 	return sessionId;
 }
 
-/** The page target id of `tabId` in the fixture install's browser. */
-function pageId(tabId: number): string {
-	return `PAGE${ANON}.${tabId}`;
+/** The page target id of `tabId` in `instanceId`'s browser. */
+function pageId(tabId: number, instanceId = "anon"): string {
+	return `PAGE${instanceCode(instanceId)}.${tabId}`;
 }
 
 /** Emulate the omp tab worker adopting a tab: connect claiming it (`/cdp?claim=`), then attach to its page. */
@@ -3030,12 +3034,9 @@ describe("RelayBridge focus emulation", () => {
 		const nextConn = bridge.cdpConnected(next);
 		const targetsId = ++msgSeq;
 		bridge.cdpMessage(nextConn, JSON.stringify({ id: targetsId, method: "Target.getTargets" }));
-		// The fork lists the tab's TAB target beside its page; neither is attached any more.
-		const listed = next.messages.find(message => message.id === targetsId)?.result as
-			| { targetInfos: Array<{ targetId: string; attached: boolean }> }
-			| undefined;
-		expect(listed?.targetInfos.map(info => info.targetId)).toContain(`PAGE${ANON}.1`);
-		expect(listed?.targetInfos.filter(info => info.attached)).toEqual([]);
+		expect(next.messages.find(message => message.id === targetsId)).toMatchObject({
+			result: { targetInfos: [{ attached: false }] },
+		});
 		const reattachId = ++msgSeq;
 		bridge.cdpMessage(
 			nextConn,
@@ -3216,7 +3217,7 @@ describe("RelayBridge download paths", () => {
 				t: "hello",
 				userAgent: "test",
 				browserVersion: "Chrome/151.0.0.0",
-				...TEST_HELLO_IDENTITY,
+				discardedTabsProtocol: 1,
 				downloadsProtocol,
 				tabs: [tab({ tabId: 1 })],
 				attachedTabIds: [],
