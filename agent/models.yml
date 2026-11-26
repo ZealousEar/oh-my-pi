@@ -1,5 +1,6 @@
-# converge L3 judges: pin each OpenRouter model to its vendor's own endpoint and
-# fail closed instead of degrading to another provider/quantization.
+# OpenRouter vendor-endpoint pins for Kimi K3 and GLM-5.3: each model is pinned to its vendor's
+# own endpoint and fails closed instead of degrading to another provider/quantization. They were
+# the converge L3 judge routes until 2026-11-26; the judges now run on opencode-go (fork-overlay.yml).
 # Source: local://openrouter-config.md (2026-09-24). The whole OpenRouter `provider`
 # object lives in compat.extraBody: extraBody is applied after the narrow
 # openRouterRouting object and therefore wins; never split fields between the two.
@@ -170,3 +171,29 @@ providers:
         input: [text]
         supportsTools: false
         cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 }
+      - id: jev-1.14.0
+        name: TypeSafe jev 1.14.0
+        reasoning: false
+        input: [text]
+        supportsTools: false
+        cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 }
+
+  # Effort ceilings (owner rule 2026-11-26): Fable and Astra never above high, Opus never max,
+  # unless the owner explicitly asks in that turn. Clamps every path: role suffixes, presets,
+  # agent frontmatter and auto thinking. Lift by editing these lines for the explicit request.
+  # An override REPLACES the catalog's whole thinking object (only prefixBinding is kept), so each
+  # entry restates every other field the catalog derives: `supportsDisplay: true` on Fable/Opus 5.x
+  # (without it adaptive thinking is requested without display=summarized and comes back empty).
+  # Not clamped, by owner choice: the OpenRouter `openai/gpt-6*-astra-pro` variants.
+  # Guarded by the must-keep probes in launchers/fork/must-keep.json.
+  anthropic:
+    modelOverrides:
+      claude-fable-5-2: { thinking: { mode: anthropic-adaptive, efforts: [low, medium, high], supportsDisplay: true } }
+      claude-fable-5-1: { thinking: { mode: anthropic-adaptive, efforts: [low, medium, high], supportsDisplay: true } }
+      claude-fable-5: { thinking: { mode: anthropic-adaptive, efforts: [low, medium, high], supportsDisplay: true } }
+      claude-opus-5-5: { thinking: { mode: anthropic-adaptive, efforts: [low, medium, high, xhigh], supportsDisplay: true } }
+      claude-opus-5: { thinking: { mode: anthropic-adaptive, efforts: [low, medium, high, xhigh], supportsDisplay: true } }
+  openai-codex:
+    modelOverrides:
+      gpt-6.2-astra: { thinking: { mode: effort, efforts: [low, medium, high] } }
+      gpt-6-astra: { thinking: { mode: effort, efforts: [low, medium, high] } }

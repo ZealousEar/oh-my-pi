@@ -33,6 +33,44 @@
       "name": "ElevenLabs speech backend",
       "tests": ["packages/ai/test/elevenlabs-speech.test.ts"],
       "probes": []
+    },
+    {
+      "name": "Effort ceilings (profile models.yml, 2026-11-26): Fable/Astra <= high, Opus <= xhigh",
+      "tests": [],
+      "probes": [
+        {
+          "label": "models anthropic: Fable 5.x top out at high, Opus 5.x at xhigh",
+          "args": ["models", "anthropic"],
+          "mustMatch": [
+            "claude-fable-5-2 .* low,medium,high ",
+            "claude-fable-5-1 .* low,medium,high ",
+            "claude-fable-5 .* low,medium,high ",
+            "claude-opus-5-5 .* low,medium,high,xhigh ",
+            "claude-opus-5 .* low,medium,high,xhigh "
+          ]
+        },
+        {
+          "label": "models openai-codex: Astra tops out at high",
+          "args": ["models", "openai-codex"],
+          "mustMatch": ["gpt-6\\.2-astra .* low,medium,high ", "gpt-6-astra .* low,medium,high "]
+        }
+      ]
+    },
+    {
+      "name": "Thinking text survives the effort clamps (models.yml overrides keep supportsDisplay)",
+      "tests": [],
+      "probes": [
+        {
+          "label": "fable-5-2 --thinking high returns thinking text",
+          "args": ["-p", "--no-session", "--no-tools", "--mode", "json", "--model", "anthropic/claude-fable-5-2", "--thinking", "high", "Think carefully before answering. Find the smallest positive integer n such that n^2 + n + 41 is composite, and give its factorization. Final answer on one line."],
+          "mustMatch": ["\"type\":\"thinking\",\"thinking\":\"[^\"]"]
+        },
+        {
+          "label": "opus-5-5 --thinking high returns thinking text",
+          "args": ["-p", "--no-session", "--no-tools", "--mode", "json", "--model", "anthropic/claude-opus-5-5", "--thinking", "high", "Think carefully before answering. Find the smallest positive integer n such that n^2 + n + 41 is composite, and give its factorization. Final answer on one line."],
+          "mustMatch": ["\"type\":\"thinking\",\"thinking\":\"[^\"]"]
+        }
+      ]
     }
   ]
 }
