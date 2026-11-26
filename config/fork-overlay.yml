@@ -4,21 +4,29 @@
 # after it and still win. Maps merge key by key; lists replace.
 # Owns only what the synced profile layer needs; everything else stays in each profile's config.yml.
 
-# converge: one role per debater/judge family. Model + effort are chosen HERE only;
-# converge freezes them into manifest.expected at new_run and identity-checks every spawn.
+# Roles used by this layer's agents and skills. Change log: ../CHANGELOG.md.
 modelRoles:
-  # jev bookkeeping for converge: native TypeSafe judge() backend, exact version pin.
-  # 18.3 seeds only typesafe/jev-latest; authenticated /v1/models discovery must offer jev-1.13.0,
-  # and the launcher policy must allow the typesafe provider (gen-disabled-providers-next.py).
-  judge: typesafe/jev-1.13.0
-  # Debaters set 2026-11-21 (kept after the preprint-selection run): Astra 6.2 / Fable 5.2.
-  converge-openai: openai-codex/gpt-6.2-astra:xhigh
-  converge-openai-esc: openai-codex/gpt-6.2-astra:max
-  converge-anthropic: anthropic/claude-fable-5-2:xhigh
-  converge-anthropic-esc: anthropic/claude-fable-5-2:max
-  # converge-judge-kimi / converge-judge-glm intentionally unset (2026-11-21): Claude/OpenAI-only
-  # routing. An L3 panel must fail closed until compliant judges are chosen; the empty fallback
-  # chains below keep it from substituting a model.
+  # jev bookkeeping for converge + auto thinking: native TypeSafe judge() backend, exact version pin.
+  # 2026-11-26: moved to the newest versioned jev (1.14.0, declared in the profile models.yml).
+  judge: typesafe/jev-1.14.0
+  # Subagent tier 3 (agents/deep.md, rules/subagent-tiers.md), 2026-11-26. No effort suffix: the
+  # agent's `thinkingLevel: auto` picks it per spawn, clamped at high by models.yml.
+  deep: anthropic/claude-fable-5-2
+  # agents/pr-writing.md, 2026-11-26 (owner: Opus low or medium, not Sonnet). The `commit` role
+  # stays per profile: omp also uses it for commit messages.
+  pr-writing: anthropic/claude-opus-5-5:medium
+  # converge: one role per debater/judge family. Model + effort are chosen HERE only;
+  # converge freezes them into manifest.expected at new_run and identity-checks every spawn.
+  # Debaters 2026-11-26: latest Astra 6.2 / Fable 5.2, capped at high (owner rule: Fable and Astra
+  # never above high unless explicitly asked). Escalation = medium -> high.
+  converge-openai: openai-codex/gpt-6.2-astra:medium
+  converge-openai-esc: openai-codex/gpt-6.2-astra:high
+  converge-anthropic: anthropic/claude-fable-5-2:medium
+  converge-anthropic-esc: anthropic/claude-fable-5-2:high
+  # L3 judges 2026-11-26: via opencode-go (owner choice). J1 seat keeps its `kimi` role/agent name
+  # (hard-coded in the converge orchestrator) but runs Qwen 4 Max; its ladder tops out at high.
+  converge-judge-kimi: opencode-go/qwen4-max:high
+  converge-judge-glm: opencode-go/glm-5.3:max
 
 # converge never substitutes a model: a failed role fails the spawn instead of falling back.
 # judge: [] is the no-silent-fallback guarantee for jev (replaces the r13 providers.judgmentFallback: none).

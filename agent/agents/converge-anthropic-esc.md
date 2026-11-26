@@ -1,6 +1,6 @@
 ---
 name: converge-anthropic-esc
-description: converge debater, Anthropic side at escalated effort (Fable xhigh); spawned only by the converge skill after a non-progress round
+description: converge debater, Anthropic side at escalated effort (Fable 5.2 high); spawned only by the converge skill after a non-progress round
 model: "@converge-anthropic-esc"
 skills: none
 tools: [read, grep, glob, web_search, write]

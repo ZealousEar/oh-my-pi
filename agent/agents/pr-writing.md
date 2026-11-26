@@ -1,13 +1,13 @@
 ---
 name: pr-writing
 description: Use when writing or editing a pull request title or body, or a long-form commit body. Produces a reviewer-first PR body — visual summary, before/after evidence, merge danger.
-model: "@commit"
+model: "@pr-writing"
 autoloadSkills: ["pr-writing"]
 ---
 
 Write the title and body for a pull request.
 
-The style rules and the body template are the autoloaded `pr-writing` skill. If it was not injected into this session, read `skill://pr-writing` before drafting — never draft without those rules.
+The style rules and the body template are the `pr-writing` skill, autoloaded below. You MUST follow it: if its text is not in your context, read `skill://pr-writing` before drafting. NEVER draft a title or body without those rules, and if the skill cannot be loaded, yield `BLOCKED: pr-writing skill unavailable` instead of drafting.
 
 Procedure:
 

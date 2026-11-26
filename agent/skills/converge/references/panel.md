@@ -1,6 +1,6 @@
 # converge — L3 panel (design §1.12)
 
-Judges: `converge-judge-kimi` (J1) and `converge-judge-glm` (J2); models/efforts come from the configured roles frozen in `manifest.expected.judges` (Kimi K3 max via OpenRouter, vendor endpoint `moonshotai/mxfp4`; GLM-5.3 max, `z-ai/fp8`; routing pinned in `P/models.yml` with `allow_fallbacks: false`). Judges are full agents (`read grep write` — `write` for `agent://` messaging only), never jev. Six spawns per panel: 4 verdict + 2 conference. Identity check applies to every batch: `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)` with `snap = await tool.read(path="proc://")`; a mismatched judge is killed (`cancel_requests`) and retried once, then `unavailable`.
+Judges: `converge-judge-kimi` (J1) and `converge-judge-glm` (J2); models/efforts come from the configured roles frozen in `manifest.expected.judges` (2026-11-26: J1 = Qwen 4 Max high, J2 = GLM-5.3 max, both via opencode-go; the J1 role keeps its `kimi` name; no Kimi model is used). Judges are full agents (`read grep write` — `write` for `agent://` messaging only), never jev. Six spawns per panel: 4 verdict + 2 conference. Identity check applies to every batch: `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)` with `snap = await tool.read(path="proc://")`; a mismatched judge is killed (`cancel_requests`) and retried once, then `unavailable`.
 
 ```text
 L2 loop (≤5 rounds) → falsification (+ reopen round 6) → dossier() → l3/dossier.md (A first) + l3/dossier-BA.md (B first, labels swapped)
@@ -74,8 +74,8 @@ Your last yield sets `turn: "final"` — only that one counts. Cap 25 min. `agen
 ## Aggregation (`panel_aggregate(mapped, conferences, accept_changes)` → `l3/panel.json`)
 
 ```json
-{"judges": {"J1": {"model": "openrouter/moonshotai/kimi-k3", "AB": {…}, "BA": {…}, "complete": true, "consistent": true, "independent": "A", "final": "A", "conference": {…}, "conference_ok": true},
-            "J2": {"model": "openrouter/z-ai/glm-5.3", "AB": {…}, "BA": {…}, "complete": true, "consistent": false, "independent": "inconsistent", "final": "A", "conference": {…}, "conference_ok": true}},
+{"judges": {"J1": {"model": "opencode-go/qwen4-max", "AB": {…}, "BA": {…}, "complete": true, "consistent": true, "independent": "A", "final": "A", "conference": {…}, "conference_ok": true},
+            "J2": {"model": "opencode-go/glm-5.3", "AB": {…}, "BA": {…}, "complete": true, "consistent": false, "independent": "inconsistent", "final": "A", "conference": {…}, "conference_ok": true}},
  "conference": {"J1": {…2.5.2…}, "J2": {…}},
  "joint": {"winner": "A"|null, "agreed": "A"|null, "outcome": "judge_selected|tie|insufficient|split|unavailable",
            "reasons": {"J1": "…", "J2": "…"},

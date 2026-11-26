@@ -101,7 +101,7 @@ CLOSED_WITHDRAWN = "closed_withdrawn"   # both sides withdrew the crux (jev C bo
 SIDES = ("A", "B")
 EVID_RE = re.compile(r"^E-(A|B|0)-[0-9]+$")
 IDENTITY_STRIP = re.compile(r"\b(gpt[-\w.]*|astra|o\d|openai|codex|claude[-\w.]*|fable|opus|sonnet|anthropic|"
-                            r"kimi[-\w.]*|moonshot\w*|glm[-\w.]*|z\.?ai|zhipu|gemini|as an ai( model)?)\b", re.I)
+                            r"kimi[-\w.]*|moonshot\w*|glm[-\w.]*|z\.?ai|zhipu|qwen[-\w.]*|alibaba|gemini|as an ai( model)?)\b", re.I)
 STATUS_LABEL = {"converged": "Converged", "converged_unfalsified": "Converged with dissent",
                 "converged_with_dissent": "Converged with dissent", "unresolved": "No convergence",
                 "incomplete_transport": "incomplete (no report)"}

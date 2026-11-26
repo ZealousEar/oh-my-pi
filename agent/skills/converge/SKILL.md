@@ -34,13 +34,13 @@ Extract: `question` (one sentence, decidable); hard constraints (Must / Prefer /
 
 ## 2. Tier ask (one `ask`, ≤ 2 questions)
 
-Q `tier`: options `L1`, `L2`, `L3`; `recommended: 1` (L2) always. Each `description` MUST be written for THIS question, in order: (a) what the tier catches / misses here — name the concrete risk with the question's own nouns; (b) expected rounds and wall time (§3 table); (c) efforts (`Astra medium / Fable high`; L3 adds `Kimi K3 max + GLM-5.3 max`). Generic boilerplate is a failure.
+Q `tier`: options `L1`, `L2`, `L3`; `recommended: 1` (L2) always. Each `description` MUST be written for THIS question, in order: (a) what the tier catches / misses here — name the concrete risk with the question's own nouns; (b) expected rounds and wall time (§3 table); (c) efforts (`Astra medium / Fable medium`; L3 adds `Qwen 4 Max high + GLM-5.3 max`). Generic boilerplate is a failure.
 
 ```json
 {"questions": [{"id": "tier", "question": "Which converge tier for: <question>?", "recommended": 1, "options": [
-  {"label": "L1 — direct exchange", "description": "Catches: <e.g. the obvious keep-alive vs re-spawn trade-off, fast>. Misses: framing anchoring on whichever side opens — for a one-way door on <X> that matters; a lost peer message degrades it to two monologues. 1 exchange, ~15–25 min. Astra medium / Fable high."},
-  {"label": "L2 — blind drafts + ledger (recommended)", "description": "Catches: independent priors on <crux nouns>, sycophantic collapse (moved_by + jev flag), premature stop (escalation before stop). Misses: a shared false premise both models hold about <Y>. 1 blind + ≤4 converge rounds + falsification, ~45–75 min. Astra medium→high / Fable high→xhigh on non-progress."},
-  {"label": "L3 — L2 + judge panel", "description": "Adds: two non-OpenAI/Anthropic judges scoring 7 criteria on an anonymised dossier, both orderings; settles an unresolved stakes-3 crux on <Z> as Judge-selected. Costs: +6 judge spawns, ~+45 min. Kimi K3 max + GLM-5.3 max."}]}]}
+  {"label": "L1 — direct exchange", "description": "Catches: <e.g. the obvious keep-alive vs re-spawn trade-off, fast>. Misses: framing anchoring on whichever side opens — for a one-way door on <X> that matters; a lost peer message degrades it to two monologues. 1 exchange, ~15–25 min. Astra medium / Fable medium."},
+  {"label": "L2 — blind drafts + ledger (recommended)", "description": "Catches: independent priors on <crux nouns>, sycophantic collapse (moved_by + jev flag), premature stop (escalation before stop). Misses: a shared false premise both models hold about <Y>. 1 blind + ≤4 converge rounds + falsification, ~45–75 min. Astra medium→high / Fable medium→high on non-progress."},
+  {"label": "L3 — L2 + judge panel", "description": "Adds: two non-OpenAI/Anthropic judges scoring 7 criteria on an anonymised dossier, both orderings; settles an unresolved stakes-3 crux on <Z> as Judge-selected. Costs: +6 judge spawns, ~+45 min. Qwen 4 Max high + GLM-5.3 max."}]}]}
 ```
 
 Q `experiments` only if jev T `evidence_kind = empirical ≥ 0.5` or the question names a measurable quantity: `off` (recommended) / `on` — description states what would be measured, where (`/tmp/converge/<run-id>/<side>` worktrees), serialized; choosing `on` IS the approval. Record with `record_ask`. "Other: your call" ⇒ L2, experiments off. Ask timeout ⇒ recommended options.
@@ -102,7 +102,7 @@ unresolved + joint winner A|B ⇒ Judge-selected; tie/insufficient/split/unavail
 
 Loop (r starts at 2; round 1 never counts as non-progress):
 1. `progress(r)` ⇒ `streak = 0`; continue.
-2. first `¬progress(r)` (`streak` 0→1) ⇒ **escalate**: next round spawns `converge-openai-esc` (Astra high) and `converge-anthropic-esc` (Fable xhigh); `manifest.escalated_at = r`. Once per run; both sides together.
+2. first `¬progress(r)` (`streak` 0→1) ⇒ **escalate**: next round spawns `converge-openai-esc` (Astra high) and `converge-anthropic-esc` (Fable high); `manifest.escalated_at = r`. Once per run; both sides together.
 3. second consecutive `¬progress` (`streak = 2`) ⇒ **stop**.
 4. every round ⇒ `checkpoint(r, …)`; an interrupted run's deliverable is the latest checkpoint.
 5. stop or `Φ_r = 0` ⇒ **falsification turn** (§5). Material, verdict-changing objections (jev M material AND jev N `verdict_changing ≥ 0.60`, through the same admission gate and caps) are ALWAYS admitted as open cruxes: run **one** more round (`phase="reopen"`, current effort) if `round + 1 ≤ max_rounds` (`manifest.reopened = true`; never twice); no round left (or L1) ⇒ they stay open and unresolved — the Status follows the open cruxes and the disclosure names them. A `fatal` objection the caps kept from jev also blocks plain Converged.
@@ -126,7 +126,7 @@ Debate state (`terminal_state`, math only): `converged` | `converged_with_dissen
 | Failure | Detection | Action |
 |---|---|---|
 | jev unavailable / error | helper raises `JevUnavailable(digest, state, questions)` (fails closed) | Answer the same question ids yourself with calibrated probabilities → `jev_answer(digest, answers)` → re-run the same helper (idempotent per round). `jev.json.backend = "orchestrator"`; report *Evidence* says "bookkeeping judged by orchestrator (jev unavailable)". Never silently. |
-| OpenRouter judge failure (auth, 4xx, `finish_reason: length`, route unavailable, invalid 2.5.1) | spawn error / `panel_verdicts` `invalid` (full-schema check) / identity mismatch | Retry that spawn once: `spawn_panel(stage, who=["J2-BA"], attempt=2)` → `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)`; still failing ⇒ that judge is `unavailable`; a panel of one is not a panel: Status = debate's, disclosure `panel unavailable`. Never substitute a model. |
+| Judge failure (opencode-go auth, 4xx, `finish_reason: length`, model unavailable, invalid 2.5.1) | spawn error / `panel_verdicts` `invalid` (full-schema check) / identity mismatch | Retry that spawn once: `spawn_panel(stage, who=["J2-BA"], attempt=2)` → `ids = register_spawn(0, stage, …)` → `identity_check(snap, expected_judges(stage, ids), ids)`; still failing ⇒ that judge is `unavailable`; a panel of one is not a panel: Status = debate's, disclosure `panel unavailable`. Never substitute a model. |
 | Debater crash / invalid schema / blocked / timeout | `ingest_round` → `action: retry`; per-spawn cap | Re-spawn those sides once with the identical packet (`spawn_round(r, sides, attempt=2)`), register, identity-check that batch; second failure ⇒ that side's failure count +1, round forced non-progress, nothing closes from its input; two failures of one side in a run ⇒ `incomplete_transport`. Every attempt is persisted raw. |
 | Identity row `pending` | `identity_check` → `retry: True` | Not a failure: identity fields fill ~20–25 s after spawn. `wait` (or independent work), re-read `proc://` on the wake, re-check. NEVER `time.sleep` in eval. |
 | Identity mismatch | `identity_check` → `mismatches` | Write every `cancel_requests(ids)` entry (`proc://<job>/kill`); `incomplete_transport`; name the role and what it resolved to. |
