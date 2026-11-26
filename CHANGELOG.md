@@ -4,6 +4,18 @@ Dated configuration decisions for the fork channels (`ompd` = profile daily-fork
 
 `~/.omp/profiles/<profile>/agent/config.yml` is not in git: `launchers/install.sh` seeds it from `launchers/profile-seed/config.yml` only when it is missing. Entries therefore record its values. `fork-release` and `install.sh` never rewrite a profile `config.yml`, `models.yml` or `config/fork-overlay.yml`. The `launchers/fork/must-keep.json` probes make `fork-check` and `fork-release` fail when a new ompd stops honouring a setting listed there.
 
+## 2026-11-27: main compaction trigger 30 %
+
+Owner decision 2026-11-27 ("keep it at 30% for now"): daily-fork `config.yml` `compaction.thresholdPercent` 25.6 → **30**, set by the owner at 2026-11-26 21:03:58Z. The rest is unchanged: `thresholdTokens: -1`, `thresholdMinContextWindow: 512000`, `keepRecentTokens: 48000`, per-agent `task` 150000 / `deep` 200000.
+
+| Window | 25.6 % (2026-11-26) | 30 % (now) |
+|---|---|---|
+| 1,000,000 (Opus, Fable, Sonnet) | 256,000 | 300,000 |
+| 1,050,000 | 268,800 | 315,000 |
+| below 512K (Astra, Sol 6.1/6.2, Featherless, Haiku) | window − 15 % | unchanged |
+
+Supersedes the 256K main trigger in the 2026-11-26 entry. Context: session `01a21995` (ChipzenBot-hc) compacted at 260,856 tokens (26.1 % of 1M) under 25.6 %, just before the change.
+
 ## 2026-11-26: compaction 256K/48K, role refresh, converge models, jev 1.14, effort ceilings, `deep` tier
 
 Owner decisions: session `01a21311` (CareerMode): "go with 256k/48k", delete the Rust and Codex Only presets, add the tier ladder with escalation, converge on opencode-go without Kimi K3 (Qwen 4 Max instead), latest jev, the effort ceilings below, pr-writing on Opus low or medium using the pr-writing skill. A same-day review corrected the first implementation (see Fixed in review).
