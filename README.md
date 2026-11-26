@@ -6,11 +6,12 @@ This branch has no code history; it is not meant for upstream.
 
 ```
 agent/skills/       skills (converge, decision-writing, grill-me, herdr-round, …)
-agent/agents/       agent definitions (converge debaters/judges, pr-writing)
-agent/rules/        always-on rules (orchestration-notify, grill-first, show-me)
+agent/agents/       agent definitions (converge debaters/judges, pr-writing, deep)
+agent/rules/        always-on rules (orchestration-notify, grill-first, show-me, subagent-tiers)
 agent/extensions/   Herdr state hook and packaged native OpenCode delegation
-agent/models.yml    OpenRouter routing for converge judges; Featherless provider
-config/fork-overlay.yml   PI_CONFIG_FILES overlay: converge roles, fallback chains, jev, skill sources
+agent/models.yml    Featherless provider, TypeSafe jev pins, effort ceilings, OpenRouter vendor pins
+config/fork-overlay.yml   PI_CONFIG_FILES overlay: layer roles (jev, deep, pr-writing, converge), fallback chains, skill sources
+CHANGELOG.md        dated config decisions: what changed, owner decision, evidence, backups
 launchers/          channel wrappers, install.sh, profile-seed (this machine's paths)
 sync/               daily commit + push (launchd ai.omp.profile-layer-sync)
 ```
@@ -20,6 +21,7 @@ sync/               daily commit + push (launchd ai.omp.profile-layer-sync)
 - Checkout: `~/.omp/profile-layer`. Each profile entry (`~/.omp/profiles/<p>/agent/{skills,agents,rules,extensions}/<name>`, `models.yml`) is a symlink into it, so editing either side edits git.
 - `ompd`/`ompdev` load `config/fork-overlay.yml` first in `PI_CONFIG_FILES`; the launcher policy overlays load after it and win. The wrappers refuse to start if the overlay is missing.
 - `launchers/install.sh` (reached through symlinks in the launcher dir) recreates every link, prunes links to removed entries, and installs the sync job. `omp-channels` reports the layer's link health, uncommitted/unpushed counts and the last sync.
+- Config decisions go in `CHANGELOG.md`, including values set in the untracked profile `config.yml`. `launchers/fork/must-keep.json` probes guard the ones a fork update could silently undo.
 - `sync/profile-sync.sh` runs daily at 04:20: `git add -A`, a credential scan over added lines (a hit blocks the commit and is reported by `omp-channels`), commit, rebase if needed, push. Status: `~/.omp/profile-layer-sync/status.json`.
 
 ## Native free-model delegation
