@@ -213,9 +213,11 @@ launchctl print "gui/$(id -u)/$SYNC_LABEL" >/dev/null 2>&1 || launchctl bootstra
 SWEEP_LABEL=ai.omp.code-sweep
 mkdir -p "$HOME/.local/state/code-sweep"
 sweep_plist=$HOME/Library/LaunchAgents/$SWEEP_LABEL.plist
-if ! cmp -s "$LAYER/bin/$SWEEP_LABEL.plist" "$sweep_plist"; then
+# The tracked plist is public: it carries __HOME__, rendered here.
+sweep_rendered=$(sed "s#__HOME__#$HOME#g" "$LAYER/bin/$SWEEP_LABEL.plist")
+if [ "$sweep_rendered" != "$(cat "$sweep_plist" 2>/dev/null)" ]; then
 	launchctl bootout "gui/$(id -u)/$SWEEP_LABEL" 2>/dev/null || true
-	cp "$LAYER/bin/$SWEEP_LABEL.plist" "$sweep_plist"
+	printf '%s\n' "$sweep_rendered" >"$sweep_plist"
 fi
 launchctl print "gui/$(id -u)/$SWEEP_LABEL" >/dev/null 2>&1 || launchctl bootstrap "gui/$(id -u)" "$sweep_plist"
 chflags uchg "$CH/stock" "$CH/fork" "$CH"

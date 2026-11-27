@@ -21,6 +21,11 @@ only. Reports: ~/.local/state/code-sweep/ (latest.txt, latest.json, dated copies
 `push` takes exactly the named refs (else the checkout's current ref) and may target a skip-listed
 repo such as omp-fork when the chosen --remote is owned by you. Reviewed gitleaks false positives
 live outside the repos in ~/.config/code-sweep/gitleaksignore/<owner>__<name>, exact fingerprints only.
+
+PUBLIC repos (and unknown visibility) get a stricter gate: blobs > 10 MB, archive/DB/dump/log/IDE-state
+paths, local home or vault paths in added lines; gitleaks ignores are never applied. `push` on a public
+repo prints a PUBLIC PUSH PREVIEW and pushes only with --allow-public --yes; bulk sweeps never push
+scratch branches (wt/, rescue/, wip/, worktree-) or 'cursor: empty commit' commits to public repos.
 """
 from __future__ import annotations
 
@@ -49,6 +54,19 @@ SECRET_PATTERNS = [
     ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*",
     ".credentials*", "credentials.json", "*.credentials", ".netrc", ".pypirc", "service-account*.json",
 ]
+# Public repos: stricter limits and paths (on top of the private gate).
+MAX_PUBLIC_BLOB = 10 * 1024 * 1024
+PUBLIC_BLOCK_FILES = [
+    "*.zip", "*.tar", "*.tar.*", "*.tgz", "*.7z", "*.rar", "*.sqlite", "*.sqlite3", "*.sqlite-*", "*.db",
+    "*.parquet", "*.pkl", "*.pickle", "*.npz", "*.pt", "*.ckpt", "*.log", "*.bak", "*.p8", "*.jks",
+    "*.keystore", "*.kdbx", "id_dsa*", "*.ovpn",
+]
+PUBLIC_BLOCK_DIRS = {".cursor", ".claude", ".obsidian", ".omp"}
+PUBLIC_SCRATCH_BRANCHES = ["wt/*", "rescue/*", "wip/*", "worktree-*"]
+EMPTY_CURSOR = re.compile(r"cursor: empty commit", re.I)
+# Built from pieces so this file does not trip its own scan.
+PRIVATE_PATH = re.compile("/" + r"Users/[^/\s]+/" + "|" + r"C:\\" + r"Users\\" + "|" + "Obsidian" + r"\s" + "Vault"
+                          + "|" + "Library/Mobile" + r"\s" + "Documents")
 # Reviewed false positives: one file per repo (<owner>__<name>), exact gitleaks fingerprints only.
 IGNORE_DIR = Path.home() / ".config/code-sweep/gitleaksignore"
 FINGERPRINT = re.compile(r"^[0-9a-f]{40}:[^:]+:[A-Za-z0-9_-]+:\d+$")
@@ -344,8 +362,54 @@ def ignore_file(repo: Repo) -> Optional[Path]:
     return path if repo.slug and path.is_file() else None
 
 
-def gate(root: Path, unit: Unit, exclude: List[str], ignore: Optional[Path] = None) -> str:
-    """'ok' or the reason the unit's outgoing range may not be pushed. Fails closed."""
+def range_args(unit: Unit, exclude: List[str]) -> Tuple[List[str], str]:
+    """Positional tip plus stdin negations for the unit's outgoing range."""
+    return [unit.sha], "".join(f"^{s}\n" for s in exclude)
+
+
+def range_subjects(root: Path, unit: Unit, exclude: List[str]) -> List[str]:
+    tips, stdin = range_args(unit, exclude)
+    return git(root, "log", "--format=%h %s", "--stdin", *tips, stdin=stdin, timeout=120).splitlines()
+
+
+def range_files(root: Path, unit: Unit, exclude: List[str]) -> List[str]:
+    tips, stdin = range_args(unit, exclude)
+    out = git(root, "log", "--format=", "--name-only", "--stdin", *tips, stdin=stdin, timeout=120)
+    return sorted({line for line in out.splitlines() if line})
+
+
+def public_problems(root: Path, unit: Unit, exclude: List[str], paths: Dict[str, str]) -> List[str]:
+    """Extra checks for public repos: dump/IDE paths, 10 MB blobs, local or vault paths in added lines."""
+    problems = []
+    for name in sorted(set(paths.values())):
+        base = name.rsplit("/", 1)[-1]
+        parts = name.split("/")[:-1]
+        if any(fnmatch.fnmatch(base, p) for p in PUBLIC_BLOCK_FILES) or any(d in PUBLIC_BLOCK_DIRS for d in parts):
+            problems.append(f"public: blocked path {name}")
+    sizes = git(root, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+                stdin="\n".join(paths) + "\n", timeout=300) if paths else ""
+    for line in sizes.splitlines():
+        bits = line.split()
+        if len(bits) == 3 and bits[1] == "blob" and MAX_PUBLIC_BLOB < int(bits[2]) <= MAX_BLOB:
+            problems.append(f"public: blob {paths.get(bits[0], bits[0])} is {int(bits[2]) // 2**20} MB (> 10 MB)")
+    tips, stdin = range_args(unit, exclude)
+    patch = git(root, "log", "-p", "--no-color", "--no-ext-diff", "--format=commit %h", "--stdin", *tips,
+                stdin=stdin, timeout=300)
+    commit, current = "", ""
+    for line in patch.splitlines():
+        if line.startswith("commit "):
+            commit = line[7:]
+        elif line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else line[4:]
+        elif line.startswith("+") and PRIVATE_PATH.search(line):
+            problems.append(f"public: local/vault path in {current} @ {commit}: {PRIVATE_PATH.search(line).group(0)}")
+    return problems
+
+
+def gate(root: Path, unit: Unit, exclude: List[str], ignore: Optional[Path] = None, public: bool = True) -> str:
+    """'ok' or the reason the unit's outgoing range may not be pushed. Fails closed.
+
+    `public` adds the public checks and never applies reviewed gitleaks ignores."""
     negs = [f"^{s}" for s in exclude]
     stdin = "\n".join(negs) + "\n"
     try:
@@ -372,12 +436,21 @@ def gate(root: Path, unit: Unit, exclude: List[str], ignore: Optional[Path] = No
             parts = line.split()
             if len(parts) == 3 and parts[1] == "blob" and int(parts[2]) > MAX_BLOB:
                 problems.append(f"blob {paths.get(parts[0], parts[0])} is {int(parts[2]) // 2**20} MB")
+    if public:
+        try:
+            problems += public_problems(root, unit, exclude, paths)
+        except GitError as exc:
+            return f"gate error (public checks): {exc}"
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / "leaks.json"
         log_opts = " ".join([unit.sha, *negs])
         cmd = ["gitleaks", "git", str(root), "--log-opts", log_opts, "--no-banner", "--redact",
                "--report-format", "json", "--report-path", str(report), "--exit-code", "3"]
-        if ignore is not None:
+        if public:
+            empty = Path(tmp) / "no-ignores"
+            empty.write_text("")
+            cmd += ["--gitleaks-ignore-path", str(empty)]  # also disables a repo-local .gitleaksignore
+        elif ignore is not None:
             entries = [l.strip() for l in ignore.read_text().splitlines() if l.strip() and not l.startswith("#")]
             bad = [e for e in entries if not FINGERPRINT.match(e)]
             if bad:
@@ -397,7 +470,49 @@ def gate(root: Path, unit: Unit, exclude: List[str], ignore: Optional[Path] = No
             problems.append(f"gitleaks: {len(leaks)} finding(s): " + "; ".join(where[:5]))
         elif proc.returncode != 0:
             return f"gate error (gitleaks exit {proc.returncode}): {proc.stderr.strip()[:300]}"
-    return "ok" if not problems else "; ".join(problems[:8])
+    return "ok" if not problems else "; ".join(problems[:8]) + (f" (+{len(problems) - 8} more)" if len(problems) > 8 else "")
+
+
+def is_public(repo: Repo) -> bool:
+    return repo.visibility != "private"  # unknown counts as public
+
+
+def block_public_scratch(root: Path, repo: Repo, exclude: List[str]) -> None:
+    """Bulk sweeps never put scratch branches or empty cursor commits on a public repo."""
+    for unit in repo.units:
+        if unit.kind == "BLOCKED":
+            continue
+        if any(fnmatch.fnmatch(unit.target, p) for p in PUBLIC_SCRATCH_BRANCHES):
+            unit.kind, unit.note = "BLOCKED", f"public: scratch branch {unit.target}; push it alone with push --allow-public"
+        elif any(EMPTY_CURSOR.search(s) for s in range_subjects(root, unit, exclude)):
+            unit.kind, unit.note = "BLOCKED", "public: contains a 'cursor: empty commit'; push it alone with push --allow-public"
+
+
+def public_preview(repo: Repo) -> str:
+    root = Path(repo.path)
+    exclude = exclusion_shas(root, repo.remote)
+    url = git(root, "remote", "get-url", repo.remote).strip()
+    bar = "!" * 72
+    out = [bar, f"PUBLIC PUSH PREVIEW: {url}  ({repo.visibility or 'visibility unknown'}: anyone can read this)", bar]
+    pages = gh_json(["api", f"repos/{repo.slug}/pages"])
+    if pages:
+        out.append(f"GitHub Pages is ON (source {pages.get('source')}): pushes may publish a site at {pages.get('html_url')}")
+    for unit in repo.units:
+        out.append(f"\n{unit.kind} {unit.ref} -> {repo.remote}/{unit.target}  ({unit.unpushed} commits)  {unit.note}")
+        out += ["  commits:"] + [f"    {s}" for s in range_subjects(root, unit, exclude)]
+        files = range_files(root, unit, exclude)
+        out += [f"  files ({len(files)}):"] + [f"    {f}" for f in files[:200]]
+        if len(files) > 200:
+            out.append(f"    … {len(files) - 200} more")
+        ci = [f for f in files if f.startswith(".github/workflows/")]
+        if ci:
+            out.append(f"  WARNING: changes GitHub Actions workflows (they run on push): {', '.join(ci)}")
+        if pages and (unit.target == "gh-pages" or any(f.startswith("docs/") for f in files)):
+            out.append("  WARNING: may touch the GitHub Pages source")
+        if unit.kind != "BLOCKED" and not unit.gate:
+            unit.gate = gate(root, unit, exclude, None, public=True)
+        out.append(f"  public gate: {unit.gate or unit.note}")
+    return "\n".join(out) + "\n"
 
 
 # ---------------------------------------------------------------- execution
@@ -529,11 +644,13 @@ def require_gitleaks() -> None:
 def apply_repo(repo: Repo) -> None:
     root = Path(repo.path)
     exclude = exclusion_shas(root, repo.remote)
+    public = is_public(repo)
     for unit in repo.units:
         if unit.kind == "BLOCKED":
             unit.result = "skipped: " + unit.note
             continue
-        unit.gate = gate(root, unit, exclude, ignore_file(repo))
+        if not unit.gate:
+            unit.gate = gate(root, unit, exclude, None if public else ignore_file(repo), public)
         if unit.gate != "ok":
             unit.result = "NOT PUSHED (gate)"
             continue
@@ -546,9 +663,10 @@ def apply_repo(repo: Repo) -> None:
 def gate_only(repo: Repo) -> None:
     root = Path(repo.path)
     exclude = exclusion_shas(root, repo.remote)
+    public = is_public(repo)
     for unit in repo.units:
         if unit.kind != "BLOCKED":
-            unit.gate = gate(root, unit, exclude, ignore_file(repo))
+            unit.gate = gate(root, unit, exclude, None if public else ignore_file(repo), public)
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -576,6 +694,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         repo.eligible = (repo.status == "ok" and not repo.archived and repo.fetch in ("ok", "")
                          and not (args.no_fetch and args.apply)
                          and (repo.visibility == "private" or args.include_public))
+        if repo.status == "ok" and repo.units and is_public(repo):
+            try:
+                block_public_scratch(Path(repo.path), repo, exclusion_shas(Path(repo.path), repo.remote))
+            except GitError as exc:
+                repo.eligible, repo.reason = False, f"public scratch check failed: {exc}"
     work = [r for r in repos if r.units]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         if args.apply:
@@ -595,7 +718,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    if not args.yes:
+    if not args.yes and not args.dry_run:
         sys.exit("code-sweep push: refusing without --yes. Pass it only when the user explicitly asked to push.")
     require_gitleaks()
     owner = github_owner()
@@ -618,6 +741,17 @@ def cmd_push(args: argparse.Namespace) -> int:
     repo.eligible = True
     if not repo.units:
         print(f"{repo.path}: nothing to push for {', '.join(refs)} (already on {args.remote})")
+        return 0
+    if is_public(repo):
+        sys.stdout.write(public_preview(repo))
+        if args.dry_run or not args.allow_public:
+            print("\nNOT PUSHED: public repo. Show this preview to the user; after they confirm it is PUBLIC, "
+                  "re-run with --allow-public --yes.")
+            return 2
+    elif args.dry_run:
+        gate_only(repo)
+        args.root, args.apply = str(root), False
+        sys.stdout.write(render([repo], args))
         return 0
     apply_repo(repo)
     args.root = str(root)
@@ -650,6 +784,9 @@ def main() -> int:
     push.add_argument("--remote", default="origin", help="GitHub remote owned by you to push to (default origin)")
     push.add_argument("refs", nargs="*", help="local branches (default: the checkout's current branch or detached HEAD)")
     push.add_argument("--yes", action="store_true", help="required: the user explicitly asked to push")
+    push.add_argument("--allow-public", action="store_true",
+                      help="required with --yes for a PUBLIC repo, after the user confirmed the public preview")
+    push.add_argument("--dry-run", action="store_true", help="show the plan (public preview for public repos); never push")
     args = parser.parse_args()
     if args.cmd == "push":
         return cmd_push(args)

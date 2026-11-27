@@ -24,6 +24,15 @@ A commit is not a push. Work that is committed but never pushed has sat unseen f
 - When the gate blocks a ref, report the reason it printed and stop. NEVER work around it by editing history, bypassing hooks, or pushing by hand.
 - Creating a GitHub repository (`code-sweep sweep --create-remote <repo>`, `gh repo create`) needs its own explicit confirmation, and the repository MUST be private.
 
+### Public repos
+
+Anyone can read a public repo, and a push there can't be taken back. This includes the profile layer and omp-fork, which push to the public `ZealousEar/oh-my-pi`.
+
+- Before any push to a public repo, run `code-sweep push --repo <path> [--remote NAME] <branch> --dry-run` and show the user the whole **PUBLIC PUSH PREVIEW** it prints: repo URL and visibility, target branch, commit subjects, changed files, GitHub Pages and `.github/workflows/` warnings, and the public gate result.
+- Pass `--allow-public` (together with `--yes`) only after the user has confirmed in this conversation that they have seen the preview and know the repo is PUBLIC. Get a separate confirmation for each repo and each branch. Approval for a private push or an earlier preview doesn't count.
+- The public gate is stricter and is a hard block: blobs over 10 MB; archives, databases, dumps, logs and IDE/agent state (`.cursor/`, `.claude/`, `.obsidian/`, `.omp/`); local home paths and private vault paths in added lines. gitleaks findings always block, and reviewed ignores are never applied. Fix the content and show a new preview. NEVER bypass the gate.
+- Bulk `sweep --apply --include-public` never pushes scratch branches (`wt/*`, `rescue/*`, `wip/*`, `worktree-*`) or `cursor: empty commit` commits. Each of those needs its own preview, confirmation, and `push --allow-public --yes <branch>`.
+
 ## 3. Worktrees for campaigns, hill-climbs and lanes
 
 - Create them on a named branch: `git worktree add -b wt/<name> <path> <start>`. NEVER use `--detach` for work that may produce commits. A detached worktree is only for a throwaway read-only look under the temp dir.
