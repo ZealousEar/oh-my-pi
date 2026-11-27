@@ -389,3 +389,17 @@ Files:
 - packages/coding-agent/src/tts/settings.ts
 - packages/coding-agent/src/tts/tts-client.ts
 - packages/coding-agent/src/tts/vocalizer.ts
+
+## 323eb55f51 feat(commit): report LOCAL ONLY/PUSHED status after every selective commit
+On fork/stack-19.2.1 after the v19.2.1 port follow-up (5c3e098df0); not yet released (pinned ompd is r34).
+Eval `commit` prints and returns a remote status after every commit and never pushes.
+Owner decision 2026-11-27: no auto-push, so agents must stop reporting "committed" as if the work were on GitHub.
+Must-keep check: test/commit-selective-flow.test.ts ("reports every commit as local only …").
+
+Files:
+- packages/coding-agent/CHANGELOG.md
+- packages/coding-agent/src/commit/selective/prelude-definition.ts
+- packages/coding-agent/src/commit/selective/remote-status.ts
+- packages/coding-agent/src/prompts/tools/commit-guidance.md
+- packages/coding-agent/src/prompts/tools/commit.md
+- packages/coding-agent/test/commit-selective-flow.test.ts
