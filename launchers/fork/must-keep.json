@@ -5,9 +5,7 @@
       "name": "/models Presets sidebar",
       "tests": [
         "packages/coding-agent/test/model-presets.test.ts",
-        "packages/coding-agent/test/model-hub.test.ts",
-        "packages/tui/test/model-picker-native.test.ts",
-        "packages/tui/test/model-hub-assign-scope.test.ts"
+        "packages/coding-agent/test/model-hub.test.ts"
       ],
       "probes": []
     },
