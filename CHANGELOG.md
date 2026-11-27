@@ -4,6 +4,26 @@ Dated configuration decisions for the fork channels (`ompd` = profile daily-fork
 
 `~/.omp/profiles/<profile>/agent/config.yml` is not in git: `launchers/install.sh` seeds it from `launchers/profile-seed/config.yml` only when it is missing. Entries therefore record its values. `fork-release` and `install.sh` never rewrite a profile `config.yml`, `models.yml` or `config/fork-overlay.yml`. The `launchers/fork/must-keep.json` probes make `fork-check` and `fork-release` fail when a new ompd stops honouring a setting listed there.
 
+## 2026-11-27: unpushed-work sweep, commit status, GitHub rule
+
+Owner decisions (2026-11-27, after two "commit everything" requests left CareerMode `main` 2 commits ahead of origin):
+
+- Commits never auto-push. Every commit report states `PUSHED` or `LOCAL ONLY: N commits …`. Pushing happens only on explicit request ("push to gh") and only through `bin/code-sweep push --yes`.
+- Push gate: gitleaks over the full outgoing range, measured against remote branches and peeled remote tags; it fails closed. No blobs over 50 MB, no secret-looking paths.
+- Sweep `--apply` pushes private repos only (`--include-public` opts in). Diverged refs go to `rescue/<checkout>/<branch>`. Detached worktree HEADs get `wt/<name>`. Dirty trees are reported only. Repos without a remote get a private repo only via `--create-remote PATH --apply --yes`.
+- Worktree hygiene is a rule (`git worktree add -b wt/<name>`), with no code change.
+- All GitHub-facing writing goes to the `pr-writing` agent on the `@pr-writing` role. PRs keep the strict template. READMEs, issues, release notes and repo docs use the style rules with per-kind shapes.
+
+| What | Where |
+|---|---|
+| Rule: commit status, push gate, worktree branches, pr-writing delegation (stock, daily-fork, dev-fork) | `agent/rules/github.md` |
+| PR vs document procedures | `agent/agents/pr-writing.md` |
+| Sweep / gated push; reports in `~/.local/state/code-sweep/` (kept outside this public layer) | `bin/code-sweep` |
+| Daily 18:30 dry-run + notification, never pushes | `bin/ai.omp.code-sweep.plist`, installed by `launchers/install.sh` |
+| `commit` status line (`LOCAL ONLY`/`PUSHED`, `remote` in the result) | omp-fork `fork/stack-19.2.1`, ships with the next fork-release |
+
+Dependency: `brew install gitleaks` (8.30.1).
+
 ## 2026-11-27: main compaction trigger 30 %
 
 Owner decision 2026-11-27 ("keep it at 30% for now"): daily-fork `config.yml` `compaction.thresholdPercent` 25.6 → **30**, set by the owner at 2026-11-26 21:03:58Z. The rest is unchanged: `thresholdTokens: -1`, `thresholdMinContextWindow: 512000`, `keepRecentTokens: 48000`, per-agent `task` 150000 / `deep` 200000.

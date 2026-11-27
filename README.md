@@ -7,13 +7,14 @@ This branch has no code history; it is not meant for upstream.
 ```
 agent/skills/       skills (converge, decision-writing, grill-me, herdr-round, …)
 agent/agents/       agent definitions (converge debaters/judges, pr-writing, deep)
-agent/rules/        always-on rules (orchestration-notify, grill-first, show-me, subagent-tiers)
+agent/rules/        always-on rules (orchestration-notify, grill-first, show-me, subagent-tiers, github)
 agent/extensions/   Herdr state hook and packaged native OpenCode delegation
 agent/models.yml    Featherless provider, TypeSafe jev pins, effort ceilings, OpenRouter vendor pins
 config/fork-overlay.yml   PI_CONFIG_FILES overlay: layer roles (jev, deep, pr-writing, converge), fallback chains, skill sources
 CHANGELOG.md        dated config decisions: what changed, owner decision, evidence, backups
 launchers/          channel wrappers, install.sh, profile-seed (this machine's paths)
 sync/               daily commit + push (launchd ai.omp.profile-layer-sync)
+bin/code-sweep      find unpushed work under ~/Code; gated push (gitleaks, size, secret paths); daily dry-run (launchd ai.omp.code-sweep)
 ```
 
 ## How it is wired

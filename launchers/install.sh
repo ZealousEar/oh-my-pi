@@ -194,7 +194,7 @@ for profile in daily-fork dev-fork; do
 	done
 done
 # Stock also gets the explicit native OpenCode command; other fork extensions remain isolated.
-for entry in commands/ompd-update.md rules/ompd-update.md extensions/opencode-free; do
+for entry in commands/ompd-update.md rules/ompd-update.md rules/github.md extensions/opencode-free; do
 	mkdir -p "$PROFILES/stock/agent/$(dirname "$entry")"
 	layer_link "$LAYER/agent/$entry" "$PROFILES/stock/agent/$entry"
 done
@@ -209,6 +209,15 @@ if ! cmp -s "$LAYER/sync/$SYNC_LABEL.plist" "$plist"; then
 	cp "$LAYER/sync/$SYNC_LABEL.plist" "$plist"
 fi
 launchctl print "gui/$(id -u)/$SYNC_LABEL" >/dev/null 2>&1 || launchctl bootstrap "gui/$(id -u)" "$plist"
+# Daily code-sweep dry-run report (launchd); never pushes. Reports in ~/.local/state/code-sweep.
+SWEEP_LABEL=ai.omp.code-sweep
+mkdir -p "$HOME/.local/state/code-sweep"
+sweep_plist=$HOME/Library/LaunchAgents/$SWEEP_LABEL.plist
+if ! cmp -s "$LAYER/bin/$SWEEP_LABEL.plist" "$sweep_plist"; then
+	launchctl bootout "gui/$(id -u)/$SWEEP_LABEL" 2>/dev/null || true
+	cp "$LAYER/bin/$SWEEP_LABEL.plist" "$sweep_plist"
+fi
+launchctl print "gui/$(id -u)/$SWEEP_LABEL" >/dev/null 2>&1 || launchctl bootstrap "gui/$(id -u)" "$sweep_plist"
 chflags uchg "$CH/stock" "$CH/fork" "$CH"
 # ~/.omp-channels is locked, but the policy dir was locked above already.
 printf 'installed wrappers (uchg) in %s; pinned targets locked under %s; profiles seeded under %s\n' "$BIN" "$CH" "$PROFILES"

@@ -1,0 +1,635 @@
+#!/usr/bin/python3
+"""code-sweep: find commits under ~/Code that are on no remote, and push them through a gate.
+
+  code-sweep [sweep] [--apply] [--include-public] [--only NAME ...] [--create-remote PATH ...]
+  code-sweep push --repo PATH [REF ...] --yes
+
+A commit is "unpushed" when it is reachable from a local branch or a worktree HEAD but from no
+remote-tracking ref and no remote tag (`git ls-remote --tags`, peeled). Plan per ref:
+
+  FF      default or side branch: fast-forward push to the same name (never --force)
+  NEW     side branch absent on origin: push -u under the same name
+  BRANCH  detached worktree HEAD: create wt/<worktree-name>, then push -u
+  RESCUE  diverged from origin: push to rescue/<checkout>/<branch>; the original is untouched
+
+Every push passes the gate first: gitleaks over the full outgoing range (fails closed), no blob
+over 50 MB, no secret-looking paths. Dry-run by default. --apply pushes PRIVATE repos only unless
+--include-public. Repos with a foreign origin owner, the skip list, archived repos (on GitHub or by
+README marker) and repos whose fetch failed are reported, never pushed. Dirty files are reported
+only. Reports: ~/.local/state/code-sweep/ (latest.txt, latest.json, dated copies).
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+STATE_DIR = Path.home() / ".local/state/code-sweep"
+DEFAULT_ROOT = Path.home() / "Code"
+MAX_DEPTH = 4
+# Upstream forks and other people's repos: never pushed, listed under "skipped".
+SKIP_NAMES = {"oh-my-pi", "omp-fork", "mcp_excalidraw"}  # plus everything under _external/
+PRUNE_DIRS = {"node_modules", ".venv", "venv", "__pycache__", ".pnpm-store", ".tox", "target", "dist", "build"}
+MAX_BLOB = 50 * 1024 * 1024
+SECRET_PATTERNS = [
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*",
+    ".credentials*", "credentials.json", "*.credentials", ".netrc", ".pypirc", "service-account*.json",
+]
+SECRET_ALLOW = {".env.example", ".env.sample", ".env.template", ".env.dist"}
+ARCHIVE_MARKER = re.compile(r"repository was archived", re.I)
+GITHUB_URL = re.compile(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$")
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/false", "LC_ALL": "C"}
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def run(args: List[str], cwd: Optional[Path] = None, timeout: int = 120, stdin: str = "") -> str:
+    try:
+        proc = subprocess.run(args, cwd=cwd, input=stdin, capture_output=True, text=True,
+                              timeout=timeout, env=GIT_ENV, errors="replace")
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"{' '.join(args[:3])}: timed out after {timeout}s") from exc
+    if proc.returncode != 0:
+        raise GitError(f"{' '.join(args[:4])}: {(proc.stderr or proc.stdout).strip()[:400]}")
+    return proc.stdout
+
+
+def git(root: Path, *args: str, timeout: int = 120, stdin: str = "") -> str:
+    return run(["git", "-C", str(root), *args], timeout=timeout, stdin=stdin)
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def discover(root: Path) -> List[Path]:
+    """Common-dir roots of every repository within MAX_DEPTH of root (worktrees fold into their repo)."""
+    found: Dict[str, Path] = {}
+    base_depth = len(root.parts)
+    for current, dirs, files in os.walk(root):
+        here = Path(current)
+        if ".git" in dirs or ".git" in files:
+            try:
+                common = Path(git(here, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                                  timeout=20).strip())
+                repo = common.parent if common.name == ".git" else common
+                found.setdefault(str(repo), repo)
+            except GitError:
+                found.setdefault(str(here), here)  # reported as broken later
+        dirs[:] = [d for d in dirs if d != ".git" and d not in PRUNE_DIRS]
+        if len(here.parts) - base_depth >= MAX_DEPTH:
+            dirs[:] = []
+    return sorted(found.values())
+
+
+# ---------------------------------------------------------------- model
+
+
+@dataclass
+class Unit:
+    kind: str  # FF | NEW | BRANCH | RESCUE | BLOCKED
+    ref: str  # local branch name, or "HEAD@<worktree>" for detached
+    sha: str
+    target: str  # remote branch name pushed to
+    unpushed: int
+    checkout: str  # worktree dir name holding the ref ("" when not checked out)
+    worktree: str = ""
+    note: str = ""
+    set_upstream: bool = False
+    create_branch: str = ""  # local branch to create first (detached HEADs)
+    gate: str = ""  # "" not run | "ok" | reason blocked
+    result: str = ""
+
+
+@dataclass
+class Repo:
+    path: str
+    name: str
+    status: str = "ok"  # ok | no-remote | skipped | broken
+    reason: str = ""
+    slug: str = ""
+    visibility: str = ""
+    archived: bool = False
+    default: str = ""
+    fetch: str = ""
+    unpushed: int = 0
+    dirty: Dict[str, int] = field(default_factory=dict)
+    off_default: int = 0
+    units: List[Unit] = field(default_factory=list)
+    eligible: bool = False
+
+
+# ---------------------------------------------------------------- per-repo analysis
+
+
+def gh_json(args: List[str]) -> Optional[dict]:
+    try:
+        return json.loads(run(["gh", *args], timeout=60))
+    except (GitError, json.JSONDecodeError):
+        return None
+
+
+def worktrees(root: Path) -> List[dict]:
+    out, cur = [], {}
+    for line in git(root, "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur:
+                out.append(cur)
+            cur = {}
+            continue
+        key, _, value = line.partition(" ")
+        cur[key] = value or True
+    return out
+
+
+def exclusion_shas(root: Path, remote: Optional[str]) -> List[str]:
+    """Commits already on a remote: remote-tracking refs plus peeled remote tags present locally."""
+    shas = set(git(root, "for-each-ref", "--format=%(objectname)", "refs/remotes").split())
+    if remote:
+        tags: Dict[str, str] = {}
+        for line in git(root, "ls-remote", "--tags", remote, timeout=90).splitlines():
+            sha, _, name = line.partition("\t")
+            base = name[:-3] if name.endswith("^{}") else name
+            if name.endswith("^{}") or base not in tags:
+                tags[base] = sha
+        candidates = sorted(set(tags.values()) - shas)
+        if candidates:
+            check = git(root, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                        stdin="\n".join(candidates) + "\n")
+            shas |= {line.split()[0] for line in check.splitlines() if line.endswith(" commit")}
+    return sorted(shas)
+
+
+def count_unpushed(root: Path, sha: str, exclude: List[str]) -> int:
+    stdin = "".join(f"^{s}\n" for s in exclude)
+    return int(git(root, "rev-list", "--count", "--stdin", sha, stdin=stdin).strip() or 0)
+
+
+def is_ancestor(root: Path, a: str, b: str) -> bool:
+    try:
+        git(root, "merge-base", "--is-ancestor", a, b)
+        return True
+    except GitError:
+        return False
+
+
+def resolve(root: Path, ref: str) -> Optional[str]:
+    try:
+        return git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip() or None
+    except GitError:
+        return None
+
+
+def dirty_counts(trees: List[dict]) -> Dict[str, int]:
+    counts = {}
+    for wt in trees:
+        if wt.get("prunable") or wt.get("bare"):
+            continue
+        try:
+            n = len(git(Path(wt["worktree"]), "status", "--porcelain", timeout=60).splitlines())
+        except GitError:
+            continue
+        if n:
+            counts[Path(wt["worktree"]).name] = n
+    return counts
+
+
+def plan_ref(root: Path, repo: Repo, ref: str, sha: str, exclude: List[str], checkout: str,
+             worktree: str, detached: bool, branches: Dict[str, str]) -> Optional[Unit]:
+    n = count_unpushed(root, sha, exclude)
+    if n == 0:
+        return None
+    unit = Unit(kind="", ref=ref, sha=sha, target="", unpushed=n, checkout=checkout, worktree=worktree)
+    if detached:
+        name = f"wt/{checkout}"
+        if name in branches and branches[name] != sha:
+            name = f"{name}-{sha[:7]}"
+        unit.create_branch = name if name not in branches else ""
+        ref = name
+    remote_sha = resolve(root, f"refs/remotes/origin/{ref}") if repo.slug else None
+    if remote_sha is None:
+        unit.kind = "BRANCH" if detached else "NEW"
+        unit.target, unit.set_upstream = ref, True
+    elif is_ancestor(root, remote_sha, sha):
+        unit.kind = "FF"
+        unit.target = ref
+        upstream = git(root, "for-each-ref", "--format=%(upstream)", f"refs/heads/{ref}").strip()
+        unit.set_upstream = not detached and not upstream
+    else:
+        ahead = n
+        behind = int(git(root, "rev-list", "--count", f"{sha}..{remote_sha}").strip())
+        unit.kind = "RESCUE"
+        unit.target = f"rescue/{checkout or repo.name}/{ref}"
+        unit.note = f"diverged from origin/{ref}: {ahead} ahead, {behind} behind"
+        unit.create_branch = ""
+        rescue_sha = resolve(root, f"refs/remotes/origin/{unit.target}")
+        if rescue_sha and not is_ancestor(root, rescue_sha, sha):
+            unit.kind, unit.note = "BLOCKED", f"{unit.note}; origin/{unit.target} also diverged"
+    if detached:
+        unit.note = (unit.note + "; " if unit.note else "") + f"detached worktree {worktree}"
+    return unit
+
+
+def analyse(path: Path, owner: str, fetch: bool, only_refs: Optional[List[str]] = None,
+            start: Optional[Path] = None) -> Repo:
+    repo = Repo(path=str(path), name=path.name)
+    try:
+        trees = worktrees(path)
+        repo.dirty = dirty_counts(trees)
+        remotes = git(path, "remote").split()
+        if path.name in SKIP_NAMES or (path.parent.name == "_external"):
+            repo.status, repo.reason = "skipped", "upstream fork / external repo (skip list)"
+            return repo
+        if not remotes:
+            repo.status = "no-remote"
+            heads = git(path, "for-each-ref", "--format=%(objectname)", "refs/heads").split()
+            repo.unpushed = int(git(path, "rev-list", "--count", *heads).strip()) if heads else 0
+            return repo
+        if "origin" not in remotes:
+            repo.status, repo.reason = "skipped", f"no 'origin' remote (remotes: {', '.join(remotes)})"
+            return repo
+        url = git(path, "remote", "get-url", "origin").strip()
+        match = GITHUB_URL.search(url)
+        if not match:
+            repo.status, repo.reason = "skipped", f"origin is not GitHub: {url}"
+            return repo
+        repo.slug = f"{match.group(1)}/{match.group(2)}"
+        if match.group(1).lower() != owner.lower():
+            repo.status, repo.reason = "skipped", f"origin owned by {match.group(1)}, not {owner}"
+            return repo
+        meta = gh_json(["repo", "view", repo.slug, "--json", "visibility,isArchived,isFork,defaultBranchRef"])
+        if meta is None:
+            repo.status, repo.reason = "skipped", f"{repo.slug} not found on GitHub (or gh failed)"
+            return repo
+        repo.visibility = meta.get("visibility", "").lower()
+        repo.archived = bool(meta.get("isArchived"))
+        repo.default = (meta.get("defaultBranchRef") or {}).get("name") or ""
+        readme = path / "README.md"
+        if repo.archived:
+            repo.reason = "archived on GitHub"
+        elif readme.exists() and ARCHIVE_MARKER.search(readme.read_text(errors="replace")[:2000]):
+            repo.archived, repo.reason = True, "README marks the repository archived"
+        if fetch:
+            try:
+                git(path, "fetch", "--prune", "--no-tags", "origin", timeout=120)
+                repo.fetch = "ok"
+            except GitError as exc:
+                repo.fetch = f"failed: {exc}"
+        exclude = exclusion_shas(path, "origin")
+        branches = dict(line.split(" ", 1)[::-1] for line in
+                        git(path, "for-each-ref", "--format=%(objectname) %(refname:short)",
+                            "refs/heads").splitlines())
+        holder: Dict[str, Tuple[str, str]] = {}
+        detached: List[Tuple[str, str, str]] = []
+        for wt in trees:
+            if wt.get("prunable") or wt.get("bare"):
+                continue
+            wpath = Path(wt["worktree"])
+            name = wpath.name
+            if isinstance(wt.get("branch"), str):
+                holder[wt["branch"].removeprefix("refs/heads/")] = (name, str(wpath))
+            elif wt.get("detached"):
+                detached.append((name, str(wpath), wt["HEAD"]))
+        candidates = []
+        for branch, sha in sorted(branches.items()):
+            checkout, wpath = holder.get(branch, ("", ""))
+            candidates.append((branch, sha, checkout, wpath, False))
+        for name, wpath, sha in detached:
+            candidates.append((f"HEAD@{name}", sha, name, wpath, True))
+        if only_refs is not None:
+            candidates = [c for c in candidates if c[0] in only_refs or c[3] == str(start)]
+        all_heads = sorted({c[1] for c in candidates})
+        if all_heads:
+            stdin = "".join(f"^{s}\n" for s in exclude)
+            repo.unpushed = int(git(path, "rev-list", "--count", "--stdin", *all_heads, stdin=stdin).strip())
+        for ref, sha, checkout, wpath, is_detached in candidates:
+            unit = plan_ref(path, repo, ref, sha, exclude, checkout, wpath, is_detached, branches)
+            if unit:
+                repo.units.append(unit)
+        if repo.default and resolve(path, f"refs/remotes/origin/{repo.default}"):
+            repo.off_default = int(git(path, "rev-list", "--count", "--remotes=origin",
+                                       "--not", f"refs/remotes/origin/{repo.default}").strip())
+    except GitError as exc:
+        repo.status, repo.reason = "broken", str(exc)
+    return repo
+
+
+# ---------------------------------------------------------------- gate
+
+
+def gate(root: Path, unit: Unit, exclude: List[str]) -> str:
+    """'ok' or the reason the unit's outgoing range may not be pushed. Fails closed."""
+    negs = [f"^{s}" for s in exclude]
+    stdin = "\n".join(negs) + "\n"
+    try:
+        objects = git(root, "rev-list", "--objects", "--stdin", unit.sha, stdin=stdin, timeout=300)
+    except GitError as exc:
+        return f"gate error (rev-list): {exc}"
+    paths: Dict[str, str] = {}
+    for line in objects.splitlines():
+        sha, _, name = line.partition(" ")
+        if name:
+            paths[sha] = name
+    problems = []
+    for name in sorted(set(paths.values())):
+        base = name.rsplit("/", 1)[-1]
+        if base not in SECRET_ALLOW and any(fnmatch.fnmatch(base, p) for p in SECRET_PATTERNS):
+            problems.append(f"secret-looking path {name}")
+    if paths:
+        try:
+            sizes = git(root, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+                        stdin="\n".join(paths) + "\n", timeout=300)
+        except GitError as exc:
+            return f"gate error (cat-file): {exc}"
+        for line in sizes.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] == "blob" and int(parts[2]) > MAX_BLOB:
+                problems.append(f"blob {paths.get(parts[0], parts[0])} is {int(parts[2]) // 2**20} MB")
+    with tempfile.TemporaryDirectory() as tmp:
+        report = Path(tmp) / "leaks.json"
+        log_opts = " ".join([unit.sha, *negs])
+        try:
+            proc = subprocess.run(
+                ["gitleaks", "git", str(root), "--log-opts", log_opts, "--no-banner", "--redact",
+                 "--report-format", "json", "--report-path", str(report), "--exit-code", "3"],
+                capture_output=True, text=True, timeout=900, env=GIT_ENV, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"gate error (gitleaks): {exc}"
+        if proc.returncode == 3:
+            try:
+                leaks = json.loads(report.read_text())
+            except (OSError, json.JSONDecodeError):
+                leaks = []
+            where = sorted({f"{l.get('File')} ({l.get('RuleID')}) @ {str(l.get('Commit'))[:8]}" for l in leaks})
+            problems.append(f"gitleaks: {len(leaks)} finding(s): " + "; ".join(where[:5]))
+        elif proc.returncode != 0:
+            return f"gate error (gitleaks exit {proc.returncode}): {proc.stderr.strip()[:300]}"
+    return "ok" if not problems else "; ".join(problems[:8])
+
+
+# ---------------------------------------------------------------- execution
+
+
+def execute(root: Path, unit: Unit) -> str:
+    if unit.kind == "BLOCKED":
+        return "skipped: " + unit.note
+    if unit.create_branch:
+        git(root, "branch", unit.create_branch, unit.sha)
+    if unit.kind == "RESCUE":
+        src = unit.sha
+    else:
+        src = f"refs/heads/{unit.create_branch or unit.ref}"
+    args = ["push"]
+    if unit.set_upstream and unit.kind != "RESCUE":
+        args.append("-u")
+    args += ["origin", f"{src}:refs/heads/{unit.target}"]
+    out = git(root, *args, timeout=600)
+    return "pushed" + (f" ({out.strip()[:120]})" if out.strip() else "")
+
+
+def create_remote(path: Path, owner: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", path.name).strip("-")
+    run(["gh", "repo", "create", f"{owner}/{name}", "--private", "--source", str(path), "--remote", "origin"],
+        timeout=120)
+    return f"{owner}/{name}"
+
+
+# ---------------------------------------------------------------- reporting
+
+
+def render(repos: List[Repo], args: argparse.Namespace) -> str:
+    mode = "APPLY" if getattr(args, "apply", False) else "DRY-RUN"
+    lines = [f"code-sweep {mode} {dt.datetime.now().isoformat(timespec='seconds')}  root={args.root}", ""]
+    groups = {"ok": [], "no-remote": [], "skipped": [], "broken": []}
+    for repo in repos:
+        groups[repo.status].append(repo)
+    pending = [r for r in groups["ok"] if r.units]
+    lines.append(f"== Unpushed work: {len(pending)} repos, {sum(r.unpushed for r in pending)} commits")
+    for repo in pending:
+        flags = [repo.visibility or "?", f"default {repo.default or '?'}"]
+        if repo.archived:
+            flags.append(f"ARCHIVED ({repo.reason})")
+        if repo.fetch and repo.fetch != "ok":
+            flags.append(f"FETCH {repo.fetch}")
+        if not repo.eligible:
+            flags.append("report only" + (" (public; --include-public to push)"
+                                          if repo.visibility == "public" and not repo.archived else ""))
+        lines.append(f"\n{repo.path}  [{repo.slug}]  unpushed={repo.unpushed}  " + "  ".join(flags))
+        for u in repo.units:
+            src = u.create_branch and f"{u.ref} -> {u.create_branch}" or u.ref
+            extra = []
+            if u.set_upstream:
+                extra.append("-u")
+            if u.note:
+                extra.append(u.note)
+            if u.gate:
+                extra.append("gate: " + u.gate)
+            if u.result:
+                extra.append("=> " + u.result)
+            lines.append(f"  {u.kind:<7}{src}  ->  origin/{u.target}  {u.unpushed} commits  " + "  ".join(extra))
+        if repo.dirty:
+            lines.append("  dirty: " + ", ".join(f"{k} {v}" for k, v in sorted(repo.dirty.items())))
+        if repo.off_default:
+            lines.append(f"  on GitHub but not on {repo.default}: {repo.off_default} commits")
+    lines.append("\n== Pushed, but dirty or off the default branch")
+    for repo in groups["ok"]:
+        if not repo.units and (repo.dirty or repo.off_default):
+            bits = []
+            if repo.dirty:
+                bits.append("dirty: " + ", ".join(f"{k} {v}" for k, v in sorted(repo.dirty.items())))
+            if repo.off_default:
+                bits.append(f"{repo.off_default} commits not on {repo.default}")
+            lines.append(f"  {repo.path}  " + "  ".join(bits))
+    lines.append("\n== No remote (create a private GitHub repo with --create-remote PATH --apply)")
+    for repo in groups["no-remote"]:
+        dirty = sum(repo.dirty.values())
+        lines.append(f"  {repo.path}  commits={repo.unpushed}  dirty={dirty}")
+    lines.append("\n== Skipped")
+    for repo in groups["skipped"]:
+        lines.append(f"  {repo.path}  {repo.reason}")
+    lines.append("\n== Broken")
+    for repo in groups["broken"]:
+        lines.append(f"  {repo.path}  {repo.reason}")
+    return "\n".join(lines) + "\n"
+
+
+def save(text: str, repos: List[Repo]) -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    (STATE_DIR / f"{stamp}.txt").write_text(text)
+    (STATE_DIR / f"{stamp}.json").write_text(json.dumps([asdict(r) for r in repos], indent=2))
+    (STATE_DIR / "latest.txt").write_text(text)
+    (STATE_DIR / "latest.json").write_text(json.dumps([asdict(r) for r in repos], indent=2))
+    return STATE_DIR / f"{stamp}.txt"
+
+
+def notify(repos: List[Repo]) -> None:
+    pending = [r for r in repos if r.status == "ok" and r.units]
+    local = [r for r in repos if r.status == "no-remote" and r.unpushed]
+    if not pending and not local:
+        return
+    msg = f"{len(pending)} repos with unpushed commits, {len(local)} without a remote. See {STATE_DIR}/latest.txt"
+    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "code-sweep"'],
+                   capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def github_owner() -> str:
+    owner = os.environ.get("CODE_SWEEP_OWNER")
+    if owner:
+        return owner
+    try:
+        return run(["gh", "api", "user", "-q", ".login"], timeout=30).strip()
+    except GitError as exc:
+        sys.exit(f"code-sweep: cannot resolve the GitHub owner via gh ({exc}); set CODE_SWEEP_OWNER")
+
+
+def require_gitleaks() -> None:
+    try:
+        run(["gitleaks", "version"], timeout=20)
+    except (GitError, OSError):
+        sys.exit("code-sweep: gitleaks is required for the push gate (brew install gitleaks)")
+
+
+def apply_repo(repo: Repo) -> None:
+    root = Path(repo.path)
+    exclude = exclusion_shas(root, "origin")
+    for unit in repo.units:
+        if unit.kind == "BLOCKED":
+            unit.result = "skipped: " + unit.note
+            continue
+        unit.gate = gate(root, unit, exclude)
+        if unit.gate != "ok":
+            unit.result = "NOT PUSHED (gate)"
+            continue
+        try:
+            unit.result = execute(root, unit)
+        except GitError as exc:
+            unit.result = f"FAILED: {exc}"
+
+
+def gate_only(repo: Repo) -> None:
+    root = Path(repo.path)
+    exclude = exclusion_shas(root, "origin")
+    for unit in repo.units:
+        if unit.kind != "BLOCKED":
+            unit.gate = gate(root, unit, exclude)
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    owner = github_owner()
+    root = Path(args.root).expanduser().resolve()
+    paths = discover(root)
+    if args.only:
+        paths = [p for p in paths if any(o == p.name or o in str(p) for o in args.only)]
+    created: Dict[str, str] = {}
+    for target in args.create_remote or []:
+        tpath = Path(target).expanduser().resolve()
+        if not args.apply:
+            created[str(tpath)] = "would create a PRIVATE repo (dry-run)"
+            continue
+        if not args.yes:
+            sys.exit("code-sweep: --create-remote with --apply also needs --yes (explicit confirmation)")
+        created[str(tpath)] = create_remote(tpath, owner)
+        if tpath not in paths:
+            paths.append(tpath)
+    if args.apply or args.gate:
+        require_gitleaks()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        repos = list(pool.map(lambda p: analyse(p, owner, not args.no_fetch), paths))
+    for repo in repos:
+        repo.eligible = (repo.status == "ok" and not repo.archived and repo.fetch in ("ok", "")
+                         and not (args.no_fetch and args.apply)
+                         and (repo.visibility == "private" or args.include_public))
+    work = [r for r in repos if r.units]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        if args.apply:
+            list(pool.map(apply_repo, [r for r in work if r.eligible]))
+        elif args.gate:
+            list(pool.map(gate_only, work))
+    text = render(repos, args)
+    for path, what in created.items():
+        text += f"created remote for {path}: {what}\n"
+    saved = save(text, repos)
+    if not args.quiet:
+        sys.stdout.write(text)
+    print(f"report: {saved}")
+    if args.notify:
+        notify(repos)
+    return 1 if any(u.result.startswith(("FAILED", "NOT PUSHED")) for r in repos for u in r.units) else 0
+
+
+def cmd_push(args: argparse.Namespace) -> int:
+    if not args.yes:
+        sys.exit("code-sweep push: refusing without --yes. Pass it only when the user explicitly asked to push.")
+    require_gitleaks()
+    owner = github_owner()
+    start = Path(args.repo).expanduser().resolve()
+    common = Path(git(start, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    root = common.parent if common.name == ".git" else common
+    refs = args.refs
+    if not refs:
+        branch = git(start, "branch", "--show-current").strip()
+        refs = [branch] if branch else [f"HEAD@{start.name}"]
+    repo = analyse(root, owner, fetch=True, only_refs=refs, start=start)
+    if repo.status != "ok":
+        print(f"code-sweep push: {repo.path}: {repo.status}: {repo.reason}")
+        return 1
+    if repo.archived or (repo.fetch not in ("ok", "")):
+        print(f"code-sweep push: {repo.path}: refusing ({repo.reason or 'fetch ' + repo.fetch})")
+        return 1
+    repo.eligible = True
+    if not repo.units:
+        print(f"{repo.path}: nothing to push for {', '.join(refs)} (already on origin)")
+        return 0
+    apply_repo(repo)
+    args.root = str(root)
+    args.apply = True
+    text = render([repo], args)
+    save(text, [repo])
+    sys.stdout.write(text)
+    return 1 if any(u.result.startswith(("FAILED", "NOT PUSHED", "skipped")) for u in repo.units) else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="code-sweep", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd")
+    sweep = sub.add_parser("sweep", help="find (and with --apply push) unpushed work")
+    for p in (parser, sweep):
+        p.add_argument("--root", default=str(DEFAULT_ROOT))
+        p.add_argument("--apply", action="store_true", help="push eligible refs (private repos only by default)")
+        p.add_argument("--include-public", action="store_true", help="also push public repos")
+        p.add_argument("--only", nargs="+", help="limit to repos whose name or path matches")
+        p.add_argument("--create-remote", nargs="+", metavar="PATH", help="create a private GitHub repo for PATH")
+        p.add_argument("--yes", action="store_true", help="confirm --create-remote")
+        p.add_argument("--gate", action="store_true", help="run the push gate in dry-run too")
+        p.add_argument("--no-fetch", action="store_true", help="use remote-tracking refs as they are (report only)")
+        p.add_argument("--notify", action="store_true", help="macOS notification when anything is unpushed")
+        p.add_argument("--quiet", action="store_true", help="write the report file only")
+        p.add_argument("--jobs", type=int, default=6)
+    push = sub.add_parser("push", help="push the given refs of one repo through the gate")
+    push.add_argument("--repo", default=".")
+    push.add_argument("refs", nargs="*", help="local branches (default: the checkout's current branch or detached HEAD)")
+    push.add_argument("--yes", action="store_true", help="required: the user explicitly asked to push")
+    args = parser.parse_args()
+    if args.cmd == "push":
+        return cmd_push(args)
+    return cmd_sweep(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

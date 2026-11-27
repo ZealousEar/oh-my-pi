@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily dry-run of code-sweep: report unpushed work under ~/Code, notify; never pushes. Installed by launchers/install.sh, which fills in the home-directory placeholder. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.omp.code-sweep</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>__HOME__/.omp/profile-layer/bin/code-sweep</string>
+		<string>sweep</string>
+		<string>--notify</string>
+		<string>--quiet</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>18</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>StandardInPath</key>
+	<string>/dev/null</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/state/code-sweep/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/state/code-sweep/launchd.log</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
