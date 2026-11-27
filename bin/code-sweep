@@ -16,7 +16,7 @@ Every push passes the gate first: gitleaks over the full outgoing range (fails c
 over 50 MB, no secret-looking paths. Dry-run by default. --apply pushes PRIVATE repos only unless
 --include-public. Repos with a foreign origin owner, the skip list, archived repos (on GitHub or by
 README marker) and repos whose fetch failed are reported, never pushed. Dirty files are reported
-only. Reports: ~/.local/state/code-sweep/ (latest.txt, latest.json, dated copies).
+only. Reports: ~/.local/state/code-sweep/ (dated copies always; latest.txt/latest.json on full sweeps only).
 
 `push` takes exactly the named refs (else the checkout's current ref) and may target a skip-listed
 repo such as omp-fork when the chosen --remote is owned by you. Reviewed gitleaks false positives
@@ -601,13 +601,14 @@ def render(repos: List[Repo], args: argparse.Namespace) -> str:
     return "\n".join(lines) + "\n"
 
 
-def save(text: str, repos: List[Repo]) -> Path:
+def save(text: str, repos: List[Repo], latest: bool = True) -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     (STATE_DIR / f"{stamp}.txt").write_text(text)
     (STATE_DIR / f"{stamp}.json").write_text(json.dumps([asdict(r) for r in repos], indent=2))
-    (STATE_DIR / "latest.txt").write_text(text)
-    (STATE_DIR / "latest.json").write_text(json.dumps([asdict(r) for r in repos], indent=2))
+    if latest:  # only full sweeps describe every repo
+        (STATE_DIR / "latest.txt").write_text(text)
+        (STATE_DIR / "latest.json").write_text(json.dumps([asdict(r) for r in repos], indent=2))
     return STATE_DIR / f"{stamp}.txt"
 
 
@@ -708,7 +709,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     text = render(repos, args)
     for path, what in created.items():
         text += f"created remote for {path}: {what}\n"
-    saved = save(text, repos)
+    saved = save(text, repos, latest=not args.only)
     if not args.quiet:
         sys.stdout.write(text)
     print(f"report: {saved}")
@@ -757,7 +758,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     args.root = str(root)
     args.apply = True
     text = render([repo], args)
-    save(text, [repo])
+    save(text, [repo], latest=False)
     sys.stdout.write(text)
     return 1 if any(u.result.startswith(("FAILED", "NOT PUSHED", "skipped")) for u in repo.units) else 0
 
