@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { ToolError } from "../../tools/tool-errors";
 import type { HostEvalPreludeDefinition } from "../../eval/preludes";
 import commitDocumentation from "../../prompts/tools/commit.md" with { type: "text" };
@@ -15,6 +16,7 @@ import { ChangeJournal } from "./journal";
 import commitJavascript from "./prelude.js" with { type: "text" };
 import commitPython from "./prelude.py" with { type: "text" };
 import { formatPatchPreview } from "./preview";
+import { formatRemoteStatus, type RemoteStatus, remoteStatus } from "./remote-status";
 
 /** Drafts kept per session; older ones expire. */
 const MAX_DRAFTS = 8;
@@ -161,7 +163,16 @@ export function createCommitPrelude(session: ToolSession): HostEvalPreludeDefini
 				drafts.delete(draft.id);
 				const remaining = await draftFor(context(signal, draft.root), scope);
 				remember(remaining, scope);
-				const lines = [`[${draft.branch ?? "HEAD"} ${outcome.sha.slice(0, 10)}] ${outcome.subject}`];
+				// The commit exists: a failed status read must not turn it into a reported failure.
+				let remote: RemoteStatus | undefined;
+				let remoteLine: string;
+				try {
+					remote = await remoteStatus(vcs.requireGit(draft.root), outcome.sha, draft.branch ?? null);
+					remoteLine = formatRemoteStatus(remote);
+				} catch (error) {
+					remoteLine = `LOCAL ONLY (remote status unknown: ${error instanceof Error ? error.message : String(error)}). Nothing was pushed.`;
+				}
+				const lines = [`[${draft.branch ?? "HEAD"} ${outcome.sha.slice(0, 10)}] ${outcome.subject}`, remoteLine];
 				if (outcome.amended) {
 					lines.push(
 						`amended ${outcome.amended.slice(0, 10)} (parent ${outcome.parent?.slice(0, 10) ?? "none, root commit"})`,
@@ -173,7 +184,7 @@ export function createCommitPrelude(session: ToolSession): HostEvalPreludeDefini
 					lines.push(`HEAD had moved to ${placedOn.slice(0, 10)}; the selection applied cleanly on top.`);
 				}
 				lines.push(...outcome.indexNotes, "", "Remaining:", remaining.summary());
-				return { text: lines.join("\n"), details: { ...outcome, remaining: describe(remaining) } };
+				return { text: lines.join("\n"), details: { ...outcome, remote, remaining: describe(remaining) } };
 			}
 		}
 	};

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `commit` (eval) now prints a `LOCAL ONLY: N commits … not on <upstream>` or `PUSHED` status line after every commit and returns it under `remote`, so a commit is never mistaken for one that reached the remote; it still never pushes.
+
 ## [19.2.1] - 2026-11-25
 
 ### Breaking Changes

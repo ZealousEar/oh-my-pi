@@ -253,6 +253,54 @@ describe("selective commit flow", () => {
 		});
 	});
 
+	it("reports every commit as local only against its upstream, the remote default branch, or no remote", async () => {
+		const { root, artifacts, journal, write } = await emptyRepo();
+		await Bun.write(path.join(root, "notes.md"), "seed\n");
+		await git(root, ["add", "notes.md"]);
+		await git(root, ["commit", "-qm", "seed"]);
+		const session: ToolSession = {
+			cwd: root,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			getArtifactsDir: () => artifacts,
+			getAgentId: () => "Main",
+			settings: Settings.isolated(),
+		};
+		const commit = createCommitPrelude(session);
+		const call = (parameters: object) => commit.invoke(parameters, { session, toolCallId: "test" });
+		const commitEdit = async (content: string) => {
+			await write("Main", undefined, "notes.md", content);
+			await journal.flush();
+			const { id } = type({ id: "string" }).assert((await call({ action: "draft" })).details);
+			const result = await call({ action: "commit", draft: id, subject: `docs: ${content.trim()}` });
+			const printed = result.content.map(block => (block.type === "text" ? block.text : "")).join("");
+			return { line: printed.split("\n")[1], details: result.details as { remote?: { unpushed: number | null } } };
+		};
+
+		expect((await commitEdit("no remote\n")).line).toBe(
+			"LOCAL ONLY: main is in a repository with no remote. Nothing was pushed.",
+		);
+
+		const bare = await fs.mkdtemp(path.join(os.tmpdir(), "omp-selective-remote-"));
+		tempDirs.push(bare);
+		await git(bare, ["init", "-q", "--bare", "-b", "main"]);
+		await git(root, ["remote", "add", "origin", bare]);
+		await git(root, ["push", "-q", "-u", "origin", "main"]);
+		await git(root, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+		await commitEdit("one\n");
+		const tracked = await commitEdit("two\n");
+		expect(tracked.line).toBe(
+			"LOCAL ONLY: 2 commits on main not on origin/main (upstream: origin/main). Nothing was pushed.",
+		);
+		expect(tracked.details.remote?.unpushed).toBe(2);
+
+		await git(root, ["checkout", "-q", "-b", "side"]);
+		expect((await commitEdit("side\n")).line).toBe(
+			"LOCAL ONLY: 3 commits on side not on origin/main (upstream: none). Nothing was pushed.",
+		);
+	});
+
 	it("explicitly selects a gitlink SHA with ordinary edits without committing child dirt or other staged work", async () => {
 		const { root, module, journal, write, before, after } = await gitlinkWorkspace();
 		await Bun.write(path.join(root, "user.txt"), "user staged\n");
